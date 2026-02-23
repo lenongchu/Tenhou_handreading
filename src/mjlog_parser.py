@@ -1,0 +1,174 @@
+"""
+牌谱数据结构与牌符工具
+
+保留 GameState、Discard 及牌编码转换等工具，解析逻辑已迁移至 tenhou6_adapter。
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Set, Optional
+from collections import Counter as PyCounter
+
+
+@dataclass
+class CallInfo:
+    """副露信息：该玩家的一次吃/碰/杠"""
+    call_type: str  # "chii" | "pon" | "kan" | "daiminkan" | "kakan" | "ankan"
+    pai: str       # 鸣牌（被吃/碰的牌，如 "7s"）
+    consumed: List[str]  # 自己的牌，如 ["6s","8s"]
+    from_discard_turn: int = 1  # 此副露后第一次舍牌的巡目；匹配时只考虑 discard.turn >= from_discard_turn
+
+
+@dataclass
+class Discard:
+    """舍牌信息"""
+    turn: int           # 巡目（该玩家的第几次出牌）
+    tile: int           # 牌编码（0-135）
+    is_tsumogiri: bool  # 是否摸切
+    riichi_happened: bool = False   # 打出此牌时，是否已有人立直
+    call_happened: bool = False     # 打出此牌时，是否已有人副露（吃/碰/杠）
+
+
+@dataclass
+class GameState:
+    """游戏状态快照"""
+    player_id: int                      # 玩家编号（0-3）
+    round_num: int = 0                  # 小局号（0=东1, 1=东2, 2=东3, 3=东4, 4=南1...）
+    honba: int = 0                      # 本场数（连庄次数）
+    oya: int = 0                        # 该局亲家（庄家）的 player_id
+    discards: List[Discard] = field(default_factory=list)  # 本家舍牌序列
+    hand_tiles: Set[int] = field(default_factory=set)      # 当前手牌（0-135）
+    initial_hand: Set[int] = field(default_factory=set)    # 初始配牌
+    hand_tiles_history: List[Set[int]] = field(default_factory=list)  # 每一巡打牌后的手牌快照
+    dora_indicators: List[int] = field(default_factory=list)  # 宝牌指示牌
+    visible_tiles: PyCounter = field(default_factory=PyCounter)  # 其他3家可见牌统计
+    calls: List["CallInfo"] = field(default_factory=list)  # 本家副露列表，用于 @p:kf 客风校验
+
+
+class TileUtils:
+    """
+    牌符与编码转换工具（原 MjlogParser 静态方法）。
+    解析逻辑已由 tenhou6_adapter 负责。
+    """
+
+    HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
+    HONOR_Z = tuple(f"{i}z" for i in range(1, 8))
+
+    @staticmethod
+    def tile_to_string(tile: int) -> str:
+        """牌编码（0-135）→ 字符串（如 3s、东）"""
+        base_tile = tile // 4
+        if 0 <= base_tile < 9:
+            return f"{base_tile + 1}m"
+        elif 9 <= base_tile < 18:
+            return f"{base_tile - 9 + 1}p"
+        elif 18 <= base_tile < 27:
+            return f"{base_tile - 18 + 1}s"
+        elif base_tile == 27:
+            return "东"
+        elif base_tile == 28:
+            return "南"
+        elif base_tile == 29:
+            return "西"
+        elif base_tile == 30:
+            return "北"
+        elif base_tile == 31:
+            return "白"
+        elif base_tile == 32:
+            return "发"
+        elif base_tile == 33:
+            return "中"
+        return f"unknown_{tile}"
+
+    @staticmethod
+    def string_to_tile(tile_str: str) -> int:
+        """字符串（如 3s、东、0m 赤五）→ base 编码（0-33）"""
+        if len(tile_str) == 2:
+            num = int(tile_str[0])
+            suit = tile_str[1]
+            if suit == "m":
+                return (4 if num == 0 else num - 1)  # 0m = 赤5m = base 4
+            elif suit == "p":
+                return 9 + (4 if num == 0 else num - 1)  # 0p = 赤5p
+            elif suit == "s":
+                return 18 + (4 if num == 0 else num - 1)  # 0s = 赤5s
+        wind_map = {"东": 27, "南": 28, "西": 29, "北": 30}
+        dragon_map = {"白": 31, "发": 32, "中": 33}
+        z_map = {"1z": 27, "2z": 28, "3z": 29, "4z": 30, "5z": 31, "6z": 32, "7z": 33}
+        if tile_str in wind_map:
+            return wind_map[tile_str]
+        if tile_str in dragon_map:
+            return dragon_map[tile_str]
+        if tile_str in z_map:
+            return z_map[tile_str]
+        raise ValueError(f"无效的牌字符串: {tile_str}")
+
+    @staticmethod
+    def indicator_to_dora(indicator: int) -> int:
+        """宝牌指示物 → 宝牌（base 0-33）"""
+        if 0 <= indicator < 27:
+            suit_base = (indicator // 9) * 9
+            suit_offset = indicator % 9
+            return suit_base + (suit_offset + 1) % 9
+        elif 27 <= indicator <= 30:
+            return 27 + (indicator - 27 + 1) % 4
+        elif 31 <= indicator <= 33:
+            return 31 + (indicator - 31 + 1) % 3
+        return indicator
+
+    @staticmethod
+    def dora_to_indicator(dora: int) -> int:
+        """宝牌 → 宝牌指示物（base 0-33）"""
+        if 0 <= dora < 27:
+            suit_base = (dora // 9) * 9
+            suit_offset = dora % 9
+            return suit_base + (suit_offset - 1) % 9
+        elif 27 <= dora <= 30:
+            return 27 + (dora - 27 - 1) % 4
+        elif 31 <= dora <= 33:
+            return 31 + (dora - 31 - 1) % 3
+        return dora
+
+    @staticmethod
+    def format_round_display(round_num: int, honba: int) -> str:
+        """小局显示：东1局、南2局 2本场 等"""
+        if round_num < 4:
+            name = f"东{round_num + 1}局"
+        elif round_num < 8:
+            name = f"南{round_num - 3}局"
+        else:
+            name = f"第{round_num + 1}局"
+        if honba > 0:
+            name += f" {honba}本场"
+        return name
+
+    @staticmethod
+    def get_player_wind(player_id: int, oya: int) -> str:
+        """根据 player_id 和亲家 oya 计算座风（东南西北）"""
+        winds = ["东", "南", "西", "北"]
+        wind_idx = (player_id - oya + 4) % 4
+        return winds[wind_idx]
+
+    @staticmethod
+    def get_jikaze(player_id: int, oya: int, round_num: int) -> str:
+        """自风：东场东家=东…；南场东家=南…"""
+        winds = ["东", "南", "西", "北"]
+        seat = (player_id - oya + 4) % 4
+        field = round_num // 4
+        return winds[(seat + field) % 4]
+
+    @staticmethod
+    def get_kyokuze_list(player_id: int, oya: int, round_num: int) -> List[str]:
+        """客风：3 个非自风的风牌"""
+        jikaze = TileUtils.get_jikaze(player_id, oya, round_num)
+        return [w for w in ("东", "南", "西", "北") if w != jikaze]
+
+    @classmethod
+    def base_to_honor_str(cls, base: int) -> str:
+        """base 27-33 → 字牌字符串（1z-7z）"""
+        if 27 <= base <= 33:
+            return cls.HONOR_Z[base - 27]
+        return None
+
+
+# 向后兼容：保留 MjlogParser 作为 TileUtils 的别名
+MjlogParser = TileUtils
