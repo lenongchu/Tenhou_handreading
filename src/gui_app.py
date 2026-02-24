@@ -15,7 +15,8 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTextEdit, QTextBrowser, QGroupBox,
     QSpinBox, QRadioButton, QButtonGroup, QProgressBar,
     QMessageBox, QFormLayout, QListWidget, QListWidgetItem,
-    QDialog, QComboBox, QDialogButtonBox, QSizePolicy
+    QDialog, QComboBox, QDialogButtonBox, QSizePolicy,
+    QScrollArea, QFrame, QGridLayout,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QRectF, QSettings, QTimer
 from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont
@@ -385,12 +386,14 @@ class SampleThread(QThread):
     progress_num = pyqtSignal(int, int)
     finished = pyqtSignal(bool, object)  # success, samples list
 
-    def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter):
+    def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter,
+                 sample_pool=None):
         super().__init__()
         self.analyzer = analyzer
         self.params = params
         self.sample_count = sample_count
         self.target_count_filter = target_count_filter
+        self.sample_pool = sample_pool  # 主统计时预收集的样本池，有则无需二次遍历
         self._should_cancel = False
 
     def cancel(self):
@@ -398,19 +401,22 @@ class SampleThread(QThread):
 
     def run(self):
         try:
-            self.progress.emit("正在收集验证样本...")
+            if self.sample_pool:
+                self.progress.emit("从已分析结果中提取样本...")
+            else:
+                self.progress.emit("正在收集验证样本...")
             def progress_cb(cur, total):
                 self.progress_num.emit(cur, total)
                 self.progress.emit(f"已扫描: {cur:,} 场" + (f"/{total:,}" if total > 0 else ""))
-            # 排除 collect_verification_samples 不接受的参数
             params = {k: v for k, v in self.params.items()
-                      if k not in ("query_pattern_str", "is_combo")}
+                      if k not in ("query_pattern_str", "is_combo", "query_items", "matched_states_cap")}
             samples = self.analyzer.collect_verification_samples(
                 **params,
                 sample_count=self.sample_count,
                 target_count_filter=self.target_count_filter,
                 progress_callback=progress_cb,
-                should_cancel=lambda: self._should_cancel
+                should_cancel=lambda: self._should_cancel,
+                sample_pool=self.sample_pool,
             )
             self.progress.emit(f"收集完成，共 {len(samples)} 条")
             self.finished.emit(True, samples)
@@ -600,12 +606,10 @@ def _stats_cache_path(db_path: str) -> Path:
 
 
 def _format_db_status_text(stats: dict) -> str:
-    """将 stats 格式化为状态文本"""
+    """将 stats 格式化为横向展示的状态文本"""
     return (
-        f"数据库状态: 已初始化\n"
-        f"对局总数: {stats['total_logs']:,}\n"
-        f"数据库大小: {stats['db_size_mb']:.2f} MB\n"
-        f"分析模式: 实时解析（按需分析）"
+        f"数据库状态: 已初始化  |  对局总数: {stats['total_logs']:,}  |  "
+        f"数据库大小: {stats['db_size_mb']:.2f} MB  |  分析模式: 实时解析（按需分析）"
     )
 
 
@@ -649,6 +653,7 @@ class MainWindow(QMainWindow):
         self.query_thread = None
         self.sample_thread = None
         self.last_query_params = None  # 上次查询参数，用于生成样本
+        self.last_query_result = None  # 上次查询结果（含 sample_pool），用于快速采样
 
         self.init_ui()
         # 优先使用缓存的统计值，数据库未更新时避免重复执行耗时的 COUNT(*)
@@ -691,9 +696,36 @@ class MainWindow(QMainWindow):
         group = QGroupBox("数据管理")
         layout = QVBoxLayout()
         
-        # 数据库状态
+        # 数据库状态（横向排列，清晰展示）
+        status_row = QHBoxLayout()
+        status_row.setSpacing(12)
         self.db_status_label = QLabel("数据库状态: 未初始化")
-        layout.addWidget(self.db_status_label)
+        self.db_status_label.setStyleSheet("color: #333;")
+        status_row.addWidget(self.db_status_label)
+        status_row.addStretch()
+        layout.addLayout(status_row)
+        
+        # 分析批次大小（根据内存选择，默认使用上次设置）
+        batch_row = QHBoxLayout()
+        batch_row.addWidget(QLabel("分析批次大小:"))
+        self.analysis_batch_size_spin = QSpinBox()
+        self.analysis_batch_size_spin.setRange(500, 10000)
+        self.analysis_batch_size_spin.setSingleStep(500)
+        self.analysis_batch_size_spin.setSuffix(" 场/批")
+        saved_batch = QSettings().value("analysis_batch_size", 2000, type=int)
+        self.analysis_batch_size_spin.blockSignals(True)
+        self.analysis_batch_size_spin.setValue(max(500, min(10000, saved_batch or 2000)))
+        self.analysis_batch_size_spin.blockSignals(False)
+        self.analysis_batch_size_spin.setToolTip(
+            "每批从数据库读取的对局数。请根据本机内存选择：\n"
+            "约 1.2GB/1000 场，如 1000 场≈1.2GB，5000 场≈6GB。\n"
+            "内存充足可设大一些以减少 SQL 次数、略快；内存紧张请设小一些。"
+        )
+        self.analysis_batch_size_spin.valueChanged.connect(self._save_analysis_batch_size)
+        batch_row.addWidget(self.analysis_batch_size_spin)
+        batch_row.addWidget(QLabel("（根据内存选择）"))
+        batch_row.addStretch()
+        layout.addLayout(batch_row)
         
         # 按钮
         button_layout = QHBoxLayout()
@@ -717,39 +749,54 @@ class MainWindow(QMainWindow):
         return group
     
     def _create_query_input_group(self) -> QGroupBox:
-        """创建查询输入区"""
+        """创建查询条件：左侧舍牌模式（主展示），右侧分析选项与约束（横向紧凑）"""
         group = QGroupBox("查询条件")
-        layout = QFormLayout()
+        main_row = QHBoxLayout()
+        main_row.setSpacing(16)
         
-        # 舍牌模式
-        pattern_row = QHBoxLayout()
-        pattern_row.setSpacing(6)
+        # ========== 左列：舍牌模式（占主要空间） ==========
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        ph_row = QHBoxLayout()
+        ph_row.addWidget(QLabel("舍牌模式 (可添加多条，满足任一即计入):"))
         pattern_help_btn = QPushButton("?")
         pattern_help_btn.setToolTip("舍牌模式输入说明")
         pattern_help_btn.setFixedWidth(28)
         pattern_help_btn.clicked.connect(self._show_pattern_help)
-        pattern_row.addWidget(pattern_help_btn)
-        self.pattern_input = QLineEdit()
-        self.pattern_input.setPlaceholderText("例: 7s-9s、7s-0m-9s、c0p6p-$、3m-z、p1z1z")
-        pattern_row.addWidget(self.pattern_input)
-        layout.addRow("舍牌模式:", pattern_row)
-
-        # 目标牌
-        target_row = QHBoxLayout()
-        target_row.setSpacing(6)
-        target_help_btn = QPushButton("?")
-        target_help_btn.setToolTip("目标牌输入说明")
-        target_help_btn.setFixedWidth(28)
-        target_help_btn.clicked.connect(self._show_target_help)
-        target_row.addWidget(target_help_btn)
-        self.target_input = QLineEdit()
-        self.target_input.setPlaceholderText("例: 6s 或 1m3m（搭子）")
-        target_row.addWidget(self.target_input)
-        layout.addRow("目标牌:", target_row)
+        ph_row.addWidget(pattern_help_btn)
+        ph_row.addStretch()
+        left_layout.addLayout(ph_row)
+        self.pattern_rows_container = QWidget()
+        self.pattern_rows_layout = QVBoxLayout(self.pattern_rows_container)
+        self.pattern_rows_layout.setSpacing(6)
+        self.pattern_rows_layout.setContentsMargins(0, 0, 0, 0)
+        pattern_scroll = QScrollArea()
+        pattern_scroll.setWidget(self.pattern_rows_container)
+        pattern_scroll.setWidgetResizable(True)
+        pattern_scroll.setMinimumHeight(80)
+        pattern_scroll.setFrameShape(QFrame.NoFrame)
+        pattern_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_layout.addWidget(pattern_scroll, 1)
+        add_btn_row = QHBoxLayout()
+        self.add_pattern_btn = QPushButton("+ 添加舍牌模式")
+        self.add_pattern_btn.clicked.connect(self._add_pattern_row)
+        add_btn_row.addWidget(self.add_pattern_btn)
+        add_btn_row.addStretch()
+        left_layout.addLayout(add_btn_row)
+        self._pattern_row_widgets = []
+        self._add_pattern_row()
+        main_row.addWidget(left_widget, 1)
         
-        # 巡目范围（双柄滑块，默认 1-6 巡）
+        # ========== 右列：开始分析相关（巡目、约束、样本、执行） ==========
+        right_widget = QWidget()
+        right_widget.setMaximumWidth(400)
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 巡目范围
         turn_layout = QHBoxLayout()
-        turn_layout.setSpacing(8)
+        turn_layout.addWidget(QLabel("巡目:"))
         self.turn_range_slider = RangeSlider(min_val=1, max_val=18, default_min=1, default_max=6)
         self.turn_range_label = QLabel("1-6 巡")
         self.turn_range_label.setMinimumWidth(45)
@@ -759,112 +806,174 @@ class MainWindow(QMainWindow):
         )
         turn_layout.addWidget(self.turn_range_slider, 1)
         turn_layout.addWidget(self.turn_range_label, 0)
-        layout.addRow("巡目范围:", turn_layout)
+        right_layout.addLayout(turn_layout)
         
-        # 宝牌约束
-        dora_layout = QVBoxLayout()
+        # 宝牌 / 立直 / 副露 各占一行，避免文字重叠
+        dora_row = QHBoxLayout()
+        dora_row.setSpacing(10)
         self.dora_group = QButtonGroup()
-        
         self.dora_irrelevant_radio = QRadioButton("宝牌无关")
         self.dora_irrelevant_radio.setChecked(True)
         self.dora_group.addButton(self.dora_irrelevant_radio, 0)
-        dora_layout.addWidget(self.dora_irrelevant_radio)
-        
-        dora_specific_layout = QHBoxLayout()
-        self.dora_specific_radio = QRadioButton("宝牌为:")
+        self.dora_specific_radio = QRadioButton("宝牌为")
         self.dora_group.addButton(self.dora_specific_radio, 1)
-        dora_specific_layout.addWidget(self.dora_specific_radio)
-        
         self.dora_tile_input = QLineEdit()
         self.dora_tile_input.setPlaceholderText("例: 6s")
-        self.dora_tile_input.setMaximumWidth(100)
-        dora_specific_layout.addWidget(self.dora_tile_input)
-        dora_specific_layout.addStretch()
-        
-        dora_layout.addLayout(dora_specific_layout)
-        layout.addRow("宝牌约束:", dora_layout)
-        
-        # 立直约束（新增）
-        riichi_layout = QVBoxLayout()
-        
+        self.dora_tile_input.setMinimumWidth(50)
+        self.dora_tile_input.setMaximumWidth(70)
+        dora_row.addWidget(self.dora_irrelevant_radio)
+        dora_row.addWidget(self.dora_specific_radio)
+        dora_row.addWidget(self.dora_tile_input)
+        dora_row.addStretch()
+        right_layout.addLayout(dora_row)
+        riichi_row = QHBoxLayout()
+        riichi_row.setSpacing(10)
         self.riichi_group = QButtonGroup()
-        
-        self.riichi_any_radio = QRadioButton("无限制")
+        self.riichi_any_radio = QRadioButton("立直: 任意")
         self.riichi_any_radio.setChecked(True)
         self.riichi_group.addButton(self.riichi_any_radio, 0)
-        riichi_layout.addWidget(self.riichi_any_radio)
-        
         self.riichi_has_radio = QRadioButton("有人立直")
         self.riichi_group.addButton(self.riichi_has_radio, 1)
-        riichi_layout.addWidget(self.riichi_has_radio)
-        
         self.riichi_no_radio = QRadioButton("无人立直")
         self.riichi_group.addButton(self.riichi_no_radio, 2)
-        riichi_layout.addWidget(self.riichi_no_radio)
-        
-        layout.addRow("立直约束:", riichi_layout)
-        
-        # 副露约束（其他家吃/碰/杠）
-        call_layout = QVBoxLayout()
+        riichi_row.addWidget(self.riichi_any_radio)
+        riichi_row.addWidget(self.riichi_has_radio)
+        riichi_row.addWidget(self.riichi_no_radio)
+        riichi_row.addStretch()
+        right_layout.addLayout(riichi_row)
+        call_row = QHBoxLayout()
+        call_row.setSpacing(10)
         self.call_group = QButtonGroup()
-        self.call_any_radio = QRadioButton("无限制")
+        self.call_any_radio = QRadioButton("副露: 任意")
         self.call_any_radio.setChecked(True)
         self.call_group.addButton(self.call_any_radio, 0)
-        call_layout.addWidget(self.call_any_radio)
         self.call_has_radio = QRadioButton("有人副露")
         self.call_group.addButton(self.call_has_radio, 1)
-        call_layout.addWidget(self.call_has_radio)
         self.call_no_radio = QRadioButton("无人副露")
         self.call_group.addButton(self.call_no_radio, 2)
-        call_layout.addWidget(self.call_no_radio)
-        layout.addRow("副露约束:", call_layout)
+        call_row.addWidget(self.call_any_radio)
+        call_row.addWidget(self.call_has_radio)
+        call_row.addWidget(self.call_no_radio)
+        call_row.addStretch()
+        right_layout.addLayout(call_row)
         
-        # 场况约束
-        constraint_layout = QVBoxLayout()
-        
-        add_constraint_layout = QHBoxLayout()
+        # 场况约束（两行：输入行 + 按钮与列表）
+        right_layout.addSpacing(4)
+        add_constraint_row = QHBoxLayout()
+        add_constraint_row.setSpacing(8)
+        add_constraint_row.addWidget(QLabel("场况约束"))
         self.constraint_tile_input = QLineEdit()
-        self.constraint_tile_input.setPlaceholderText("牌 (如8s)")
-        self.constraint_tile_input.setMaximumWidth(80)
-        add_constraint_layout.addWidget(self.constraint_tile_input)
-        
-        add_constraint_layout.addWidget(QLabel("可见"))
+        self.constraint_tile_input.setPlaceholderText("牌，如 8s")
+        self.constraint_tile_input.setMinimumWidth(52)
+        self.constraint_tile_input.setMaximumWidth(72)
+        add_constraint_row.addWidget(self.constraint_tile_input)
+        add_constraint_row.addWidget(QLabel("可见"))
         self.constraint_range_slider = DiscreteRangeSlider()
+        self.constraint_range_slider.setMinimumWidth(100)
         self.constraint_range_slider.setMaximumWidth(140)
-        add_constraint_layout.addWidget(self.constraint_range_slider)
-        add_constraint_layout.addWidget(QLabel("枚"))
-        
-        self.add_constraint_btn = QPushButton("添加约束")
+        add_constraint_row.addWidget(self.constraint_range_slider)
+        add_constraint_row.addWidget(QLabel("枚"))
+        add_constraint_row.addStretch()
+        right_layout.addLayout(add_constraint_row)
+        add_btn_row_constraint = QHBoxLayout()
+        self.add_constraint_btn = QPushButton("添加场况约束")
         self.add_constraint_btn.clicked.connect(self.add_constraint)
-        add_constraint_layout.addWidget(self.add_constraint_btn)
-        
-        add_constraint_layout.addStretch()
-        constraint_layout.addLayout(add_constraint_layout)
-        
-        # 约束列表
+        add_btn_row_constraint.addWidget(self.add_constraint_btn)
+        add_btn_row_constraint.addStretch()
+        right_layout.addLayout(add_btn_row_constraint)
         self.constraint_list = QListWidget()
-        self.constraint_list.setMaximumHeight(100)
-        constraint_layout.addWidget(self.constraint_list)
+        self.constraint_list.setMinimumHeight(52)
+        self.constraint_list.setMaximumHeight(88)
+        right_layout.addWidget(self.constraint_list)
         
-        layout.addRow("场况约束:", constraint_layout)
-        
-        # 样本上限（保存上次选择）
+        # 样本上限 + 匹配状态保留条数
+        opts_row = QHBoxLayout()
+        opts_row.addWidget(QLabel("样本上限:"))
         self.sample_limit_input = QSpinBox()
-        self.sample_limit_input.setRange(100, 100000)
-        self.sample_limit_input.setSingleStep(1000)
-        saved_limit = QSettings().value("sample_limit", 10000, type=int)
-        self.sample_limit_input.setValue(max(100, min(100000, saved_limit)))
+        self.sample_limit_input.setRange(100, 10000000)
+        self.sample_limit_input.setSingleStep(10000)
+        self.sample_limit_input.setSuffix(" 半庄")
+        saved_limit = QSettings().value("sample_limit", 10000, type=int) or 10000
+        self.sample_limit_input.blockSignals(True)
+        self.sample_limit_input.setValue(max(100, min(10000000, saved_limit)))
+        self.sample_limit_input.blockSignals(False)
         self.sample_limit_input.valueChanged.connect(self._save_sample_limit)
-        layout.addRow("样本上限:", self.sample_limit_input)
+        self.sample_limit_input.setMaximumWidth(120)
+        opts_row.addWidget(self.sample_limit_input)
+        opts_row.addWidget(QLabel("匹配保留:"))
+        self.matched_states_cap_spin = QSpinBox()
+        self.matched_states_cap_spin.setRange(1, 500)
+        saved_cap = QSettings().value("matched_states_cap", 100, type=int) or 100
+        self.matched_states_cap_spin.blockSignals(True)
+        self.matched_states_cap_spin.setValue(max(1, min(500, saved_cap)))
+        self.matched_states_cap_spin.blockSignals(False)
+        self.matched_states_cap_spin.setToolTip("分析时最多保留的匹配状态条数（用于展示，越大占内存越多）")
+        self.matched_states_cap_spin.valueChanged.connect(self._save_matched_states_cap)
+        self.matched_states_cap_spin.setMaximumWidth(64)
+        opts_row.addWidget(self.matched_states_cap_spin)
+        opts_row.addStretch()
+        right_layout.addLayout(opts_row)
         
-        # 执行查询按钮
-        self.query_btn = QPushButton("执行查询")
+        # 执行查询
+        self.query_btn = QPushButton("开始分析")
         self.query_btn.clicked.connect(self.execute_query)
-        self.query_btn.setStyleSheet("font-size: 14pt; padding: 10px;")
-        layout.addRow("", self.query_btn)
+        self.query_btn.setStyleSheet("font-size: 13pt; padding: 8px;")
+        right_layout.addWidget(self.query_btn)
         
-        group.setLayout(layout)
+        main_row.addWidget(right_widget, 0)
+        group.setLayout(main_row)
         return group
+
+    def _add_pattern_row(self):
+        """添加一行舍牌模式+目标牌"""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        pattern_edit = QLineEdit()
+        pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$")
+        pattern_edit.setMinimumWidth(150)
+        target_edit = QLineEdit()
+        target_edit.setPlaceholderText("例: 6s")
+        target_edit.setMaximumWidth(80)
+        target_help_btn = QPushButton("?")
+        target_help_btn.setToolTip("目标牌说明")
+        target_help_btn.setFixedWidth(24)
+        target_help_btn.clicked.connect(self._show_target_help)
+        del_btn = QPushButton("删除")
+        del_btn.setMaximumWidth(50)
+        row.addWidget(QLabel("模式:"))
+        row.addWidget(pattern_edit, 1)
+        row.addWidget(QLabel("→"))
+        row.addWidget(target_edit)
+        row.addWidget(target_help_btn)
+        row.addWidget(del_btn)
+        entry = (pattern_edit, target_edit, del_btn, row)
+        self._pattern_row_widgets.append(entry)
+        del_btn.clicked.connect(lambda checked=False, e=entry: self._remove_pattern_row(e))
+        self.pattern_rows_layout.addLayout(row)
+
+    def _remove_pattern_row(self, entry):
+        """移除一行舍牌模式"""
+        if len(self._pattern_row_widgets) <= 1:
+            QMessageBox.warning(self, "提示", "至少需保留一个舍牌模式")
+            return
+        pattern_edit, target_edit, del_btn, row = entry
+        while row.count():
+            item = row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.pattern_rows_layout.removeItem(row)
+        if entry in self._pattern_row_widgets:
+            self._pattern_row_widgets.remove(entry)
+
+    def _get_pattern_items(self) -> List[Tuple[List[str], str]]:
+        """从界面获取所有 (pattern, target) 对"""
+        items = []
+        for pattern_edit, target_edit, _, _ in self._pattern_row_widgets:
+            pt = pattern_edit.text().strip()
+            tg = target_edit.text().strip()
+            if pt and tg:
+                items.append(([p.strip() for p in pt.split("-")], tg))
+        return items
 
     def _show_pattern_help(self):
         """显示舍牌模式输入说明"""
@@ -892,6 +1001,12 @@ class MainWindow(QMainWindow):
         self.sample_count_spin.setValue(10)
         sample_layout.addWidget(self.sample_count_spin)
         sample_layout.addWidget(QLabel("条"))
+        sample_layout.addWidget(QLabel("舍牌模式:"))
+        self.sample_pattern_combo = QComboBox()
+        self.sample_pattern_combo.setToolTip("多舍牌模式时可选择为哪个模式生成样本")
+        self.sample_pattern_combo.setMinimumWidth(120)
+        sample_layout.addWidget(self.sample_pattern_combo)
+        sample_layout.addWidget(QLabel("目标:"))
         self.sample_target_combo = QComboBox()
         self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
         self.sample_target_combo.setToolTip("单张模式: 有0~3张；搭子模式(执行查询后): 没有/有")
@@ -928,6 +1043,14 @@ class MainWindow(QMainWindow):
     def _save_sample_limit(self, value: int):
         """保存样本上限到本地设置"""
         QSettings().setValue("sample_limit", value)
+
+    def _save_matched_states_cap(self, value: int):
+        """保存匹配状态保留条数到本地设置"""
+        QSettings().setValue("matched_states_cap", value)
+
+    def _save_analysis_batch_size(self, value: int):
+        """保存分析批次大小到本地设置"""
+        QSettings().setValue("analysis_batch_size", value)
 
     def download_data(self):
         """下载历史数据"""
@@ -1052,16 +1175,11 @@ class MainWindow(QMainWindow):
     
     def execute_query(self):
         """执行查询"""
-        # 获取输入参数
-        pattern_text = self.pattern_input.text().strip()
-        target_tile = self.target_input.text().strip()
-        
-        if not pattern_text or not target_tile:
-            QMessageBox.warning(self, "输入错误", "请输入舍牌模式和目标牌")
+        query_items = self._get_pattern_items()
+        if not query_items:
+            QMessageBox.warning(self, "输入错误", "请至少输入一个舍牌模式和对应的目标牌")
             return
-        
-        # 解析舍牌模式
-        pattern = [p.strip() for p in pattern_text.split('-')]
+        first_pattern, first_target = query_items[0]
         
         # 宝牌约束
         if self.dora_irrelevant_radio.isChecked():
@@ -1107,10 +1225,11 @@ class MainWindow(QMainWindow):
         cached = _load_db_status_from_cache(self.db_path)
         total_logs_hint = cached.get("total_logs") if cached else None
 
-        # 构造查询参数
+        matched_states_cap = self.matched_states_cap_spin.value()
+        analysis_batch_size = self.analysis_batch_size_spin.value()
+
         params = {
-            "query_pattern": pattern,
-            "target_tile": target_tile,
+            "query_items": query_items,
             "visible_constraints": visible_constraints if visible_constraints else None,
             "dora_constraint": dora_constraint,
             "riichi_constraint": riichi_constraint,
@@ -1118,6 +1237,8 @@ class MainWindow(QMainWindow):
             "turn_range": turn_range,
             "sample_limit": sample_limit,
             "total_logs_hint": total_logs_hint,
+            "matched_states_cap": matched_states_cap,
+            "analysis_batch_size": analysis_batch_size,
         }
         
         # 启动查询线程
@@ -1131,7 +1252,7 @@ class MainWindow(QMainWindow):
         self.query_thread.finished.connect(self.on_query_finished)
         self.query_thread.start()
         
-        self.query_btn.setEnabled(False)
+        self.query_btn.setEnabled(True)  # 保持可点击，以便用户点击「取消分析」
         self.query_btn.setText("取消分析")
         self.query_btn.clicked.disconnect()
         self.query_btn.clicked.connect(self.cancel_query)
@@ -1144,7 +1265,7 @@ class MainWindow(QMainWindow):
             self.query_btn.setEnabled(False)
 
     def generate_samples(self):
-        """生成验证样本"""
+        """生成验证样本（多舍牌模式时按当前选择的舍牌模式生成）"""
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
@@ -1162,6 +1283,30 @@ class MainWindow(QMainWindow):
         idx = self.sample_target_combo.currentIndex()
         target_count_filter = None if idx == 0 else idx - 1
 
+        # 当前选中的舍牌模式（多模式时用于过滤 sample_pool 或传给收集接口）
+        pattern_index = self.sample_pattern_combo.currentIndex()
+        query_items = self.last_query_params.get("query_items", [])
+        if not query_items or pattern_index < 0 or pattern_index >= len(query_items):
+            QMessageBox.warning(self, "提示", "请先执行查询后再生成样本")
+            return
+        selected_pattern, selected_target = query_items[pattern_index]
+        self._last_sample_pattern_str = "-".join(selected_pattern)
+        self._last_sample_target_tile = selected_target
+
+        # 构建用于本次采样的参数（单模式用选中的 pattern/target）
+        params_for_sample = {
+            **self.last_query_params,
+            "query_pattern": selected_pattern,
+            "query_pattern_str": self._last_sample_pattern_str,
+            "target_tile": selected_target,
+        }
+
+        # 若有预收集的 sample_pool 且为多模式，只保留当前选中模式的样本
+        sample_pool = self.last_query_result.get("sample_pool") if self.last_query_result else None
+        multi = self.last_query_params.get("multi_pattern", False) and len(query_items) > 1
+        if sample_pool and multi:
+            sample_pool = [s for s in sample_pool if s.get("matched_pattern_idx") == pattern_index]
+
         self.gen_sample_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -1169,9 +1314,10 @@ class MainWindow(QMainWindow):
 
         self.sample_thread = SampleThread(
             self.analyzer,
-            self.last_query_params,
+            params_for_sample,
             count,
-            target_count_filter
+            target_count_filter,
+            sample_pool=sample_pool,
         )
         self.sample_thread.progress.connect(lambda s: self.result_text.append(s))
         self.sample_thread.progress_num.connect(self.on_sample_progress_num)
@@ -1193,11 +1339,12 @@ class MainWindow(QMainWindow):
         self.gen_sample_btn.setEnabled(True)
         if success and samples_or_error:
             samples = samples_or_error
-            query_str = self.last_query_params.get("query_pattern_str", "-".join(self.last_query_params["query_pattern"]))
+            query_str = getattr(self, "_last_sample_pattern_str", None) or self.last_query_params.get("query_pattern_str", "-".join(self.last_query_params.get("query_pattern", [])))
+            target_tile = getattr(self, "_last_sample_target_tile", None) or self.last_query_params.get("target_tile", "")
             text = format_samples_for_display(
                 samples,
                 query_str,
-                self.last_query_params["target_tile"]
+                target_tile
             )
             dlg = SampleDialog(self, text, query_str.replace("-", "_"))
             dlg.exec_()
@@ -1224,15 +1371,19 @@ class MainWindow(QMainWindow):
         """查询完成回调"""
         self.progress_bar.setVisible(False)
         self.query_btn.setEnabled(True)
-        self.query_btn.setText("执行查询")
+        self.query_btn.setText("开始分析")
         self.query_btn.clicked.disconnect()
         self.query_btn.clicked.connect(self.execute_query)
 
         if success:
-            # 保存查询参数供生成样本使用
-            pattern_text = self.pattern_input.text().strip()
-            target_tile = self.target_input.text().strip()
-            pattern = [p.strip() for p in pattern_text.split("-")]
+            self.last_query_result = result
+            if result.get("multi_pattern") and result.get("pattern_results"):
+                query_items = [(pr["pattern"], pr["target"]) for pr in result["pattern_results"]]
+            else:
+                query_items = self._get_pattern_items()
+            if not query_items:
+                query_items = [(result.get("query_pattern", []), result.get("target_tile", ""))]
+            first_pattern, first_target = query_items[0]
             if self.dora_irrelevant_radio.isChecked():
                 dora_constraint = "dora_unrelated"
             else:
@@ -1261,9 +1412,10 @@ class MainWindow(QMainWindow):
             cached = _load_db_status_from_cache(self.db_path)
             total_logs_hint = cached.get("total_logs") if cached else None
             self.last_query_params = {
-                "query_pattern": pattern,
-                "query_pattern_str": "-".join(pattern),
-                "target_tile": target_tile,
+                "query_items": query_items,
+                "query_pattern": first_pattern,
+                "query_pattern_str": "-".join(first_pattern),
+                "target_tile": first_target,
                 "dora_constraint": dora_constraint,
                 "visible_constraints": visible_constraints if visible_constraints else None,
                 "riichi_constraint": riichi_constraint,
@@ -1274,28 +1426,58 @@ class MainWindow(QMainWindow):
                 "total_logs_hint": total_logs_hint,
             }
             self.gen_sample_btn.setEnabled(True)
-            # 搭子模式：样本筛选显示 全部/没有/有；单张模式：显示 全部/有0张~有3张
+            # 舍牌模式选择：多模式时列出每个模式供生成样本时选择
+            self.sample_pattern_combo.clear()
+            pr_list = result.get("pattern_results", []) if result.get("multi_pattern") else []
+            if result.get("multi_pattern") and pr_list:
+                for pr in pr_list:
+                    self.sample_pattern_combo.addItem(f"{pr['pattern_str']} → {pr['target']}")
+            else:
+                first_pattern, first_target = query_items[0]
+                self.sample_pattern_combo.addItem("-".join(first_pattern) + " → " + first_target)
+            # 搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；多模式混合时用单张选项
             self.sample_target_combo.clear()
-            if result.get("is_combo", False):
+            any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
+            if result.get("multi_pattern") and any_single:
+                self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
+            elif result.get("is_combo", False) and not result.get("multi_pattern"):
                 self.sample_target_combo.addItems(["全部", "没有", "有"])
             else:
                 self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
 
-            # 显示结果
             is_combo = result.get('is_combo', False)
-            if is_combo:
-                dist_text = (
-                    f"  没有: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
-                    f"  有: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)"
-                )
+            multi = result.get('multi_pattern', False)
+            if multi and result.get('pattern_results'):
+                lines = ["查询完成！\n", f"总匹配数: {result['total_matches']:,}\n"]
+                for pr in result['pattern_results']:
+                    lines.append(f"  {pr['pattern_str']} → {pr['target']}: {pr['matches']:,} 次")
+                    if pr['is_combo']:
+                        lines.append(f"    没有: {pr['probability_distribution'][0]:.1f}%  有: {pr['probability_distribution'][1]:.1f}%")
+                    else:
+                        lines.append(
+                            f"    有0张: {pr['probability_distribution'][0]:.1f}%  有1张: {pr['probability_distribution'][1]:.1f}%  "
+                            f"有2张: {pr['probability_distribution'][2]:.1f}%  有3张: {pr['probability_distribution'][3]:.1f}%"
+                        )
+                lines.extend([
+                    f"\n分析对局数: {result['total_logs_analyzed']:,}",
+                    f"巡目范围: {result.get('turn_range', '不限')}",
+                    f"等价变体数: {result['variants_count']}",
+                ])
+                result_text = "\n".join(lines)
             else:
-                dist_text = (
-                    f"  有0张: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
-                    f"  有1张: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)\n"
-                    f"  有2张: {result['probability_distribution'][2]:.2f}% ({result['target_count_distribution'][2]:,} 例)\n"
-                    f"  有3张: {result['probability_distribution'][3]:.2f}% ({result['target_count_distribution'][3]:,} 例)"
-                )
-            result_text = f"""
+                if is_combo:
+                    dist_text = (
+                        f"  没有: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
+                        f"  有: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)"
+                    )
+                else:
+                    dist_text = (
+                        f"  有0张: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
+                        f"  有1张: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)\n"
+                        f"  有2张: {result['probability_distribution'][2]:.2f}% ({result['target_count_distribution'][2]:,} 例)\n"
+                        f"  有3张: {result['probability_distribution'][3]:.2f}% ({result['target_count_distribution'][3]:,} 例)"
+                    )
+                result_text = f"""
 查询完成！
 
 目标: {result['target_tile']}{' (搭子)' if is_combo else ''}
@@ -1313,6 +1495,7 @@ class MainWindow(QMainWindow):
         else:
             self.gen_sample_btn.setEnabled(False)
             self.last_query_params = None
+            self.last_query_result = None
             QMessageBox.critical(self, "查询失败", f"查询失败: {result}")
 
 
@@ -1326,6 +1509,8 @@ def main():
     
     # 创建应用
     app = QApplication(sys.argv)
+    app.setApplicationName("TenhouHandreading")
+    app.setOrganizationName("TenhouHandreading")
     
     # 创建主窗口
     window = MainWindow()

@@ -9,22 +9,22 @@ Tenhou6 格式参考: https://github.com/Riichi-Mahjong-Statistics-Seminar/tenho
 
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter as PyCounter
 
 from .mjlog_parser import GameState, Discard, TileUtils, CallInfo
 
 logger = logging.getLogger(__name__)
 
-# tenhou6 牌符 -> base_tile (0-33)
+# tenhou6 牌符 -> base_tile (0-36)
 # "1m"-"9m" -> 0-8, "1p"-"9p" -> 9-17, "1s"-"9s" -> 18-26
 # "1z"-"7z" 或 东/南/西/北/白/发/中 -> 27-33
-# "0m"/"0p"/"0s" -> 红5
+# "0m"/"0p"/"0s" -> 赤五独立 base 34/35/36（不与 5m/5p/5s 共用）
 TENHOU6_TO_BASE: Dict[str, int] = {}
 for suit, offset in [("m", 0), ("p", 9), ("s", 18)]:
     for n in range(1, 10):
         TENHOU6_TO_BASE[f"{n}{suit}"] = offset + n - 1
-    TENHOU6_TO_BASE[f"0{suit}"] = offset + 4  # 红5
+    TENHOU6_TO_BASE[f"0{suit}"] = 34 + {"m": 0, "p": 1, "s": 2}[suit]  # 0m=34, 0p=35, 0s=36
 for i in range(1, 8):
     TENHOU6_TO_BASE[f"{i}z"] = 26 + i
 for cn, base in [("东", 27), ("南", 28), ("西", 29), ("北", 30), ("白", 31), ("发", 32), ("中", 33)]:
@@ -32,7 +32,7 @@ for cn, base in [("东", 27), ("南", 28), ("西", 29), ("北", 30), ("白", 31)
 
 
 def _pai_to_tile(pai: str) -> int:
-    """tenhou6 牌符 -> 天凤 tile 编码 (0-135)，使用 base*4 作为代表"""
+    """tenhou6 牌符 -> tile 编码 (0-147)，使用 base*4 作为代表（用于舍牌等单张场景）"""
     base = TENHOU6_TO_BASE.get(pai)
     if base is None:
         raise ValueError(f"未知牌符: {pai}")
@@ -40,18 +40,13 @@ def _pai_to_tile(pai: str) -> int:
 
 
 def _tehai_to_hand_tiles(tehais: List[str]) -> List[int]:
-    """将 tehais (牌符列表) 转为 tile 编码列表，用于生成 hand_tiles set"""
-    # 需要为同种牌的多张分配不同 copy，使用 base*4 + copy_idx
-    from collections import Counter
-    cnt: Counter[int] = Counter()
+    """将 tehais (牌符列表) 转为 tile 编码列表。使用 base*4，允许重复以保留枚数。"""
     result = []
     for pai in tehais:
         base = TENHOU6_TO_BASE.get(pai)
         if base is None:
             continue
-        idx = cnt[base] % 4
-        cnt[base] += 1
-        result.append(base * 4 + idx)
+        result.append(base * 4)
     return result
 
 
@@ -67,10 +62,19 @@ def _parse_round_from_tenhou6(
     """
     oya = int(game_data.get("oya", 0))
     honba = int(game_data.get("honba", 0))
-    kyoku = int(game_data.get("kyoku", 1))
-    # tenhou6 kyoku: 1=东1, 2=东2, 3=东3, 4=东4, 5=南1...
-    # 我们使用 round_num: 0=东1, 1=东2, ...
-    round_num = kyoku - 1
+    kyoku = int(game_data.get("kyoku", 1))  # 场内局号 1-4
+    bakaze = (game_data.get("bakaze") or "E").upper()
+    # tenhou-paifu-to-json: kyoku=1-4 为场内局号，bakaze 为场风 E=东/S=南/W=西
+    # round_num: 0=东1, 1=东2, 2=东3, 3=东4, 4=南1, 5=南2, ...
+    if bakaze in ("E", "東"):
+        field_offset = 0
+    elif bakaze in ("S", "南"):
+        field_offset = 4
+    elif bakaze in ("W", "西"):
+        field_offset = 8
+    else:
+        field_offset = 0
+    round_num = field_offset + (kyoku - 1)
     
     # 初始手牌
     tehais_raw = game_data.get("tehais", [[], [], [], []])
@@ -83,7 +87,7 @@ def _parse_round_from_tenhou6(
     for i, th in enumerate(tehais_raw):
         if i < 4 and th:
             tiles = _tehai_to_hand_tiles(th)
-            game_states[i].hand_tiles = set(tiles)
+            game_states[i].hand_tiles = set(tiles)  # GameState 仍用 set，解析中用 list 便于保留枚数
             game_states[i].initial_hand = set(tiles)
     
     # 宝牌指示牌
@@ -96,8 +100,8 @@ def _parse_round_from_tenhou6(
                 s.dora_indicators = [ind]
                 s.visible_tiles[ind] += 1
     
-    # 追踪每个玩家的手牌、舍牌、巡目、立直/副露状态
-    hands: List[set] = [set(gs.hand_tiles) for gs in game_states]
+    # 追踪每个玩家的手牌、舍牌、巡目、立直/副露状态。用 list 存储以正确保留同种牌枚数
+    hands: List[List[int]] = [_tehai_to_hand_tiles(tehais_raw[i]) if i < len(tehais_raw) and tehais_raw[i] else [] for i in range(4)]
     turns_count = [0] * 4
     riichi_seen = False
     call_seen = False
@@ -113,13 +117,16 @@ def _parse_round_from_tenhou6(
             pai = ev.get("pai")
             if pai:
                 t = _pai_to_tile(pai)
-                hands[actor].add(t)
+                hands[actor].append(t)
         
         elif ev_type == "dahai":
             pai = ev.get("pai")
             if not pai:
                 continue
-            t = _pai_to_tile(pai)
+            base = TENHOU6_TO_BASE.get(pai)
+            if base is None:
+                continue
+            t = base * 4  # Discard 编码用 base*4 代表
             tsumogiri = ev.get("tsumogiri", False)
             turns_count[actor] += 1
             
@@ -132,15 +139,20 @@ def _parse_round_from_tenhou6(
             )
             game_states[actor].discards.append(d)
             
-            if t in hands[actor]:
-                hands[actor].remove(t)
-            game_states[actor].hand_tiles_history.append(set(hands[actor]))
+            # 移除手牌中该 base 的任意一张
+            for idx, x in enumerate(hands[actor]):
+                if x // 4 == base:
+                    del hands[actor][idx]
+                    break
+            game_states[actor].hand_tiles_history.append(list(hands[actor]))
             
             for i in range(4):
                 if i != actor:
                     game_states[i].visible_tiles[t] += 1
         
-        elif ev_type == "reach":
+        elif ev_type in ("reach", "riichi", "riichi_accepted"):
+            # tenhou-paifu-to-json 输出 "riichi"/"riichi_accepted"，部分数据为 "reach"/"reach_accepted"
+            # 任一立直相关事件均标记 riichi_seen，确保同巡内后续舍牌正确获得 riichi_happened=True
             riichi_seen = True
         elif ev_type in ("chii", "pon", "kan", "daiminkan", "kakan", "ankan"):
             call_seen = True
@@ -161,10 +173,10 @@ def _parse_round_from_tenhou6(
                         for i in range(4):
                             if i != actor:
                                 game_states[i].visible_tiles[tt] += 1
-                        # 从该玩家手牌移除（简化：按数量移除）
-                        to_remove = [x for x in hands[actor] if x // 4 == tb]
-                        for x in to_remove[: len(all_tiles)]:
-                            hands[actor].discard(x)
+                        # 从该玩家手牌移除（按 base 与数量）
+                        to_remove = [x for x in hands[actor] if x // 4 == tb][: len(all_tiles)]
+                        for x in to_remove:
+                            hands[actor].remove(x)
         
         elif ev_type == "dora":
             # 追加宝牌指示牌
@@ -178,16 +190,28 @@ def _parse_round_from_tenhou6(
                         s.dora_indicators = list(dora_indicators_list)
                         s.visible_tiles[ind] += 1
     
-    # 同步最终手牌
+    # 同步最终手牌（转为 set 以兼容 GameState 类型）
     for i in range(4):
-        game_states[i].hand_tiles = hands[i]
+        game_states[i].hand_tiles = set(hands[i])
     
     return game_states
+
+
+def _round_identity(data: Dict[str, Any]) -> Tuple[str, int, int, int]:
+    """提取局的唯一标识 (bakaze, kyoku, honba, oya)，用于一炮双响去重"""
+    bakaze = (data.get("bakaze") or "E").upper()
+    kyoku = int(data.get("kyoku", 1))
+    honba = int(data.get("honba", 0))
+    oya = int(data.get("oya", 0))
+    return (bakaze, kyoku, honba, oya)
 
 
 def parse_tenhou6_json(json_data: Dict[str, Any]) -> List[GameState]:
     """
     解析 tenhou6 JSON，返回与 MjlogParser.parse() 相同结构的 GameState 列表。
+    
+    一炮双响（一人打牌两家荣和）时，tenhou-paifu-to-json 会为每个 AGARI 产生一个 game 条目，
+    导致同一局被重复输出。此处按 (bakaze, kyoku, honba, oya) 去重，只保留每个局的首次出现。
     
     Args:
         json_data: tenhou6 格式的 dict（来自 tenhou-paifu-to-json 输出）
@@ -197,9 +221,15 @@ def parse_tenhou6_json(json_data: Dict[str, Any]) -> List[GameState]:
     """
     games = json_data.get("games", [])
     all_states: List[GameState] = []
+    seen_rounds: set = set()
     
     for g in games:
         data = g.get("data", {})
+        rid = _round_identity(data)
+        if rid in seen_rounds:
+            # 一炮双响/三家和了：同一局被 tenhou-paifu-to-json 输出多次，只统计一次
+            continue
+        seen_rounds.add(rid)
         game_events = g.get("game", [])
         states = _parse_round_from_tenhou6(data, game_events)
         all_states.extend(states)

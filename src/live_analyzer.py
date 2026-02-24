@@ -19,9 +19,15 @@ from .simple_normalizer import (
     get_consumed_search_patterns,
     log_contains_consumed,
     round_has_matching_consumed,
+    player_has_matching_consumed,
 )
 
 logger = logging.getLogger(__name__)
+
+# 每批从数据库读取的对局数。越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
+ANALYSIS_BATCH_SIZE = 4000
+# 主统计时最多保留的匹配状态条数（仅用于返回给界面，超出部分不保留，避免内存持续增长）
+MATCHED_STATES_CAP = 100
 
 
 def _get_raw_content(content: Union[bytes, str]) -> str:
@@ -38,6 +44,22 @@ def _is_tenhou6_json(raw: str) -> bool:
     """判断是否为 tenhou6 JSON（可做副露字符串搜索）"""
     s = raw.strip()
     return s.startswith("{") and "games" in raw
+
+
+def _game_at_index_contains_consumed(raw: str, game_index: int, consumed_search) -> bool:
+    """
+    检查 raw（tenhou6 JSON）中第 game_index 个小局的原始内容是否包含 consumed。
+    通过提取该小局的 JSON 片段进行字符串搜索，避免解析/结构问题导致的跨局污染。
+    """
+    try:
+        data = json.loads(raw)
+        games = data.get("games", [])
+        if game_index >= len(games):
+            return False
+        game_str = json.dumps(games[game_index], ensure_ascii=False)
+        return log_contains_consumed(game_str, consumed_search)
+    except Exception:
+        return False
 
 
 def _ensure_log_json_column(conn) -> None:
@@ -95,23 +117,30 @@ def parse_log_to_game_states(content: Union[bytes, str]) -> List[GameState]:
     return []
 
 
-def _empty_analysis_result(query_pattern: List[str], target_tile: str) -> Dict:
+def _empty_analysis_result(query_pattern: List[str], target_tile: str, pattern_results: Optional[List] = None) -> Dict:
     """用户取消时返回的空结果"""
-    _, is_combo = parse_target_tiles(target_tile)
+    if target_tile:
+        _, is_combo = parse_target_tiles(target_tile)
+    else:
+        is_combo = False
     dist = {0: 0, 1: 0} if is_combo else {0: 0, 1: 0, 2: 0, 3: 0}
-    return {
+    r = {
         'total_logs_analyzed': 0,
         'total_matches': 0,
         'target_count_distribution': dist,
         'probability_distribution': {k: 0.0 for k in dist},
         'query_pattern': query_pattern,
-        'query_pattern_str': '-'.join(query_pattern),
+        'query_pattern_str': '-'.join(query_pattern) if query_pattern else '',
         'target_tile': target_tile,
         'turn_range': None,
         'variants_count': 0,
         'matched_states': [],
+        'sample_pool': [],
         'is_combo': is_combo,
+        'multi_pattern': False,
+        'pattern_results': pattern_results or [],
     }
+    return r
 
 
 class LiveAnalyzer:
@@ -128,8 +157,9 @@ class LiveAnalyzer:
     
     def analyze_discard_pattern(
         self,
-        query_pattern: List[str],
-        target_tile: str,
+        query_pattern: List[str] = None,
+        target_tile: str = None,
+        query_items: Optional[List[Tuple[List[str], str]]] = None,
         dora_constraint: Optional[str] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
@@ -139,42 +169,74 @@ class LiveAnalyzer:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         total_logs_hint: Optional[int] = None,
+        matched_states_cap: Optional[int] = None,  # 最多保留的匹配状态条数，None 用默认 MATCHED_STATES_CAP
+        analysis_batch_size: Optional[int] = None,  # 每批从数据库读取的对局数，None 用默认 ANALYSIS_BATCH_SIZE
     ) -> Dict:
         """
-        分析舍牌模式，计算目标牌在手牌中的概率
-        
+        分析舍牌模式，计算目标牌在手牌中的概率。
+        支持多舍牌模式：query_items 中任一匹配即计入（A or B or C）。
+
         Args:
-            query_pattern: 查询的舍牌序列，如 ["7s", "9s"]
-            target_tile: 目标牌，如 "8s"
-            dora_constraint: 宝牌约束，"any" 或具体牌如 "6s"
-            visible_constraints: 可见枚数约束，如 {"8s": (0, 2)}
-            riichi_constraint: 立直约束，"any"=无限制, "has_riichi"=有人立直, "no_riichi"=无人立直
-            call_constraint: 副露约束，"any"=无限制, "has_call"=有人副露, "no_call"=无人副露
-            turn_range: 巡目范围 (min, max)，如 (2, 8) 表示仅分析 2-8 巡内的舍牌
+            query_pattern: 单模式时的舍牌序列（与 target_tile 配套，兼容旧接口）
+            target_tile: 单模式时的目标牌
+            query_items: 多模式 [(pattern, target), ...]，如 [(["7s","9s"],"6s"), (["3m","4m"],"2m")]
+            dora_constraint: 宝牌约束（所有模式共用）
+            visible_constraints: 可见枚数约束（所有模式共用）
+            riichi_constraint: 立直约束（所有模式共用）
+            call_constraint: 副露约束（所有模式共用）
+            turn_range: 巡目范围（所有模式共用）
             sample_limit: 最大分析对局数（None = 全部）
             progress_callback: 进度回调函数 (current, total)
-            should_cancel: 取消检查函数，返回 True 则停止分析
-            total_logs_hint: 对局总数预估值（避免耗时的 COUNT(*)；0 表示未知）
-            
-        Returns:
-            分析结果字典
-        """
-        # 生成所有等价变体
-        variants = generate_equivalent_variants(
-            query_pattern, target_tile, visible_constraints
-        )
-        _, is_combo = parse_target_tiles(target_tile)
-        consumed_search = get_consumed_search_patterns(query_pattern)
+            should_cancel: 取消检查函数
+            total_logs_hint: 对局总数预估值
+            matched_states_cap: 最多保留的匹配状态条数（用于界面展示，影响内存）
+            analysis_batch_size: 每批读取对局数（越大越省 SQL 次数，但单批内存约 1.2GB/1000 条）
 
-        # 统计结果；搭子模式只统计 有/没有
+        Returns:
+            分析结果字典；多模式时含 pattern_results 列表
+        """
+        cap = matched_states_cap if matched_states_cap is not None else MATCHED_STATES_CAP
+        batch_size = analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
+        if query_items is not None and len(query_items) > 0:
+            items = query_items
+        elif query_pattern and target_tile:
+            items = [(query_pattern, target_tile)]
+        else:
+            return _empty_analysis_result([], "")
+
+        first_pattern, first_target = items[0]
+        consumed_search = get_consumed_search_patterns(first_pattern)
+        consumed_search_list: List[List] = []  # 多模式时收集各模式的 consumed，用于 log 级预过滤
+        for p, _ in items:
+            cs = get_consumed_search_patterns(p)
+            if cs:
+                consumed_search = consumed_search or cs
+                consumed_search_list.append(cs)
+        if not consumed_search_list:
+            consumed_search_list = [consumed_search] if consumed_search else []
+
+        item_variants = []
+        for p, t in items:
+            vars_p = generate_equivalent_variants(p, t, visible_constraints)
+            _, combo = parse_target_tiles(t)
+            item_variants.append((vars_p, t, combo))
+
+        variants = item_variants[0][0]
+        _, is_combo = parse_target_tiles(first_target)
+
         matched_states = []
+        sample_pool: List[Dict] = []
+        SAMPLE_POOL_CAP = 10000
         total_matches = 0
-        target_count_distribution = (
-            {0: 0, 1: 0} if is_combo else {0: 0, 1: 0, 2: 0, 3: 0}
-        )
-        
+        pattern_matches = [0] * len(items)
+        pattern_distributions = [
+            ({0: 0, 1: 0} if iv[2] else {0: 0, 1: 0, 2: 0, 3: 0})
+            for iv in item_variants
+        ]
+        target_count_distribution = pattern_distributions[0]
+
         if should_cancel and should_cancel():
-            return _empty_analysis_result(query_pattern, target_tile)
+            return _empty_analysis_result(first_pattern, first_target)
 
         conn = sqlite3.connect(self.db_path, timeout=60)
         cur = conn.cursor()
@@ -190,9 +252,8 @@ class LiveAnalyzer:
         
         logger.info(f"开始分析 {total_logs:,} 场对局...")
         
-        # 批量读取并分析
-        batch_size = 1000
-        offset = 0
+        # 批量读取并分析（用 id 游标分页，避免 OFFSET 越大越慢）
+        last_id = None  # None 表示第一页；之后用 WHERE id < last_id
         processed = 0
         
         while True:
@@ -202,14 +263,25 @@ class LiveAnalyzer:
                 break
             
             # 读取批次：优先 log_json（tenhou6 JSON），若无则用 log（XML）
-            query = """
-                SELECT id, COALESCE(log_json, log) as content
-                FROM logs 
-                WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')
-                ORDER BY id DESC
-                LIMIT ? OFFSET ?
-            """
-            cur.execute(query, (batch_size, offset))
+            if last_id is None:
+                query = """
+                    SELECT id, COALESCE(log_json, log) as content
+                    FROM logs 
+                    WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')
+                    ORDER BY id DESC
+                    LIMIT ?
+                """
+                cur.execute(query, (batch_size,))
+            else:
+                query = """
+                    SELECT id, COALESCE(log_json, log) as content
+                    FROM logs 
+                    WHERE ((log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != ''))
+                      AND id < ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                """
+                cur.execute(query, (last_id, batch_size))
             logs = cur.fetchall()
             
             if not logs:
@@ -219,15 +291,23 @@ class LiveAnalyzer:
             for log_id, log_content in logs:
                 if should_cancel and should_cancel():
                     conn.close()
-                    return _empty_analysis_result(query_pattern, target_tile)
+                    return _empty_analysis_result(first_pattern, first_target)
                 try:
                     raw = _get_raw_content(log_content)
-                    if consumed_search and _is_tenhou6_json(raw):
-                        if not log_contains_consumed(raw, consumed_search):
-                            processed += 1
-                            if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                progress_callback(processed, total_logs)
-                            continue
+                    if consumed_search_list and _is_tenhou6_json(raw):
+                        if len(items) == 1:
+                            if not log_contains_consumed(raw, consumed_search_list[0]):
+                                processed += 1
+                                if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                    progress_callback(processed, total_logs)
+                                continue
+                        else:
+                            # 多模式：仅当牌谱中不包含任一模式的 consumed 时才跳过
+                            if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
+                                processed += 1
+                                if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                    progress_callback(processed, total_logs)
+                                continue
                     game_states = parse_log_to_game_states(raw)
                     
                     # 按小局分组（每局 4 个玩家）
@@ -247,10 +327,15 @@ class LiveAnalyzer:
                             if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                                 continue
 
-                        # 含吃碰时：仅处理本局确有该副露的小局，避免半庄级预过滤误通过
-                        if consumed_search and not round_has_matching_consumed(round_players, consumed_search):
-                            continue
-                        
+                        # 局级 consumed 预过滤：单模式用单一 consumed；多模式需至少一个模式的 consumed 存在
+                        if consumed_search_list:
+                            if len(items) == 1:
+                                if not round_has_matching_consumed(round_players, consumed_search_list[0]):
+                                    continue
+                            else:
+                                if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
+                                    continue
+
                         # 分析该局每个玩家
                         for player_state in round_players:
                             # 提取巡目范围内的舍牌
@@ -285,9 +370,24 @@ class LiveAnalyzer:
                                 ]
 
                                 honor_ctx = {**honor_ctx_base, "current_discard_turn": discard.turn}
-                                matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
+                                matched_variant = None
+                                matched_idx = -1
+                                for idx, (vars_p, _, _) in enumerate(item_variants):
+                                    cs = get_consumed_search_patterns(items[idx][0])
+                                    if cs:
+                                        if not round_has_matching_consumed(round_players, cs):
+                                            continue
+                                        # 必须由本玩家完成该副露，否则会跨玩家污染（如 c0p4p 与 c0p6p 同局时）
+                                        if not player_has_matching_consumed(player_state, cs):
+                                            continue
+                                    mv = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
+                                    if mv:
+                                        matched_variant = mv
+                                        matched_idx = idx
+                                        break
                                 if not matched_variant:
                                     continue
+                                _, _, item_combo = item_variants[matched_idx]
                                 
                                 # 宝牌约束 dora_unrelated：取决于匹配到的等价变体花色
                                 if dora_constraint == "dora_unrelated" and dora_str:
@@ -318,9 +418,10 @@ class LiveAnalyzer:
                                     match_visible = True
                                     for tile_str, (min_count, max_count) in vc.items():
                                         base_code = MjlogParser.string_to_tile(tile_str)
+                                        equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
                                         count = sum(
                                             c for t, c in player_state.visible_tiles.items()
-                                            if t // 4 == base_code
+                                            if t // 4 in equiv_bases
                                         )
                                         if not (min_count <= count <= max_count):
                                             match_visible = False
@@ -328,46 +429,95 @@ class LiveAnalyzer:
                                     if not match_visible:
                                         continue
                                 
+                                # 排除：若本巡打出的牌就是目标牌，不计入统计（与无副露情形一致）
+                                mapped_target = matched_variant["target"]
+                                if item_combo:
+                                    target_equiv = set()
+                                    for t in mapped_target:
+                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                    if discard.tile // 4 in target_equiv:
+                                        continue
+                                else:
+                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                        continue
+                                
                                 # 匹配成功！
                                 total_matches += 1
+                                pattern_matches[matched_idx] += 1
                                 
                                 # 获取该巡打牌后的手牌快照（orig_i 为完整舍牌序列中的下标）
+                                # 必须为 list 以保留同种牌枚数，set 会合并重复导致“3张5p显示为1张”
                                 if orig_i < len(player_state.hand_tiles_history):
                                     hand_at_turn = player_state.hand_tiles_history[orig_i]
                                 else:
                                     logger.warning(f"手牌历史记录不足：巡目{orig_i+1}，历史长度{len(player_state.hand_tiles_history)}")
                                     hand_at_turn = player_state.hand_tiles
+                                hand_at_turn = list(hand_at_turn)  # 副本，且确保为 list（非 set）以保留同种牌枚数
                                 
-                                # 使用匹配变体的目标牌（无需映射）
-                                mapped_target = matched_variant["target"]
-                                if is_combo:
-                                    # 搭子：手牌是否包含所有目标牌（每种至少1张）
+                                # mapped_target 已在上方排除逻辑中取得
+                                if item_combo:
+                                    # 搭子：手牌是否包含所有目标牌（每种至少1张，0/5 视为不同）
                                     target_codes = [
                                         MjlogParser.string_to_tile(t) for t in mapped_target
                                     ]
                                     hand_bases = [t // 4 for t in hand_at_turn]
                                     target_count = 1 if all(
-                                        hand_bases.count(c) >= 1 for c in target_codes
+                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
+                                        for c in target_codes
                                     ) else 0
                                 else:
                                     mapped_target_code = MjlogParser.string_to_tile(mapped_target)
+                                    equiv = MjlogParser.get_count_equivalent_bases(mapped_target_code)
                                     target_count = sum(
                                         1 for tile in hand_at_turn
-                                        if tile // 4 == mapped_target_code
+                                        if tile // 4 in equiv
                                     )
                                     target_count = min(target_count, 3)
-                                target_count_distribution[target_count] += 1
+                                pattern_distributions[matched_idx][target_count] += 1
                                 
-                                # 记录匹配状态
-                                matched_states.append({
-                                    'round_num': player_state.round_num,
-                                    'turn': discard.turn,
-                                    'target_count': target_count,
-                                    'actual_pattern': hand_discard_strings,
-                                    'mapped_target': mapped_target,
-                                    'hand_tiles': list(hand_at_turn),
-                                    'visible_tiles': dict(player_state.visible_tiles)
-                                })
+                                # 记录匹配状态（仅保留前 cap 条，避免内存持续增长）
+                                if len(matched_states) < cap:
+                                    matched_states.append({
+                                        'round_num': player_state.round_num,
+                                        'turn': discard.turn,
+                                        'target_count': target_count,
+                                        'actual_pattern': hand_discard_strings,
+                                        'mapped_target': mapped_target,
+                                        'hand_tiles': list(hand_at_turn),
+                                        'visible_tiles': dict(player_state.visible_tiles)
+                                    })
+                                
+                                # 主统计时顺带收集完整样本，供采样直接使用
+                                if len(sample_pool) < SAMPLE_POOL_CAP:
+                                    visible_tiles_dict = dict(player_state.visible_tiles)
+                                    dora_readable = "".join(
+                                        MjlogParser.tile_to_string(d)
+                                        for d in round_players[0].dora_indicators[:5]
+                                    ) if round_players[0].dora_indicators else "（无）"
+                                    if item_combo and isinstance(mapped_target, list):
+                                        visible_target = ", ".join(
+                                            f"{t}:{_visible_count(visible_tiles_dict, t)}"
+                                            for t in mapped_target
+                                        )
+                                    else:
+                                        visible_target = str(_visible_count(visible_tiles_dict, mapped_target))
+                                    sample_pool.append({
+                                        "log_id": log_id,
+                                        "round_num": player_state.round_num,
+                                        "honba": player_state.honba,
+                                        "oya": player_state.oya,
+                                        "player_id": player_state.player_id,
+                                        "turn": discard.turn,
+                                        "actual_pattern": hand_discard_strings.copy(),
+                                        "mapped_target": mapped_target,
+                                        "hand_tiles": list(hand_at_turn),
+                                        "visible_tiles": visible_tiles_dict,
+                                        "dora_readable": dora_readable,
+                                        "visible_target": visible_target,
+                                        "target_count": target_count,
+                                        "is_combo": item_combo,
+                                        "matched_pattern_idx": matched_idx,
+                                    })
                     
                 except Exception as e:
                     logger.error(f"解析对局 {log_id} 失败: {e}")
@@ -383,7 +533,7 @@ class LiveAnalyzer:
                 if sample_limit and processed >= sample_limit:
                     break
             
-            offset += batch_size
+            last_id = logs[-1][0]  # ORDER BY id DESC，最后一条 id 最小，用于下一页游标
             
             # 达到样本限制
             if sample_limit and processed >= sample_limit:
@@ -391,29 +541,52 @@ class LiveAnalyzer:
         
         conn.close()
 
-        # 计算概率分布
+        target_count_distribution = pattern_distributions[0]
         probability_distribution = {}
         keys = [0, 1] if is_combo else [0, 1, 2, 3]
         for count in keys:
-            prob = (target_count_distribution.get(count, 0) / total_matches * 100) if total_matches > 0 else 0
+            prob = (target_count_distribution.get(count, 0) / max(1, pattern_matches[0]) * 100) if pattern_matches[0] > 0 else 0
             probability_distribution[count] = prob
+
+        pattern_results = []
+        for idx, (p, t) in enumerate(items):
+            dist = pattern_distributions[idx]
+            prob = {}
+            k = [0, 1] if item_variants[idx][2] else [0, 1, 2, 3]
+            for c in k:
+                prob[c] = (dist.get(c, 0) / max(1, pattern_matches[idx]) * 100) if pattern_matches[idx] > 0 else 0
+            pattern_results.append({
+                'pattern': p,
+                'pattern_str': '-'.join(p),
+                'target': t,
+                'matches': pattern_matches[idx],
+                'target_count_distribution': dist,
+                'probability_distribution': prob,
+                'is_combo': item_variants[idx][2],
+            })
 
         result = {
             'total_logs_analyzed': processed,
             'total_matches': total_matches,
             'target_count_distribution': target_count_distribution,
             'probability_distribution': probability_distribution,
-            'query_pattern': query_pattern,
-            'query_pattern_str': '-'.join(query_pattern),
-            'target_tile': target_tile,
+            'query_pattern': first_pattern,
+            'query_pattern_str': '-'.join(first_pattern),
+            'target_tile': first_target,
             'turn_range': turn_range,
-            'variants_count': len(variants),
-            'matched_states': matched_states[:100],
-            'is_combo': is_combo
+            'variants_count': sum(len(iv[0]) for iv in item_variants),
+            'matched_states': matched_states[:cap],
+            'sample_pool': sample_pool,
+            'is_combo': is_combo,
+            'multi_pattern': len(items) > 1,
+            'pattern_results': pattern_results,
         }
 
         logger.info(f"分析完成: 匹配 {total_matches} 个状态")
-        if is_combo:
+        if len(items) > 1:
+            for pr in pattern_results:
+                logger.info(f"  {pr['pattern_str']}→{pr['target']}: {pr['matches']:,} 次")
+        elif is_combo:
             logger.info(f"  没有: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例)")
             logger.info(f"  有: {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例)")
         else:
@@ -439,20 +612,27 @@ class LiveAnalyzer:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         total_logs_hint: Optional[int] = None,
+        sample_pool: Optional[List[Dict]] = None,  # 主统计时预收集的样本池，有则无需二次遍历
+        analysis_batch_size: Optional[int] = None,
     ) -> List[Dict]:
         """
         收集验证样本，用于人工复盘核对。
         返回含 log_id、oya、正确小局显示等完整信息的样本列表。
+        若传入 sample_pool（主统计时预收集），则直接从中采样，无需二次分析。
         """
+        batch_size = analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
+        if sample_pool and len(sample_pool) > 0:
+            # 从预收集的样本池中筛选并取前 N 个，无需遍历牌谱
+            candidates = sample_pool
+            if target_count_filter is not None:
+                candidates = [s for s in sample_pool if s["target_count"] == target_count_filter]
+            return candidates[:sample_count]
+
         variants = generate_equivalent_variants(
             query_pattern, target_tile, visible_constraints
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
         samples = []
-
-        def _visible_count(visible_tiles: dict, tile_str: str) -> int:
-            base = MjlogParser.string_to_tile(tile_str)
-            return sum(c for t, c in visible_tiles.items() if t // 4 == base)
 
         if should_cancel and should_cancel():
             return []
@@ -469,17 +649,22 @@ class LiveAnalyzer:
         if sample_limit:
             total_logs = min(total_logs, sample_limit) if total_logs > 0 else sample_limit
 
-        batch_size = 1000
-        offset = 0
+        last_id = None  # 游标分页，避免 OFFSET 越大越慢
         processed = 0
 
         while True:
             if should_cancel and should_cancel():
                 break
-            cur.execute(
-                "SELECT id, COALESCE(NULLIF(log_json, ''), log) FROM logs WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '') ORDER BY id DESC LIMIT ? OFFSET ?",
-                (batch_size, offset),
-            )
+            if last_id is None:
+                cur.execute(
+                    "SELECT id, COALESCE(NULLIF(log_json, ''), log) FROM logs WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '') ORDER BY id DESC LIMIT ?",
+                    (batch_size,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, COALESCE(NULLIF(log_json, ''), log) FROM logs WHERE ((log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')) AND id < ? ORDER BY id DESC LIMIT ?",
+                    (last_id, batch_size),
+                )
             logs = cur.fetchall()
             if not logs:
                 break
@@ -511,6 +696,8 @@ class LiveAnalyzer:
                             continue
 
                         for player_state in round_players:
+                            if consumed_search and not player_has_matching_consumed(player_state, consumed_search):
+                                continue
                             if turn_range:
                                 min_turn, max_turn = turn_range
                                 in_range = [
@@ -571,9 +758,10 @@ class LiveAnalyzer:
                                     match_visible = True
                                     for tile_str, (min_count, max_count) in vc.items():
                                         base_code = MjlogParser.string_to_tile(tile_str)
+                                        equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
                                         count = sum(
                                             c for t, c in player_state.visible_tiles.items()
-                                            if t // 4 == base_code
+                                            if t // 4 in equiv_bases
                                         )
                                         if not (min_count <= count <= max_count):
                                             match_visible = False
@@ -581,26 +769,40 @@ class LiveAnalyzer:
                                     if not match_visible:
                                         continue
 
-                                hand_at_turn = (
+                                # 排除：若本巡打出的牌就是目标牌，不计入（与主统计逻辑一致）
+                                mapped_target = matched_variant["target"]
+                                sample_is_combo = matched_variant.get("is_combo", False)
+                                if sample_is_combo:
+                                    target_equiv = set()
+                                    for t in mapped_target:
+                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                    if discard.tile // 4 in target_equiv:
+                                        continue
+                                else:
+                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                        continue
+
+                                hh = (
                                     player_state.hand_tiles_history[orig_i]
                                     if orig_i < len(player_state.hand_tiles_history)
                                     else player_state.hand_tiles
                                 )
-                                mapped_target = matched_variant["target"]
-                                sample_is_combo = matched_variant.get("is_combo", False)
+                                hand_at_turn = list(hh)  # 必须 list 以保留同种牌枚数
                                 if sample_is_combo:
                                     target_codes = [
                                         MjlogParser.string_to_tile(t) for t in mapped_target
                                     ]
                                     hand_bases = [t // 4 for t in hand_at_turn]
                                     target_count = 1 if all(
-                                        hand_bases.count(c) >= 1 for c in target_codes
+                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
+                                        for c in target_codes
                                     ) else 0
                                 else:
                                     mapped_target_code = MjlogParser.string_to_tile(mapped_target)
+                                    equiv = MjlogParser.get_count_equivalent_bases(mapped_target_code)
                                     target_count = sum(
                                         1 for tile in hand_at_turn
-                                        if tile // 4 == mapped_target_code
+                                        if tile // 4 in equiv
                                     )
                                     target_count = min(target_count, 3)
 
@@ -653,7 +855,7 @@ class LiveAnalyzer:
             processed += len(logs)
             if progress_callback and processed % 500 == 0:
                 progress_callback(processed, total_logs)
-            offset += batch_size
+            last_id = logs[-1][0]  # ORDER BY id DESC，用于下一页游标
             if sample_limit and processed >= sample_limit:
                 break
             if len(samples) >= sample_count:
@@ -661,6 +863,13 @@ class LiveAnalyzer:
 
         conn.close()
         return samples
+
+
+def _visible_count(visible_tiles: dict, tile_str: str) -> int:
+    """统计某牌在可见牌中的枚数（0m/0p/0s 与 5m/5p/5s 视为不同牌）"""
+    base = MjlogParser.string_to_tile(tile_str)
+    equiv = MjlogParser.get_count_equivalent_bases(base)
+    return sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
 
 
 def _fmt_target(mt) -> str:
@@ -675,6 +884,11 @@ def _target_desc(s: dict) -> str:
     return "应有{}张在手牌".format(s["target_count"])
 
 
+def _target_display_set(mt) -> set:
+    """目标牌的显示集合（0m/0p/0s 与 5m/5p/5s 视为不同牌）"""
+    return set(mt) if isinstance(mt, list) else {mt}
+
+
 def format_samples_for_display(samples: List[Dict], query_pattern_str: str, target_tile: str) -> str:
     """将样本格式化为可读文本，支持单张和搭子"""
     is_combo = samples[0].get("is_combo", False) if samples else False
@@ -687,7 +901,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     ]
     for i, s in enumerate(samples, 1):
         mt = s["mapped_target"]
-        mt_set = set(mt) if isinstance(mt, list) else {mt}
+        mt_set = _target_display_set(mt)
         hand_parts = []
         for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
             ts = MjlogParser.tile_to_string(t)
@@ -738,4 +952,10 @@ def get_database_stats(db_path: str) -> Dict:
     stats['total_logs'] = cur.fetchone()[0]
     
     # 数据库大小
-    import 
+    import os
+    if os.path.exists(db_path):
+        stats['db_size_mb'] = os.path.getsize(db_path) / (1024 * 1024)
+    
+    conn.close()
+    
+    return stats

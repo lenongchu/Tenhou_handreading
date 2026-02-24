@@ -24,7 +24,7 @@ HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
 # 1z-4z 风牌对应中文，用于 @p:kf 客风校验
 Z_TO_WIND = {"1z": "东", "2z": "南", "3z": "西", "4z": "北"}
 
-# 赤五输入：0m=赤5m, 0p=赤5p, 0s=赤5s（与 5m/5p/5s 同 base，匹配时等价）
+# 赤五输入：0m=赤5m, 0p=赤5p, 0s=赤5s（编码独立 base 34/35/36，与 5m/5p/5s 视为不同牌）
 RED_FIVES = frozenset({"0m", "0p", "0s"})
 
 # 吃碰占位符前缀：解析后为 @c:... 或 @p:...；语义为具体吃的/碰的牌（如 4mc3m5m=用3m5m吃4m）
@@ -104,20 +104,43 @@ def _single_consumed_matches(raw: str, ev_type: str, tiles: List[str]) -> bool:
 
 
 def _calls_have_consumed(calls: list, ev_type: str, want_tiles: List[str]) -> bool:
-    """检查 calls 中是否有 ev_type 类型的副露且 consumed 匹配（含赤五等价）"""
-    def tiles_eq(a_list, b_list):
+    """检查 calls 中是否有 ev_type 类型的副露且 consumed 精确匹配（0p 与 5p 视为不同牌）"""
+    def consumed_eq(a_list, b_list):
         if len(a_list) != len(b_list):
             return False
         sa, sb = sorted(a_list), sorted(b_list)
-        return all(_tile_base_eq(ta, tb) for ta, tb in zip(sa, sb))
+        return all(ta == tb for ta, tb in zip(sa, sb))
 
     for c in calls:
         if getattr(c, "call_type", None) != ev_type:
             continue
         got = getattr(c, "consumed", []) or []
-        if isinstance(got, list) and tiles_eq(want_tiles, got):
+        if isinstance(got, list) and consumed_eq(want_tiles, got):
             return True
     return False
+
+
+def player_has_matching_consumed(player_state, search_patterns: List[ConsumedSearchItem]) -> bool:
+    """
+    检查该玩家是否发生过 search_patterns 中的副露。
+    多舍牌模式下必须用此检查：仅当「本玩家」有该副露时，其舍牌才计入该模式；
+    否则会误将 A 玩家的舍牌计入 B 玩家副露的模式（如 c0p4p 与 c0p6p 同局时互相污染）。
+    """
+    if not search_patterns:
+        return True
+    calls = getattr(player_state, "calls", []) or []
+    for item in search_patterns:
+        if isinstance(item, tuple):
+            ev_type, tiles = item
+            if not _calls_have_consumed(calls, ev_type, tiles):
+                return False
+        else:
+            if not any(
+                _calls_have_consumed(calls, ev_type, tiles)
+                for ev_type, tiles in item
+            ):
+                return False
+    return True
 
 
 def round_has_matching_consumed(round_players: list, search_patterns: List[ConsumedSearchItem]) -> bool:
@@ -176,13 +199,8 @@ def _is_honor_tile(tile_str: str) -> bool:
 
 
 def _tile_base_eq(a: str, b: str) -> bool:
-    """两牌是否同种（0m 与 5m 等价，均为 5m base）"""
-    if a == b:
-        return True
-    red_to_five = {"0m": "5m", "0p": "5p", "0s": "5s"}
-    a_n = red_to_five.get(a, a)
-    b_n = red_to_five.get(b, b)
-    return a_n == b_n
+    """两牌是否同种。已弃用：consumed/舍牌匹配等均使用精确匹配，0m/0p/0s 与 5m/5p/5s 视为不同牌。"""
+    return a == b
 
 
 def _parse_call_element(s: str) -> Optional[Tuple[str, bool]]:
@@ -562,8 +580,6 @@ def get_acceptable_last_tiles(variants: List[Dict]) -> frozenset:
                     last_tiles.update(HONOR_NAMES)
                 else:
                     last_tiles.add(tile)
-                    if tile in RED_FIVES:
-                        last_tiles.add({"0m": "5m", "0p": "5p", "0s": "5s"}[tile])
                 break
     return frozenset(last_tiles)
 
@@ -590,11 +606,14 @@ def map_target_tile(query_pattern: List[str], actual_pattern: List[str], target_
     return matched["target"] if matched else target_tile
 
 
-def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] = None) -> bool:
+def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] = None,
+                           require_immediate: bool = False) -> bool:
     """
     检查 pat_tile (@c:xyz 或 @p:xyz) 是否与 calls 中某次副露匹配。
     仅考虑在该舍牌之前发生的副露（context["current_discard_turn"]）。
-    @c:0p6p -> 需有 chii 且 consumed 含 0p、6p（含赤五等价）
+    require_immediate: 若为 True，要求该舍牌必须为副露后立即打出的那张（from_discard_turn == current_turn），
+       以确保巡目/立直等场况约束正确作用（如 c0p6p-$ 中 $ 必须是吃完后立刻打出的牌）。
+    @c:0p6p -> 需有 chii 且 consumed 精确为 ["0p","6p"]（0p 与 5p 视为不同牌）
     @p:1z1z -> 需有 pon 且 consumed 含 1z、1z
     """
     if not pat_tile.startswith(CALL_PREFIX) or ":" not in pat_tile:
@@ -611,12 +630,11 @@ def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] =
 
     current_turn = (context or {}).get("current_discard_turn")
 
-    def tiles_eq(a_list, b_list):
+    def consumed_eq(a_list, b_list):
         if len(a_list) != len(b_list):
             return False
-        sa = sorted(a_list)
-        sb = sorted(b_list)
-        return all(_tile_base_eq(ta, tb) for ta, tb in zip(sa, sb))
+        sa, sb = sorted(a_list), sorted(b_list)
+        return all(ta == tb for ta, tb in zip(sa, sb))  # 0p 与 5p 视为不同牌
 
     for c in calls:
         # 仅考虑在打这张牌之前已发生的副露
@@ -624,12 +642,15 @@ def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] =
             from_turn = getattr(c, "from_discard_turn", 1)
             if from_turn > current_turn:
                 continue
+            # 若要求“紧接副露”，则当前舍牌必须就是副露后打出的那张
+            if require_immediate and from_turn != current_turn:
+                continue
         if getattr(c, "call_type", None) != want_type:
             continue
         got = getattr(c, "consumed", []) or []
         if not isinstance(got, list):
             got = list(got) if got else []
-        if tiles_eq(want_tiles, got):
+        if consumed_eq(want_tiles, got):
             return True
     return False
 
@@ -677,12 +698,21 @@ def _match_pattern_at_end(
                 if not kyokuze_list:
                     p_idx -= 1
                     continue
+                next_elem = pattern[p_idx + 1] if p_idx + 1 < len(pattern) else None
+                next_tile = next_elem[0] if next_elem else None
+                require_immediate_kf = (
+                    next_tile is not None
+                    and next_tile != "*"
+                    and not (next_tile.startswith(CALL_PREFIX) if isinstance(next_tile, str) else False)
+                )
                 has_kf_pon = False
                 current_turn = ctx.get("current_discard_turn")
                 for c in calls:
                     if current_turn is not None:
                         from_turn = getattr(c, "from_discard_turn", 1)
                         if from_turn > current_turn:
+                            continue
+                        if require_immediate_kf and from_turn != current_turn:
                             continue
                     if getattr(c, "call_type", None) == "pon":
                         pai_cn = Z_TO_WIND.get(getattr(c, "pai", ""))
@@ -693,7 +723,16 @@ def _match_pattern_at_end(
                     return False
             else:
                 # @c:xyz / @p:xyz：须校验 calls 中有对应吃/碰（且在该舍牌之前发生）
-                if not _consumed_matches_call(pat_tile, calls, ctx):
+                # require_immediate: 若副露后紧跟 $ 或具体牌（无 * 隔开），则当前舍牌必须是副露后立刻打出的那张，
+                #   以便巡目/立直等场况约束正确作用
+                next_elem = pattern[p_idx + 1] if p_idx + 1 < len(pattern) else None
+                next_tile = next_elem[0] if next_elem else None
+                require_immediate = (
+                    next_tile is not None
+                    and next_tile != "*"
+                    and not (next_tile.startswith(CALL_PREFIX) if isinstance(next_tile, str) else False)
+                )
+                if not _consumed_matches_call(pat_tile, calls, ctx, require_immediate=require_immediate):
                     return False
             p_idx -= 1
             continue
@@ -762,8 +801,8 @@ def _match_pattern_at_end(
             p_idx -= 1
             continue
 
-        # 具体牌：精确或赤五等价（0m 与 5m 同 base）
-        if not _tile_base_eq(tile_str, pat_tile):
+        # 具体牌：精确匹配（0m/0p/0s 与 5m/5p/5s 视为不同牌）
+        if tile_str != pat_tile:
             return False
         consumed_any_discard = True
         d_idx -= 1

@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Union
 from collections import Counter as PyCounter
 
 
@@ -22,7 +22,7 @@ class CallInfo:
 class Discard:
     """舍牌信息"""
     turn: int           # 巡目（该玩家的第几次出牌）
-    tile: int           # 牌编码（0-135）
+    tile: int           # 牌编码（0-147，含赤五 base 34-36）
     is_tsumogiri: bool  # 是否摸切
     riichi_happened: bool = False   # 打出此牌时，是否已有人立直
     call_happened: bool = False     # 打出此牌时，是否已有人副露（吃/碰/杠）
@@ -36,9 +36,9 @@ class GameState:
     honba: int = 0                      # 本场数（连庄次数）
     oya: int = 0                        # 该局亲家（庄家）的 player_id
     discards: List[Discard] = field(default_factory=list)  # 本家舍牌序列
-    hand_tiles: Set[int] = field(default_factory=set)      # 当前手牌（0-135）
+    hand_tiles: Set[int] = field(default_factory=set)      # 当前手牌（0-147，含赤五）
     initial_hand: Set[int] = field(default_factory=set)    # 初始配牌
-    hand_tiles_history: List[Set[int]] = field(default_factory=list)  # 每一巡打牌后的手牌快照
+    hand_tiles_history: List[Union[Set[int], List[int]]] = field(default_factory=list)  # 每一巡打牌后的手牌快照（list 可保留同种牌枚数）
     dora_indicators: List[int] = field(default_factory=list)  # 宝牌指示牌
     visible_tiles: PyCounter = field(default_factory=PyCounter)  # 其他3家可见牌统计
     calls: List["CallInfo"] = field(default_factory=list)  # 本家副露列表，用于 @p:kf 客风校验
@@ -55,7 +55,7 @@ class TileUtils:
 
     @staticmethod
     def tile_to_string(tile: int) -> str:
-        """牌编码（0-135）→ 字符串（如 3s、东）"""
+        """牌编码（0-147）→ 字符串（如 3s、东、0m 赤五）"""
         base_tile = tile // 4
         if 0 <= base_tile < 9:
             return f"{base_tile + 1}m"
@@ -63,6 +63,12 @@ class TileUtils:
             return f"{base_tile - 9 + 1}p"
         elif 18 <= base_tile < 27:
             return f"{base_tile - 18 + 1}s"
+        elif base_tile == 34:
+            return "0m"
+        elif base_tile == 35:
+            return "0p"
+        elif base_tile == 36:
+            return "0s"
         elif base_tile == 27:
             return "东"
         elif base_tile == 28:
@@ -81,16 +87,16 @@ class TileUtils:
 
     @staticmethod
     def string_to_tile(tile_str: str) -> int:
-        """字符串（如 3s、东、0m 赤五）→ base 编码（0-33）"""
+        """字符串（如 3s、东、0m 赤五）→ base 编码（0-36）"""
         if len(tile_str) == 2:
             num = int(tile_str[0])
             suit = tile_str[1]
             if suit == "m":
-                return (4 if num == 0 else num - 1)  # 0m = 赤5m = base 4
+                return 34 if num == 0 else num - 1  # 0m = 赤5m = base 34
             elif suit == "p":
-                return 9 + (4 if num == 0 else num - 1)  # 0p = 赤5p
+                return 35 if num == 0 else 9 + num - 1  # 0p = 赤5p = base 35
             elif suit == "s":
-                return 18 + (4 if num == 0 else num - 1)  # 0s = 赤5s
+                return 36 if num == 0 else 18 + num - 1  # 0s = 赤5s = base 36
         wind_map = {"东": 27, "南": 28, "西": 29, "北": 30}
         dragon_map = {"白": 31, "发": 32, "中": 33}
         z_map = {"1z": 27, "2z": 28, "3z": 29, "4z": 30, "5z": 31, "6z": 32, "7z": 33}
@@ -168,6 +174,16 @@ class TileUtils:
         if 27 <= base <= 33:
             return cls.HONOR_Z[base - 27]
         return None
+
+    @classmethod
+    def bases_equivalent_for_count(cls, base_a: int, base_b: int) -> bool:
+        """两 base 在统计目标数时是否等价（0m/0p/0s 与 5m/5p/5s 视为不同牌）"""
+        return base_a == base_b
+
+    @classmethod
+    def get_count_equivalent_bases(cls, base: int):
+        """返回该 base 在统计目标数时的等价 base（0m/0p/0s 与 5m/5p/5s 视为不同，仅自身）"""
+        return {base}
 
 
 # 向后兼容：保留 MjlogParser 作为 TileUtils 的别名
