@@ -105,6 +105,8 @@ def _parse_round_from_tenhou6(
     turns_count = [0] * 4
     riichi_seen = False
     call_seen = False
+    # 立直 step1（riichi/reach）：下一张该玩家的 dahai 即为立直宣言牌
+    pending_riichi_actor: Optional[int] = None
     dora_indicators_list = list(game_states[0].dora_indicators)
     
     for ev in game_events:
@@ -130,12 +132,18 @@ def _parse_round_from_tenhou6(
             tsumogiri = ev.get("tsumogiri", False)
             turns_count[actor] += 1
             
+            # 若上一事件为该玩家的立直 step1，则此 dahai 为立直宣言牌
+            is_riichi_decl = actor == pending_riichi_actor
+            if is_riichi_decl:
+                pending_riichi_actor = None
+            
             d = Discard(
                 turn=turns_count[actor],
                 tile=t,
                 is_tsumogiri=tsumogiri,
                 riichi_happened=riichi_seen,
                 call_happened=call_seen,
+                is_riichi_declaration=is_riichi_decl,
             )
             game_states[actor].discards.append(d)
             
@@ -154,6 +162,9 @@ def _parse_round_from_tenhou6(
             # tenhou-paifu-to-json 输出 "riichi"/"riichi_accepted"，部分数据为 "reach"/"reach_accepted"
             # 任一立直相关事件均标记 riichi_seen，确保同巡内后续舍牌正确获得 riichi_happened=True
             riichi_seen = True
+            # 仅 step1（riichi/reach，非 riichi_accepted）时，下一张该玩家的 dahai 为立直宣言牌
+            if ev_type in ("reach", "riichi"):
+                pending_riichi_actor = actor
         elif ev_type in ("chii", "pon", "kan", "daiminkan", "kakan", "ankan"):
             call_seen = True
             pai = ev.get("pai")
@@ -164,6 +175,7 @@ def _parse_round_from_tenhou6(
                 game_states[actor].calls.append(
                     CallInfo(call_type=ev_type, pai=pai, consumed=consumed_str, from_discard_turn=from_discard)
                 )
+            # 可见牌：pai（鸣牌）和 consumed（自己贡献）都对其他玩家可见
             all_tiles = ([pai] if pai else []) + consumed
             for p in all_tiles:
                 if p:
@@ -173,10 +185,13 @@ def _parse_round_from_tenhou6(
                         for i in range(4):
                             if i != actor:
                                 game_states[i].visible_tiles[tt] += 1
-                        # 从该玩家手牌移除（按 base 与数量）
-                        to_remove = [x for x in hands[actor] if x // 4 == tb][: len(all_tiles)]
-                        for x in to_remove:
-                            hands[actor].remove(x)
+            # 仅从手牌移除 consumed（自己贡献的牌）；pai 来自对手河牌，不在手牌中，不可移除
+            for p in consumed_str:
+                tb = TENHOU6_TO_BASE.get(p)
+                if tb is not None:
+                    to_remove = [x for x in hands[actor] if x // 4 == tb]
+                    if to_remove:
+                        hands[actor].remove(to_remove[0])
         
         elif ev_type == "dora":
             # 追加宝牌指示牌

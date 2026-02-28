@@ -17,9 +17,11 @@ import re
 from typing import List, Dict, Tuple, Optional, Union
 from itertools import product, permutations
 
+from .mjlog_parser import MjlogParser
 
-# 字牌占位符：z=任意字牌, zf=自风, kf=客风, z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
-HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
+
+# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
+HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "yp", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
 HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
 # 1z-4z 风牌对应中文，用于 @p:kf 客风校验
 Z_TO_WIND = {"1z": "东", "2z": "南", "3z": "西", "4z": "北"}
@@ -30,6 +32,234 @@ RED_FIVES = frozenset({"0m", "0p", "0s"})
 # 吃碰占位符前缀：解析后为 @c:... 或 @p:...；语义为具体吃的/碰的牌（如 4mc3m5m=用3m5m吃4m）
 # 含吃或数牌碰时不生成花色/镜像等价变体，仅碰字牌时仍生成变体
 CALL_PREFIX = "@"
+
+
+def _wind_to_z(wind: str) -> str:
+    """东/南/西/北 -> 1z/2z/3z/4z"""
+    m = {"东": "1z", "南": "2z", "西": "3z", "北": "4z"}
+    return m.get(wind, wind)
+
+
+# tenhou-paifu-to-json 的 consumed 可能为 "1z"/"3z" 或 "东"/"西" 等，需统一为 1z-7z 再与 yakuhai_set 比较
+HONOR_TO_Z = {"东": "1z", "南": "2z", "西": "3z", "北": "4z", "白": "5z", "发": "6z", "中": "7z"}
+
+
+def _honor_tile_to_z(tile: str) -> str:
+    """将字牌统一为 1z-7z 格式，便于役牌比较"""
+    if tile in HONOR_TO_Z:
+        return HONOR_TO_Z[tile]
+    if isinstance(tile, str) and len(tile) == 2 and tile[0].isdigit() and tile[1] == "z":
+        return tile
+    return tile
+
+
+def parse_call_area_constraint(s: str) -> Optional[Tuple[str, Optional[List[str]], Optional[str]]]:
+    """
+    解析副露区域约束字符串。
+    "pzfzf" -> ("pon", None, "zf") 碰自风
+    "pypyp" -> ("pon", None, "yp") 碰役牌
+    "4mc3m5m" -> ("chii", ["3m","5m"], None) 用3m5m吃4m
+    "p1z1z" -> ("pon", ["1z","1z"], None) 碰东
+    """
+    s = (s or "").strip()
+    if len(s) < 2:
+        return None
+    s_lower = s.lower()
+    if "c" in s_lower and ("m" in s_lower or "p" in s_lower or "s" in s_lower):
+        idx = s_lower.index("c")
+        consumed_str = s[idx + 1:]
+        tiles = _split_tiles(consumed_str)
+        if len(tiles) >= 2:
+            return ("chii", tiles[:2], None)
+    elif s_lower.startswith("p") and len(s) >= 2:
+        rest = s_lower[1:]
+        if rest == "zfzf":
+            return ("pon", None, "zf")
+        if rest == "ypyp":
+            return ("pon", None, "yp")
+        if rest == "kfkf":
+            return ("pon", None, "kf")
+        tiles = _split_tiles(rest)
+        if len(tiles) >= 2:
+            return ("pon", tiles, None)
+    return None
+
+
+def player_could_satisfy_call_area_constraints(player_state, oya: int, constraints: List[str]) -> bool:
+    """
+    粗略检查该玩家是否可能满足 call_area_constraints（不按巡目过滤）。
+    用于玩家级预过滤：若连「总量」都不够，则无需遍历舍牌。
+    返回 True 表示有可能满足（需在具体舍牌巡目再次精确检查）。
+    """
+    if not constraints:
+        return True
+    calls = getattr(player_state, "calls", []) or []
+    round_num = getattr(player_state, "round_num", 0)
+    player_id = getattr(player_state, "player_id", 0)
+    jikaze_name = MjlogParser.get_jikaze(player_id, oya, round_num)
+    jikaze_z = _wind_to_z(jikaze_name)
+    field = round_num // 4
+    bakaze_name = ["东", "南", "西", "北"][field]
+    bakaze_z = _wind_to_z(bakaze_name)
+    yakuhai_set = {jikaze_z, bakaze_z, "5z", "6z", "7z"}
+    kyokuze_z = [_wind_to_z(w) for w in MjlogParser.get_kyokuze_list(player_id, oya, round_num)]
+
+    used = set()
+    for raw in constraints[:4]:
+        spec = parse_call_area_constraint(raw)
+        if not spec:
+            continue
+        ev_type, tiles, placeholder = spec
+        found = False
+        for i, c in enumerate(calls):
+            if i in used:
+                continue
+            if getattr(c, "call_type", None) != ev_type:
+                continue
+            got = getattr(c, "consumed", []) or []
+            got_z = [_honor_tile_to_z(t) for t in got[:2]] if len(got) >= 2 else []
+            if placeholder == "zf":
+                if len(got_z) >= 2 and got_z[0] == got_z[1] == jikaze_z:
+                    found = True
+            elif placeholder == "yp":
+                if len(got_z) >= 2 and all(t in yakuhai_set for t in got_z):
+                    found = True
+            elif placeholder == "kf":
+                if len(got_z) >= 2 and got_z[0] == got_z[1] and got_z[0] in kyokuze_z:
+                    found = True
+            elif tiles:
+                if len(got) == len(tiles) and sorted(got) == sorted(tiles):
+                    found = True
+            if found:
+                used.add(i)
+                break
+        if not found:
+            return False
+    return True
+
+
+def round_could_satisfy_call_constraints(
+    round_players: list,
+    call_constraint: Optional[str],
+    call_area_constraints: Optional[List[str]],
+    oya: int,
+) -> bool:
+    """
+    局级预过滤：call_constraint 与 call_area_constraints 是否有任何玩家可能满足。
+    - call_constraint "has_call": 至少一人有副露
+    - call_constraint "no_call": 至少一人无副露
+    - call_area_constraints: 至少一人可能满足（总量足够，不按巡目）
+    """
+    if call_constraint and call_constraint != "any":
+        any_has_call = any(
+            len(getattr(p, "calls", []) or []) > 0 for p in round_players
+        )
+        if call_constraint == "has_call" and not any_has_call:
+            return False
+        if call_constraint == "no_call" and all(
+            len(getattr(p, "calls", []) or []) > 0 for p in round_players
+        ):
+            return False
+    if call_area_constraints:
+        if not any(
+            player_could_satisfy_call_area_constraints(p, oya, call_area_constraints)
+            for p in round_players
+        ):
+            return False
+    return True
+
+
+def _find_yp_call_index(
+    calls: list, ev_type: str, yakuhai_set: set, exclude_indices: set
+) -> Optional[int]:
+    """找到首个役牌碰的下标，用于一对一匹配。consumed 统一为 1z-7z 后与 yakuhai_set 比较"""
+    for i, c in enumerate(calls):
+        if i in exclude_indices:
+            continue
+        if getattr(c, "call_type", None) != ev_type:
+            continue
+        got = getattr(c, "consumed", []) or []
+        got_z = [_honor_tile_to_z(t) for t in got[:2]]
+        if len(got_z) >= 2 and all(t in yakuhai_set for t in got_z):
+            return i
+    return None
+
+
+def _find_kf_call_index(
+    calls: list, ev_type: str, kyokuze_z: List[str], exclude_indices: set
+) -> Optional[int]:
+    """找到首个客风碰的下标"""
+    for i, c in enumerate(calls):
+        if i in exclude_indices:
+            continue
+        if getattr(c, "call_type", None) != ev_type:
+            continue
+        got = getattr(c, "consumed", []) or []
+        if len(got) >= 2 and got[0] == got[1] and got[0] in kyokuze_z:
+            return i
+    return None
+
+
+def player_satisfies_call_area_constraints(
+    player_state,
+    round_players: list,
+    oya: int,
+    constraints: List[str],
+    current_discard_turn: Optional[int] = None,
+) -> bool:
+    """
+    检查该玩家是否满足所有副露区域约束（AND 关系）。
+    constraints: 如 ["pypyp", "pypyp", "4mc3m5m"]，最多 4 个。
+    多约束采用一对一匹配：每个约束必须匹配不同的副露，如两个 pypyp 需两个不同的役牌碰。
+    current_discard_turn: 当前舍牌巡目；仅考虑 from_discard_turn <= current_discard_turn 的副露
+        （即该巡舍牌前已完成的副露）。None 表示不按巡目过滤。
+    """
+    if not constraints:
+        return True
+    all_calls = getattr(player_state, "calls", []) or []
+    if current_discard_turn is not None:
+        calls = [c for c in all_calls if getattr(c, "from_discard_turn", 1) <= current_discard_turn]
+    else:
+        calls = all_calls
+    round_num = getattr(player_state, "round_num", 0)
+    player_id = getattr(player_state, "player_id", 0)
+    jikaze_name = MjlogParser.get_jikaze(player_id, oya, round_num)
+    jikaze_z = _wind_to_z(jikaze_name)
+    field = round_num // 4
+    bakaze_name = ["东", "南", "西", "北"][field]
+    bakaze_z = _wind_to_z(bakaze_name)
+    yakuhai_set = {jikaze_z, bakaze_z, "5z", "6z", "7z"}
+    kyokuze_z = [_wind_to_z(w) for w in MjlogParser.get_kyokuze_list(player_id, oya, round_num)]
+
+    used_indices: set = set()
+
+    for raw in constraints[:4]:
+        spec = parse_call_area_constraint(raw)
+        if not spec:
+            continue
+        ev_type, tiles, placeholder = spec
+        if placeholder == "zf":
+            want = [jikaze_z, jikaze_z]
+            idx = _find_call_index_with_consumed(calls, ev_type, want, tuple(used_indices))
+            if idx is None:
+                return False
+            used_indices.add(idx)
+        elif placeholder == "yp":
+            idx = _find_yp_call_index(calls, ev_type, yakuhai_set, used_indices)
+            if idx is None:
+                return False
+            used_indices.add(idx)
+        elif placeholder == "kf":
+            idx = _find_kf_call_index(calls, ev_type, kyokuze_z, used_indices)
+            if idx is None:
+                return False
+            used_indices.add(idx)
+        elif tiles:
+            idx = _find_call_index_with_consumed(calls, ev_type, tiles, tuple(used_indices))
+            if idx is None:
+                return False
+            used_indices.add(idx)
+    return True
 
 
 def _split_tiles(s: str) -> List[str]:
@@ -50,6 +280,15 @@ def _split_tiles(s: str) -> List[str]:
 
 # 搜索规格：单项 (type, tiles) 表示必须匹配；列表 [(type,tiles),...] 表示 OR（匹配其一即可）
 ConsumedSearchItem = Union[Tuple[str, List[str]], List[Tuple[str, List[str]]]]
+
+
+def pattern_has_riichi(query_pattern: List[str]) -> bool:
+    """检查舍牌模式是否含立直宣言牌(r)"""
+    for elem in query_pattern:
+        s = (elem or "").strip()
+        if s.endswith("r") and len(s) >= 2:
+            return True
+    return False
 
 
 def get_consumed_search_patterns(query_pattern: List[str]) -> List[ConsumedSearchItem]:
@@ -103,21 +342,34 @@ def _single_consumed_matches(raw: str, ev_type: str, tiles: List[str]) -> bool:
     return bool(re.search(pattern_ord, raw) or re.search(pattern_rev, raw))
 
 
-def _calls_have_consumed(calls: list, ev_type: str, want_tiles: List[str]) -> bool:
-    """检查 calls 中是否有 ev_type 类型的副露且 consumed 精确匹配（0p 与 5p 视为不同牌）"""
-    def consumed_eq(a_list, b_list):
-        if len(a_list) != len(b_list):
-            return False
-        sa, sb = sorted(a_list), sorted(b_list)
-        return all(ta == tb for ta, tb in zip(sa, sb))
+def _consumed_eq(a_list, b_list) -> bool:
+    """consumed 精确相等（0p 与 5p 视为不同牌）；字牌统一为 1z-7z 后比较以兼容 东/西 等格式"""
+    if len(a_list) != len(b_list):
+        return False
+    a_norm = [_honor_tile_to_z(t) for t in a_list]
+    b_norm = [_honor_tile_to_z(t) for t in b_list]
+    sa, sb = sorted(a_norm), sorted(b_norm)
+    return all(ta == tb for ta, tb in zip(sa, sb))
 
-    for c in calls:
+
+def _calls_have_consumed(calls: list, ev_type: str, want_tiles: List[str]) -> bool:
+    """检查 calls 中是否有 ev_type 类型的副露且 consumed 精确匹配"""
+    return _find_call_index_with_consumed(calls, ev_type, want_tiles, exclude_indices=()) is not None
+
+
+def _find_call_index_with_consumed(
+    calls: list, ev_type: str, want_tiles: List[str], exclude_indices: Tuple[int, ...] = ()
+) -> Optional[int]:
+    """返回首个匹配的 call 下标，未找到返回 None。用于一对一匹配。"""
+    for i, c in enumerate(calls):
+        if i in exclude_indices:
+            continue
         if getattr(c, "call_type", None) != ev_type:
             continue
         got = getattr(c, "consumed", []) or []
-        if isinstance(got, list) and consumed_eq(want_tiles, got):
-            return True
-    return False
+        if isinstance(got, list) and _consumed_eq(want_tiles, got):
+            return i
+    return None
 
 
 def player_has_matching_consumed(player_state, search_patterns: List[ConsumedSearchItem]) -> bool:
@@ -257,6 +509,13 @@ def parse_discard_element(s: str) -> Tuple[str, bool]:
         return (s, False)
     if s in RED_FIVES:
         return (s, False)
+    # r 后缀：立直宣言牌（该牌为打出时宣告立直，必为摸切；与 c/p 不可同时出现）
+    if s.endswith("r") and len(s) >= 2:
+        base = s[:-1]
+        if base in RED_FIVES or (len(base) >= 2 and base[-1] in "mps" and (base[0].isdigit() or base in RED_FIVES)):
+            return (f"{CALL_PREFIX}r:{base}", True)  # 立直宣言牌必为摸切
+        if base in HONOR_PLACEHOLDERS:
+            return (f"{CALL_PREFIX}r:{base}", True)
     if s.endswith("t") and len(s) >= 2:
         base = s[:-1]
         if base in HONOR_PLACEHOLDERS:
@@ -316,8 +575,12 @@ def mirror_number(n: int) -> int:
 
 
 def _change_suit(tile: str, new_suit: str) -> str:
-    """将数牌的花色改为 new_suit，字牌、*、$ 与吃碰占位符不变"""
-    if tile in ("*", "$") or tile.startswith(CALL_PREFIX):
+    """将数牌的花色改为 new_suit，字牌、*、$ 与吃碰占位符不变；@r: 后牌参与花色变换"""
+    if tile in ("*", "$"):
+        return tile
+    if tile.startswith("@r:"):
+        return f"@r:{_change_suit(tile[3:], new_suit)}"
+    if tile.startswith(CALL_PREFIX):
         return tile
     if len(tile) >= 2 and tile[-1] in "mps" and (tile[0].isdigit() or tile in RED_FIVES):
         return f"{tile[0]}{new_suit}"  # 0m->0s, 5m->5s
@@ -330,10 +593,14 @@ def _apply_suit(tiles: List[str], suit: str) -> List[str]:
 
 
 def _apply_mirror(tiles: List[str]) -> List[str]:
-    """对数牌应用镜像，字牌、*、$、赤五、吃碰占位符不变"""
+    """对数牌应用镜像，字牌、*、$、赤五、吃碰占位符不变；@r: 后牌参与镜像"""
     result = []
     for t in tiles:
-        if t in ("*", "$") or t.startswith(CALL_PREFIX):
+        if t in ("*", "$"):
+            result.append(t)
+        elif t.startswith("@r:"):
+            result.append(f"@r:{_apply_mirror([t[3:]])[0]}")
+        elif t.startswith(CALL_PREFIX):
             result.append(t)
         elif t in RED_FIVES:
             result.append(t)  # 0m/0p/0s 视为 5，镜像仍为 5
@@ -361,7 +628,17 @@ def _apply_suit_to_pattern_dual(
     """数牌与赤五独立花色：非赤五用 suit_num，赤五用 suit_red。用于 7s-0m-9s 等 9+9 变体。"""
     result = []
     for tile, is_tsumogiri in pattern:
-        if tile in ("*", "$") or tile.startswith(CALL_PREFIX):
+        if tile in ("*", "$"):
+            result.append((tile, is_tsumogiri))
+        elif tile.startswith("@r:"):
+            sub = tile[3:]
+            if sub in RED_FIVES:
+                result.append((f"@r:0{suit_red}", is_tsumogiri))
+            elif len(sub) >= 2 and sub[-1] in "mps" and sub[0].isdigit():
+                result.append((f"@r:{sub[0]}{suit_num}", is_tsumogiri))
+            else:
+                result.append((tile, is_tsumogiri))
+        elif tile.startswith(CALL_PREFIX):
             result.append((tile, is_tsumogiri))
         elif tile in RED_FIVES:
             result.append((f"0{suit_red}", is_tsumogiri))
@@ -373,10 +650,20 @@ def _apply_suit_to_pattern_dual(
 
 
 def _apply_mirror_to_pattern(pattern: List[Tuple[str, bool]]) -> List[Tuple[str, bool]]:
-    """对模式应用镜像变换，保留摸切标记；*、$、赤五与吃碰占位不变"""
+    """对模式应用镜像变换，保留摸切标记；*、$、赤五与吃碰占位不变；@r: 后牌参与镜像"""
     result = []
     for tile, is_tsumogiri in pattern:
-        if tile in ("*", "$") or tile.startswith(CALL_PREFIX):
+        if tile in ("*", "$"):
+            result.append((tile, is_tsumogiri))
+        elif tile.startswith("@r:"):
+            sub = tile[3:]
+            if sub in RED_FIVES:
+                result.append((tile, is_tsumogiri))
+            elif len(sub) >= 2 and sub[-1] in "mps" and sub[0].isdigit():
+                result.append((f"@r:{mirror_number(int(sub[0]))}{sub[-1]}", is_tsumogiri))
+            else:
+                result.append((tile, is_tsumogiri))
+        elif tile.startswith(CALL_PREFIX):
             result.append((tile, is_tsumogiri))
         elif tile in RED_FIVES:
             result.append((tile, is_tsumogiri))
@@ -470,11 +757,19 @@ def generate_equivalent_variants(
     def _is_red_five(tile: str) -> bool:
         return tile in RED_FIVES
 
-    # 检查是否包含数牌、赤五、吃、碰
-    has_number = any(_is_number_tile(tile) for tile, _ in parsed_pattern)
-    has_red_five = any(_is_red_five(tile) for tile, _ in parsed_pattern)
+    # 检查是否包含数牌、赤五、吃、碰、立直宣言
+    has_number = any(_is_number_tile(tile) for tile, _ in parsed_pattern) or any(
+        tile.startswith("@r:") and _is_number_tile(tile[3:]) for tile, _ in parsed_pattern
+    )
+    has_red_five = any(_is_red_five(tile) for tile, _ in parsed_pattern) or any(
+        tile.startswith("@r:") and tile[3:] in RED_FIVES for tile, _ in parsed_pattern
+    )
     has_chi = any(tile.startswith("@c:") for tile, _ in parsed_pattern)
     has_pon = any(tile.startswith("@p:") for tile, _ in parsed_pattern)
+    has_riichi = any(tile.startswith("@r:") for tile, _ in parsed_pattern)
+    # 立直宣言牌(r)与副露(c/p)互斥：立直玩家不可能有吃碰
+    if has_riichi and (has_chi or has_pon):
+        raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
     # 数牌碰：@p: 后的内容含 m/p/s（如将来支持 p5m5m）；@p:1z1z、@p:kf 为字牌碰
     has_number_pon = any(
         tile.startswith("@p:") and any(c in tile[3:] for c in "mps")
@@ -574,6 +869,8 @@ def get_acceptable_last_tiles(variants: List[Dict]) -> frozenset:
             elem = pattern[i]
             tile = elem[0] if isinstance(elem, tuple) else elem
             if tile.startswith(CALL_PREFIX):
+                if tile.startswith("@r:"):
+                    last_tiles.add(tile[3:])
                 continue  # 吃碰占位不参与“末尾牌”判定
             if tile not in ("*", "$"):
                 if tile in HONOR_PLACEHOLDERS:
@@ -690,6 +987,19 @@ def _match_pattern_at_end(
     while p_idx >= 0 and d_idx >= 0:
         tile_str, is_tsumogiri = full_discards[d_idx]
         pat_tile, pat_want_tsumogiri = pattern[p_idx]
+
+        # 立直宣言牌 @r:：消耗一张舍牌，须为摸切且该舍牌为立直宣言
+        if pat_tile.startswith("@r:"):
+            want_tile = pat_tile[3:]
+            riichi_flags = ctx.get("discard_riichi_flags") or []
+            if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
+                return False
+            if tile_str != want_tile or not is_tsumogiri:
+                return False
+            consumed_any_discard = True
+            d_idx -= 1
+            p_idx -= 1
+            continue
 
         # 吃/碰占位：不消耗舍牌，只跳过该模式元素
         if pat_tile.startswith(CALL_PREFIX):

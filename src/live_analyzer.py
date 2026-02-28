@@ -12,6 +12,7 @@ from collections import Counter
 import logging
 
 from .mjlog_parser import MjlogParser, GameState
+from .tenpai_utils import is_tenpai
 from .simple_normalizer import (
     generate_equivalent_variants,
     match_discard_to_variant,
@@ -20,6 +21,10 @@ from .simple_normalizer import (
     log_contains_consumed,
     round_has_matching_consumed,
     player_has_matching_consumed,
+    player_satisfies_call_area_constraints,
+    round_could_satisfy_call_constraints,
+    player_could_satisfy_call_area_constraints,
+    pattern_has_riichi,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,6 +169,8 @@ class LiveAnalyzer:
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,  # "any" | "has_call" | "no_call"
+        call_area_constraints: Optional[List[str]] = None,  # 副露区域约束，最多4个 AND
+        analysis_target: str = "target_count",  # "target_count"=目标牌存量, "tenpai"=是否听牌
         turn_range: Optional[Tuple[int, int]] = None,  # (min_turn, max_turn) 如 (2, 8)
         sample_limit: Optional[int] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -214,6 +221,7 @@ class LiveAnalyzer:
                 consumed_search_list.append(cs)
         if not consumed_search_list:
             consumed_search_list = [consumed_search] if consumed_search else []
+        riichi_any = any(pattern_has_riichi(p) for p, _ in items)
 
         item_variants = []
         for p, t in items:
@@ -229,8 +237,9 @@ class LiveAnalyzer:
         SAMPLE_POOL_CAP = 10000
         total_matches = 0
         pattern_matches = [0] * len(items)
+        use_tenpai = (analysis_target == "tenpai")
         pattern_distributions = [
-            ({0: 0, 1: 0} if iv[2] else {0: 0, 1: 0, 2: 0, 3: 0})
+            ({0: 0, 1: 0} if (use_tenpai or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
             for iv in item_variants
         ]
         target_count_distribution = pattern_distributions[0]
@@ -294,6 +303,13 @@ class LiveAnalyzer:
                     return _empty_analysis_result(first_pattern, first_target)
                 try:
                     raw = _get_raw_content(log_content)
+                    # 立直宣言模式(r)：牌谱无立直时快速跳过
+                    if riichi_any and _is_tenhou6_json(raw):
+                        if "riichi" not in raw and "reach" not in raw:
+                            processed += 1
+                            if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                progress_callback(processed, total_logs)
+                            continue
                     if consumed_search_list and _is_tenhou6_json(raw):
                         if len(items) == 1:
                             if not log_contains_consumed(raw, consumed_search_list[0]):
@@ -317,8 +333,8 @@ class LiveAnalyzer:
                         round_players = game_states[round_start:round_start + round_size]
                         if len(round_players) < round_size:
                             break
-                        
-                        
+                        oya = getattr(round_players[0], "oya", 0)
+
                         dora_str = None
                         if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                             dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
@@ -336,8 +352,30 @@ class LiveAnalyzer:
                                 if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
                                     continue
 
+                        # 局级副露约束预过滤：call_constraint 与 call_area_constraints 若不可能满足则跳过整局
+                        if call_constraint or call_area_constraints:
+                            if not round_could_satisfy_call_constraints(
+                                round_players, call_constraint, call_area_constraints, oya
+                            ):
+                                continue
+
+                        # 立直宣言模式(r)：本局无人立直时跳过
+                        if riichi_any:
+                            round_has_riichi_decl = any(
+                                any(getattr(d, 'is_riichi_declaration', False) for d in p.discards)
+                                for p in round_players
+                            )
+                            if not round_has_riichi_decl:
+                                continue
+
                         # 分析该局每个玩家
                         for player_state in round_players:
+                            # 玩家级副露约束预过滤：no_call 时该玩家有副露则跳过；call_area 时该玩家不可能满足则跳过
+                            if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
+                                continue
+                            if call_area_constraints and not player_could_satisfy_call_area_constraints(player_state, oya, call_area_constraints):
+                                continue
+
                             # 提取巡目范围内的舍牌
                             if turn_range:
                                 min_turn, max_turn = turn_range
@@ -360,16 +398,26 @@ class LiveAnalyzer:
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                             }
+                            discard_riichi_flags = [getattr(in_range[i][1], 'is_riichi_declaration', False) for i in range(len(in_range))]
 
                             # 遍历范围内舍牌
                             for j, (orig_i, discard) in enumerate(in_range):
                                 discarded_bases.add(discard.tile // 4)
                                 full_discards_up_to_now = discards_precomputed[:j+1]
-                                hand_discard_strings = [
-                                    f"{t}t" if ts else t for t, ts in full_discards_up_to_now
-                                ]
+                                hand_discard_strings = []
+                                for i, (t, ts) in enumerate(full_discards_up_to_now):
+                                    if i < len(discard_riichi_flags) and discard_riichi_flags[i]:
+                                        hand_discard_strings.append(f"{t}r")
+                                    elif ts:
+                                        hand_discard_strings.append(f"{t}t")
+                                    else:
+                                        hand_discard_strings.append(t)
 
-                                honor_ctx = {**honor_ctx_base, "current_discard_turn": discard.turn}
+                                honor_ctx = {
+                                    **honor_ctx_base,
+                                    "current_discard_turn": discard.turn,
+                                    "discard_riichi_flags": discard_riichi_flags[: j + 1],
+                                }
                                 matched_variant = None
                                 matched_idx = -1
                                 for idx, (vars_p, _, _) in enumerate(item_variants):
@@ -412,6 +460,14 @@ class LiveAnalyzer:
                                     if call_constraint == "no_call" and discard.call_happened:
                                         continue
                                 
+                                # 副露区域约束：目标玩家必须满足所有指定的副露（AND）；仅统计该巡舍牌前已完成的副露
+                                if call_area_constraints:
+                                    if not player_satisfies_call_area_constraints(
+                                        player_state, round_players, player_state.oya, call_area_constraints,
+                                        current_discard_turn=discard.turn,
+                                    ):
+                                        continue
+                                
                                 # 检查可见枚数约束（含宝牌指示物，mjlog_parser 已将其计入 visible_tiles）
                                 vc = matched_variant["visible_constraints"]
                                 if vc:
@@ -429,17 +485,18 @@ class LiveAnalyzer:
                                     if not match_visible:
                                         continue
                                 
-                                # 排除：若本巡打出的牌就是目标牌，不计入统计（与无副露情形一致）
+                                # 排除：若本巡打出的牌就是目标牌，不计入统计（与无副露情形一致）；听牌模式无此概念，跳过
                                 mapped_target = matched_variant["target"]
-                                if item_combo:
-                                    target_equiv = set()
-                                    for t in mapped_target:
-                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
-                                    if discard.tile // 4 in target_equiv:
-                                        continue
-                                else:
-                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
-                                        continue
+                                if not use_tenpai:
+                                    if item_combo:
+                                        target_equiv = set()
+                                        for t in mapped_target:
+                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                        if discard.tile // 4 in target_equiv:
+                                            continue
+                                    else:
+                                        if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                            continue
                                 
                                 # 匹配成功！
                                 total_matches += 1
@@ -455,7 +512,9 @@ class LiveAnalyzer:
                                 hand_at_turn = list(hand_at_turn)  # 副本，且确保为 list（非 set）以保留同种牌枚数
                                 
                                 # mapped_target 已在上方排除逻辑中取得
-                                if item_combo:
+                                if use_tenpai:
+                                    target_count = 1 if is_tenpai(list(hand_at_turn)) else 0
+                                elif item_combo:
                                     # 搭子：手牌是否包含所有目标牌（每种至少1张，0/5 视为不同）
                                     target_codes = [
                                         MjlogParser.string_to_tile(t) for t in mapped_target
@@ -543,7 +602,7 @@ class LiveAnalyzer:
 
         target_count_distribution = pattern_distributions[0]
         probability_distribution = {}
-        keys = [0, 1] if is_combo else [0, 1, 2, 3]
+        keys = [0, 1] if (use_tenpai or is_combo) else [0, 1, 2, 3]
         for count in keys:
             prob = (target_count_distribution.get(count, 0) / max(1, pattern_matches[0]) * 100) if pattern_matches[0] > 0 else 0
             probability_distribution[count] = prob
@@ -552,7 +611,7 @@ class LiveAnalyzer:
         for idx, (p, t) in enumerate(items):
             dist = pattern_distributions[idx]
             prob = {}
-            k = [0, 1] if item_variants[idx][2] else [0, 1, 2, 3]
+            k = [0, 1] if (use_tenpai or item_variants[idx][2]) else [0, 1, 2, 3]
             for c in k:
                 prob[c] = (dist.get(c, 0) / max(1, pattern_matches[idx]) * 100) if pattern_matches[idx] > 0 else 0
             pattern_results.append({
@@ -578,6 +637,7 @@ class LiveAnalyzer:
             'matched_states': matched_states[:cap],
             'sample_pool': sample_pool,
             'is_combo': is_combo,
+            'analysis_target': analysis_target,
             'multi_pattern': len(items) > 1,
             'pattern_results': pattern_results,
         }
@@ -586,6 +646,9 @@ class LiveAnalyzer:
         if len(items) > 1:
             for pr in pattern_results:
                 logger.info(f"  {pr['pattern_str']}→{pr['target']}: {pr['matches']:,} 次")
+        elif use_tenpai:
+            logger.info(f"  未听牌: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例)")
+            logger.info(f"  听牌: {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例)")
         elif is_combo:
             logger.info(f"  没有: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例)")
             logger.info(f"  有: {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例)")
@@ -632,6 +695,7 @@ class LiveAnalyzer:
             query_pattern, target_tile, visible_constraints
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
+        riichi_search = pattern_has_riichi(query_pattern)
         samples = []
 
         if should_cancel and should_cancel():
@@ -675,6 +739,9 @@ class LiveAnalyzer:
                     return samples
                 try:
                     raw = _get_raw_content(log_content)
+                    if riichi_search and _is_tenhou6_json(raw):
+                        if "riichi" not in raw and "reach" not in raw:
+                            continue
                     if consumed_search and _is_tenhou6_json(raw):
                         if not log_contains_consumed(raw, consumed_search):
                             continue
@@ -694,6 +761,12 @@ class LiveAnalyzer:
 
                         if consumed_search and not round_has_matching_consumed(round_players, consumed_search):
                             continue
+                        if riichi_search:
+                            if not any(
+                                any(getattr(d, 'is_riichi_declaration', False) for d in p.discards)
+                                for p in round_players
+                            ):
+                                continue
 
                         for player_state in round_players:
                             if consumed_search and not player_has_matching_consumed(player_state, consumed_search):
@@ -719,15 +792,25 @@ class LiveAnalyzer:
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                             }
+                            discard_riichi_flags = [getattr(in_range[i][1], 'is_riichi_declaration', False) for i in range(len(in_range))]
 
                             for j, (orig_i, discard) in enumerate(in_range):
                                 discarded_bases.add(discard.tile // 4)
                                 full_discards_up_to_now = discards_precomputed[:j + 1]
-                                hand_discard_strings = [
-                                    f"{t}t" if ts else t for t, ts in full_discards_up_to_now
-                                ]
+                                hand_discard_strings = []
+                                for i, (t, ts) in enumerate(full_discards_up_to_now):
+                                    if i < len(discard_riichi_flags) and discard_riichi_flags[i]:
+                                        hand_discard_strings.append(f"{t}r")
+                                    elif ts:
+                                        hand_discard_strings.append(f"{t}t")
+                                    else:
+                                        hand_discard_strings.append(t)
 
-                                honor_ctx = {**honor_ctx_base, "current_discard_turn": discard.turn}
+                                honor_ctx = {
+                                    **honor_ctx_base,
+                                    "current_discard_turn": discard.turn,
+                                    "discard_riichi_flags": discard_riichi_flags[: j + 1],
+                                }
                                 matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
                                 if not matched_variant:
                                     continue
@@ -877,8 +960,10 @@ def _fmt_target(mt) -> str:
     return "-".join(mt) if isinstance(mt, list) else str(mt)
 
 
-def _target_desc(s: dict) -> str:
-    """目标牌描述：有搭子/无搭子 或 应有X张在手牌"""
+def _target_desc(s: dict, use_tenpai: bool = False) -> str:
+    """目标牌描述：听牌模式=听牌/未听牌；搭子=有/无搭子；单张=应有X张在手牌"""
+    if use_tenpai:
+        return "听牌" if s["target_count"] else "未听牌"
     if s.get("is_combo"):
         return "有搭子" if s["target_count"] else "无搭子"
     return "应有{}张在手牌".format(s["target_count"])
@@ -889,10 +974,12 @@ def _target_display_set(mt) -> set:
     return set(mt) if isinstance(mt, list) else {mt}
 
 
-def format_samples_for_display(samples: List[Dict], query_pattern_str: str, target_tile: str) -> str:
-    """将样本格式化为可读文本，支持单张和搭子"""
-    is_combo = samples[0].get("is_combo", False) if samples else False
-    target_label = f"{target_tile} (搭子)" if is_combo else target_tile
+def format_samples_for_display(samples: List[Dict], query_pattern_str: str, target_tile: str,
+                               analysis_target: str = "target_count") -> str:
+    """将样本格式化为可读文本，支持单张、搭子、听牌模式"""
+    use_tenpai = (analysis_target == "tenpai")
+    is_combo = False if use_tenpai else (samples[0].get("is_combo", False) if samples else False)
+    target_label = target_tile if use_tenpai else (f"{target_tile} (搭子)" if is_combo else target_tile)
     lines = [
         "=" * 80,
         f"验证样本：{query_pattern_str} → {target_label}",
@@ -901,29 +988,31 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     ]
     for i, s in enumerate(samples, 1):
         mt = s["mapped_target"]
-        mt_set = _target_display_set(mt)
+        mt_set = _target_display_set(mt) if not use_tenpai else set()
         hand_parts = []
         for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
             ts = MjlogParser.tile_to_string(t)
-            hand_parts.append(f"[{ts}]" if ts in mt_set else ts)
+            hand_parts.append(f"[{ts}]" if (ts in mt_set) else ts)
         hand_str = " ".join(hand_parts)
         round_display = MjlogParser.format_round_display(s["round_num"], s["honba"])
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
-
-        lines.extend([
+        target_line = f"  听牌状态:   {_target_desc(s, use_tenpai)}" if use_tenpai else f"  目标牌:     {_fmt_target(mt)} ({_target_desc(s, use_tenpai)})"
+        block = [
             f"【样本 {i}】",
             f"  对局ID:     {s['log_id']}",
             f"  天凤牌谱:   https://tenhou.net/0/?log={s['log_id']}",
             f"  小局/本场:  {round_display}",
-            f"  目标玩家:   {wind}家)",
+            f"  目标玩家:   {wind}家",
             f"  巡目:       第{s['turn']}巡",
             f"  宝牌:       {s['dora_readable']}",
             f"  舍牌序列:   {' '.join(s['actual_pattern'])} ",
-            f"  目标牌:     {_fmt_target(mt)} ({_target_desc(s)})",
+            target_line,
             f"  手牌({len(s['hand_tiles'])}张): {hand_str}",
-            f"  可见{_fmt_target(mt)}: {s['visible_target']}{'' if s.get('is_combo') else '张'} (他家舍牌+宝牌指示物)",
-            ""
-        ])
+        ]
+        if not use_tenpai:
+            block.append(f"  可见{_fmt_target(mt)}: {s['visible_target']}{'' if s.get('is_combo') else '张'} (他家舍牌+宝牌指示物)")
+        block.append("")
+        lines.extend(block)
     lines.extend([
         "=" * 80,
         f"共 {len(samples)} 条样本",

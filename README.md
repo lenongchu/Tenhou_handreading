@@ -13,6 +13,7 @@
 - **场况约束**：支持可见枚数约束、宝牌约束、立直约束，精确模拟实战环境
 - **概率计算**：统计目标牌在手牌中的概率分布（0/1/2/3张）
 - **图形界面**：提供直观的桌面GUI，方便查询和分析
+- **麻将示意图**：根据舍牌/副露符号生成示意图图片（如 `4mc3m5m`），牌面素材来自 [riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)
 
 ## 技术栈
 
@@ -59,6 +60,23 @@ python -m src.gui_app
 2. 批量转换为 tenhou6 格式（可选，可加速分析）：`py convert_xml_to_tenhou6.py --skip-existing`
 
 详见 [数据质量管理文档](docs/data_quality.md)、[tenhou6 迁移说明](docs/tenhou6_migration.md)。
+
+### 5. 麻将示意图（可选）
+
+使用「麻将示意图」功能前，需下载牌面资源：
+
+```bash
+python download_tiles.py
+```
+
+脚本会下载 **SVG 矢量图**（立体效果）和 PNG 备用。
+
+**立体效果**：安装 `cairosvg` 可高质量渲染 Inkscape SVG：
+```bash
+pip install cairosvg
+```
+
+牌面素材来源：[FluffyStuff/riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)（公共领域 CC0）。
 
 ## 使用说明
 

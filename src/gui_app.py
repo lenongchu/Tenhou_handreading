@@ -16,13 +16,14 @@ from PyQt5.QtWidgets import (
     QSpinBox, QRadioButton, QButtonGroup, QProgressBar,
     QMessageBox, QFormLayout, QListWidget, QListWidgetItem,
     QDialog, QComboBox, QDialogButtonBox, QSizePolicy,
-    QScrollArea, QFrame, QGridLayout,
+    QScrollArea, QFrame, QGridLayout, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QRectF, QSettings, QTimer
 from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont
 
 from .data_downloader import DataDownloader
 from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_display
+from .tile_illustration import render_illustration_to_qimage
 logger = logging.getLogger(__name__)
 
 
@@ -409,7 +410,7 @@ class SampleThread(QThread):
                 self.progress_num.emit(cur, total)
                 self.progress.emit(f"已扫描: {cur:,} 场" + (f"/{total:,}" if total > 0 else ""))
             params = {k: v for k, v in self.params.items()
-                      if k not in ("query_pattern_str", "is_combo", "query_items", "matched_states_cap")}
+                      if k not in ("query_pattern_str", "is_combo", "query_items", "matched_states_cap", "call_area_constraints", "analysis_target")}
             samples = self.analyzer.collect_verification_samples(
                 **params,
                 sample_count=self.sample_count,
@@ -478,7 +479,16 @@ PATTERN_HELP_HTML = """
 <li>例：<code>3mt-1m</code> = 3m 摸切、1m 手切</li>
 </ul>
 
-<h3>三、通配符 * 与 $</h3>
+<h3>三、立直宣言牌 r</h3>
+<ul>
+<li>牌后加 <b>r</b> 表示该牌为立直宣言牌（打出此牌宣告立直）</li>
+<li>例：<code>3m-5mr</code> = 玩家先打 3m，再打 5m 时宣告立直；统计立直瞬间手牌中目标牌的数量</li>
+<li>立直宣言牌必为摸切；立直后该玩家舍牌均为摸切</li>
+<li><b>互斥</b>：r 与吃(c)、碰(p) 不可同现，立直玩家不可副露</li>
+<li>含 r 时优先检索牌谱是否有玩家立直，无则快速跳过</li>
+</ul>
+
+<h3>四、通配符 * 与 $</h3>
 <ul>
 <li><b>*</b> 表示“任意摸切”，可匹配中间任意张摸切牌</li>
 <li>例：<code>3m-*-1m</code> = 3m 与 1m 之间允许若干摸切，不允许手切</li>
@@ -486,7 +496,7 @@ PATTERN_HELP_HTML = """
 <li>例：<code>c0p6p-$</code> = 用 0p6p 吃后打出任意一张手切牌</li>
 </ul>
 
-<h3>四、吃 / 碰占位</h3>
+<h3>五、吃 / 碰占位</h3>
 <p>在舍牌序列中表示“此处有一次吃或碰”，不占一张舍牌；<b>语义为具体吃的/碰的牌</b>，如 <code>4mc3m5m</code> 表示必须是用 3m5m 吃的 4m。</p>
 <ul>
 <li><b>吃</b>：任意 <code>(牌)c(牌)(牌)</code> 或 <code>c(牌)(牌)</code>，如 <code>1sc2s3s</code>、<code>4mc3m5m</code>、<code>c5m6m</code></li>
@@ -494,10 +504,10 @@ PATTERN_HELP_HTML = """
 <li><b>等价变体</b>：含吃或数牌碰时<u>不</u>生成花色/镜像等价变体（如 7s-4mc3m5m-9s 不考虑 7p-4mc3m5m-9p）；仅碰字牌时仍可生成变体</li>
 </ul>
 
-<h3>五、字牌</h3>
+<h3>六、字牌</h3>
 <p><b>1z～7z</b> 对应：东、南、西、北、白、发、中</p>
 
-<h3>六、字牌占位符</h3>
+<h3>七、字牌占位符</h3>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;">
 <tr><th>符号</th><th>含义</th></tr>
 <tr><td><code>z</code></td><td>任意字牌（手切）</td></tr>
@@ -508,7 +518,7 @@ PATTERN_HELP_HTML = """
 <tr><td><code>kf1</code> <code>kf2</code> <code>kf3</code></td><td>互不相同的客风</td></tr>
 </table>
 
-<h3>七、示例</h3>
+<h3>八、示例</h3>
 <ul>
 <li><code>7s-9s</code>：相邻打出 7s、9s</li>
 <li><code>7s-0m-9s</code>：7s、赤5万、9s</li>
@@ -519,6 +529,7 @@ PATTERN_HELP_HTML = """
 <li><code>3m-*-1m</code>：3m 与 1m 之间可隔若干摸切</li>
 <li><code>zf-kf</code>：先打自风，再打客风</li>
 <li><code>c0p6p-$</code>：用 0p6p 吃后打出任意一张手切牌</li>
+<li><code>3m-5mr</code>：打 3m 后，打 5m 时立直（统计立直瞬间手牌目标数）</li>
 </ul>
 """
 
@@ -581,6 +592,84 @@ class TargetHelpDialog(QDialog):
         btn = QPushButton("关闭")
         btn.clicked.connect(self.accept)
         layout.addWidget(btn, alignment=Qt.AlignRight)
+
+
+class TileIllustrationDialog(QDialog):
+    """麻将示意图生成对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("麻将示意图")
+        self.setMinimumSize(520, 420)
+        self._current_image = None
+        layout = QVBoxLayout(self)
+
+        # 输入区
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("符号输入:"))
+        self.notation_edit = QLineEdit()
+        self.notation_edit.setPlaceholderText("例: 4mc3m5m（用3m5m吃4m）、p1z1z（碰东）、7s-9s")
+        self.notation_edit.setMinimumWidth(260)
+        self.notation_edit.returnPressed.connect(self._generate)
+        input_row.addWidget(self.notation_edit, 1)
+        self.gen_btn = QPushButton("生成")
+        self.gen_btn.clicked.connect(self._generate)
+        input_row.addWidget(self.gen_btn)
+        layout.addLayout(input_row)
+
+        hint = QLabel("支持：吃 4mc3m5m、碰 p1z1z、单排 7s-9s 等，背景朴素可保存为图片")
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
+
+        # 预览区
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumSize(400, 220)
+        self.preview_label.setStyleSheet(
+            "background-color: #f5f5f8; border: 1px solid #ddd; border-radius: 4px;"
+        )
+        self.preview_label.setText("输入符号后点击「生成」预览")
+        layout.addWidget(self.preview_label, 1)
+
+        # 保存按钮
+        btn_row = QHBoxLayout()
+        self.save_btn = QPushButton("保存为图片")
+        self.save_btn.clicked.connect(self._save_image)
+        self.save_btn.setEnabled(False)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+    def _generate(self):
+        notation = self.notation_edit.text().strip()
+        if not notation:
+            return
+        try:
+            from PyQt5.QtGui import QPixmap
+            from PyQt5.QtCore import QByteArray, QBuffer
+            img = render_illustration_to_qimage(notation, scale=3.0)
+            self._current_image = img
+            pix = QPixmap.fromImage(img)
+            scaled = pix.scaled(380, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview_label.setPixmap(scaled)
+            self.save_btn.setEnabled(True)
+        except Exception as e:
+            QMessageBox.warning(self, "生成失败", str(e))
+
+    def _save_image(self):
+        if self._current_image is None:
+            return
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存示意图",
+            f"mahjong_{self.notation_edit.text().strip().replace('-', '_')[:20]}.png",
+            "PNG 图片 (*.png)"
+        )
+        if path:
+            if self._current_image.save(path):
+                QMessageBox.information(self, "保存成功", f"已保存至 {path}")
+            else:
+                QMessageBox.critical(self, "保存失败", "无法写入文件")
 
 
 class DbStatusThread(QThread):
@@ -654,6 +743,8 @@ class MainWindow(QMainWindow):
         self.sample_thread = None
         self.last_query_params = None  # 上次查询参数，用于生成样本
         self.last_query_result = None  # 上次查询结果（含 sample_pool），用于快速采样
+        self._excel_clipboard_text = ""  # 当前结果的 Excel 格式文本
+        self._pattern_checkboxes = []  # 多模式勾选框列表
 
         self.init_ui()
         # 优先使用缓存的统计值，数据库未更新时避免重复执行耗时的 COUNT(*)
@@ -711,7 +802,6 @@ class MainWindow(QMainWindow):
         self.analysis_batch_size_spin = QSpinBox()
         self.analysis_batch_size_spin.setRange(500, 10000)
         self.analysis_batch_size_spin.setSingleStep(500)
-        self.analysis_batch_size_spin.setSuffix(" 场/批")
         saved_batch = QSettings().value("analysis_batch_size", 2000, type=int)
         self.analysis_batch_size_spin.blockSignals(True)
         self.analysis_batch_size_spin.setValue(max(500, min(10000, saved_batch or 2000)))
@@ -723,7 +813,7 @@ class MainWindow(QMainWindow):
         )
         self.analysis_batch_size_spin.valueChanged.connect(self._save_analysis_batch_size)
         batch_row.addWidget(self.analysis_batch_size_spin)
-        batch_row.addWidget(QLabel("（根据内存选择）"))
+        batch_row.addWidget(QLabel("场/批（根据内存选择）"))
         batch_row.addStretch()
         layout.addLayout(batch_row)
         
@@ -856,6 +946,25 @@ class MainWindow(QMainWindow):
         call_row.addWidget(self.call_no_radio)
         call_row.addStretch()
         right_layout.addLayout(call_row)
+
+        # 副露区域约束（目标玩家必须有这些副露，AND 关系，最多 4 个）
+        call_area_row = QHBoxLayout()
+        call_area_row.addWidget(QLabel("副露区域:"))
+        self.call_area_inputs = []
+        for i in range(4):
+            le = QLineEdit()
+            le.setPlaceholderText("例: pzfzf 4mc3m5m")
+            le.setMinimumWidth(90)
+            le.setMaximumWidth(120)
+            self.call_area_inputs.append(le)
+            call_area_row.addWidget(le)
+        call_area_help = QPushButton("?")
+        call_area_help.setFixedWidth(24)
+        call_area_help.setToolTip("pzfzf=碰自风, pypyp=碰役牌, 4mc3m5m=吃4m用3m5m")
+        call_area_help.clicked.connect(self._show_call_area_help)
+        call_area_row.addWidget(call_area_help)
+        call_area_row.addStretch()
+        right_layout.addLayout(call_area_row)
         
         # 场况约束（两行：输入行 + 按钮与列表）
         right_layout.addSpacing(4)
@@ -886,8 +995,14 @@ class MainWindow(QMainWindow):
         self.constraint_list.setMaximumHeight(88)
         right_layout.addWidget(self.constraint_list)
         
-        # 样本上限 + 匹配状态保留条数
+        # 分析目标 + 样本上限 + 匹配状态保留条数
         opts_row = QHBoxLayout()
+        opts_row.addWidget(QLabel("分析目标:"))
+        self.analysis_target_combo = QComboBox()
+        self.analysis_target_combo.addItem("目标牌存量", "target_count")
+        self.analysis_target_combo.addItem("是否听牌", "tenpai")
+        self.analysis_target_combo.setToolTip("目标牌存量：统计手牌中目标牌数量；是否听牌：统计匹配时已听牌/未听牌比例")
+        opts_row.addWidget(self.analysis_target_combo)
         opts_row.addWidget(QLabel("样本上限:"))
         self.sample_limit_input = QSpinBox()
         self.sample_limit_input.setRange(100, 10000000)
@@ -965,14 +1080,15 @@ class MainWindow(QMainWindow):
         if entry in self._pattern_row_widgets:
             self._pattern_row_widgets.remove(entry)
 
-    def _get_pattern_items(self) -> List[Tuple[List[str], str]]:
-        """从界面获取所有 (pattern, target) 对"""
+    def _get_pattern_items(self, require_target: bool = True) -> List[Tuple[List[str], str]]:
+        """从界面获取所有 (pattern, target) 对。require_target=False 时（听牌模式）目标可为空，以 5z 占位"""
         items = []
+        placeholder = "5z"  # 听牌模式无目标牌时占位，仅用于等价变体生成
         for pattern_edit, target_edit, _, _ in self._pattern_row_widgets:
             pt = pattern_edit.text().strip()
             tg = target_edit.text().strip()
-            if pt and tg:
-                items.append(([p.strip() for p in pt.split("-")], tg))
+            if pt and (tg or not require_target):
+                items.append(([p.strip() for p in pt.split("-")], tg or placeholder))
         return items
 
     def _show_pattern_help(self):
@@ -983,15 +1099,54 @@ class MainWindow(QMainWindow):
         """显示目标牌输入说明"""
         TargetHelpDialog(self).exec_()
 
+    def _show_call_area_help(self):
+        """显示副露区域约束说明"""
+        QMessageBox.information(
+            self,
+            "副露区域约束说明",
+            "格式与舍牌模式相同。目标玩家必须满足所有填写的副露（AND）。\n\n"
+            "• pzfzf：碰出自风\n"
+            "• pypyp：碰出任一役牌（自风/场风/三元牌）\n"
+            "• pkfkf：碰出客风\n"
+            "• 4mc3m5m：用3m5m吃过4m\n"
+            "• p1z1z：碰出东\n\n"
+            "最多 4 个约束，留空表示无此约束。"
+        )
+
+    def _show_tile_illustration_dialog(self):
+        """显示麻将示意图生成对话框"""
+        TileIllustrationDialog(self).exec_()
+
     def _create_result_display_group(self) -> QGroupBox:
         """创建结果显示区"""
         group = QGroupBox("查询结果")
         layout = QVBoxLayout()
 
+        # 工具栏：复制到 Excel、麻将示意图
+        tool_row = QHBoxLayout()
+        self.copy_excel_btn = QPushButton("复制到 Excel")
+        self.copy_excel_btn.setToolTip("复制分析结果为 Tab 分隔格式，可直接粘贴到 Excel 中计算")
+        self.copy_excel_btn.clicked.connect(self._copy_result_to_excel)
+        self.copy_excel_btn.setEnabled(False)
+        tool_row.addWidget(self.copy_excel_btn)
+        self.tile_illustration_btn = QPushButton("麻将示意图")
+        self.tile_illustration_btn.setToolTip("根据舍牌/副露符号生成示意图图片，如 4mc3m5m")
+        self.tile_illustration_btn.clicked.connect(self._show_tile_illustration_dialog)
+        tool_row.addWidget(self.tile_illustration_btn)
+        tool_row.addStretch()
+        layout.addLayout(tool_row)
+
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
         self.result_text.setMinimumHeight(200)
         layout.addWidget(self.result_text)
+
+        # 多模式合并区（仅多舍牌模式时显示）
+        self.multi_merge_widget = QWidget()
+        self.multi_merge_layout = QVBoxLayout(self.multi_merge_widget)
+        self.multi_merge_layout.setContentsMargins(0, 8, 0, 0)
+        self.multi_merge_widget.setVisible(False)
+        layout.addWidget(self.multi_merge_widget)
 
         # 样本生成区（查询成功后可用）
         sample_layout = QHBoxLayout()
@@ -1051,6 +1206,185 @@ class MainWindow(QMainWindow):
     def _save_analysis_batch_size(self, value: int):
         """保存分析批次大小到本地设置"""
         QSettings().setValue("analysis_batch_size", value)
+
+    def _copy_merged_result(self):
+        """复制合并结果到剪贴板（Tab 分隔，可粘贴到 Excel）"""
+        if self._excel_clipboard_text:
+            cb = QApplication.clipboard()
+            cb.setText(self._excel_clipboard_text)
+            self.statusBar().showMessage("已复制合并结果到剪贴板", 2000)
+
+    def _copy_result_to_excel(self):
+        """复制当前分析结果到剪贴板（Tab 分隔，可直接粘贴到 Excel）"""
+        if self._excel_clipboard_text:
+            QApplication.clipboard().setText(self._excel_clipboard_text)
+            QMessageBox.information(self, "已复制", "分析结果已复制到剪贴板，可直接粘贴到 Excel 中。")
+
+    def _build_excel_text(self, result: dict, pr_list: Optional[list], multi: bool) -> str:
+        """生成 Tab 分隔的 Excel 友好格式"""
+        rows = []
+        tr = result.get('turn_range')
+        turn_str = f"{tr[0]}-{tr[1]}" if tr else "不限"
+        use_tenpai = (result.get('analysis_target') == 'tenpai')
+        col_0, col_1 = ("未听牌", "听牌") if use_tenpai else ("有0张", "有1张")
+        col_2, col_3 = ("有2张", "有3张") if not use_tenpai else ("", "")
+        if multi and pr_list:
+            if use_tenpai:
+                rows.append(f"模式\t匹配数\t{col_0}\t{col_1}\t{col_0}%\t{col_1}%")
+                for pr in pr_list:
+                    dist = pr.get('target_count_distribution', {})
+                    prob = pr.get('probability_distribution', {})
+                    rows.append(f"{pr['pattern_str']}\t{pr['matches']}\t{dist.get(0, 0)}\t{dist.get(1, 0)}\t{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}")
+            else:
+                rows.append("模式\t目标\t匹配数\t有0张\t有1张\t有2张\t有3张\t有0张%\t有1张%\t有2张%\t有3张%")
+                for pr in pr_list:
+                    dist = pr.get('target_count_distribution', {})
+                    prob = pr.get('probability_distribution', {})
+                    rows.append(
+                        f"{pr['pattern_str']}\t{pr['target']}\t{pr['matches']}\t"
+                        f"{dist.get(0, 0)}\t{dist.get(1, 0)}\t{dist.get(2, 0)}\t{dist.get(3, 0)}\t"
+                        f"{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}\t{prob.get(2, 0):.2f}\t{prob.get(3, 0):.2f}"
+                    )
+            rows.append("")
+            rows.append(f"分析对局数\t{result.get('total_logs_analyzed', 0)}")
+            rows.append(f"巡目范围\t{turn_str}")
+        else:
+            dist = result.get('target_count_distribution', {})
+            prob = result.get('probability_distribution', {})
+            rows.append("指标\t值")
+            rows.append(f"{'分析目标' if use_tenpai else '目标'}\t{'听牌' if use_tenpai else result.get('target_tile', '')}")
+            rows.append(f"匹配数\t{result.get('total_matches', 0)}")
+            if use_tenpai:
+                rows.append(f"{col_0}\t{dist.get(0, 0)}\t{prob.get(0, 0):.2f}%")
+                rows.append(f"{col_1}\t{dist.get(1, 0)}\t{prob.get(1, 0):.2f}%")
+            else:
+                rows.append(f"有0张\t{dist.get(0, 0)}\t{prob.get(0, 0):.2f}%")
+                rows.append(f"有1张\t{dist.get(1, 0)}\t{prob.get(1, 0):.2f}%")
+                rows.append(f"有2张\t{dist.get(2, 0)}\t{prob.get(2, 0):.2f}%")
+                rows.append(f"有3张\t{dist.get(3, 0)}\t{prob.get(3, 0):.2f}%")
+            rows.append(f"分析对局数\t{result.get('total_logs_analyzed', 0)}")
+            rows.append(f"巡目范围\t{turn_str}")
+        return "\n".join(rows)
+
+    def _setup_multi_pattern_merge(self, result: dict, pr_list: list) -> None:
+        """设置多模式勾选与合并区域"""
+        # 清除旧勾选框
+        for cb in self._pattern_checkboxes:
+            cb.setParent(None)
+            cb.deleteLater()
+        self._pattern_checkboxes.clear()
+
+        def _clear_layout(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+        _clear_layout(self.multi_merge_layout)
+
+        cb_row = QHBoxLayout()
+        use_tenpai = self.last_query_result and self.last_query_result.get("analysis_target") == "tenpai"
+        cb_row.addWidget(QLabel("勾选合并（目标牌相同）:" if not use_tenpai else "勾选合并:"))
+        for i, pr in enumerate(pr_list):
+            lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
+            cb = QCheckBox(lbl)
+            cb.setChecked(True)
+            cb.setProperty("idx", i)
+            cb.stateChanged.connect(lambda *_: self._update_merged_result(result, pr_list))
+            self._pattern_checkboxes.append(cb)
+            cb_row.addWidget(cb)
+        select_all_btn = QPushButton("全选")
+        select_all_btn.setFixedWidth(44)
+        select_all_btn.clicked.connect(lambda: self._set_all_pattern_checks(True, result, pr_list))
+        cb_row.addWidget(select_all_btn)
+        cb_row.addStretch()
+        self.multi_merge_layout.addLayout(cb_row)
+
+        merge_display_row = QHBoxLayout()
+        self.merged_result_label = QLabel("")
+        self.merged_result_label.setWordWrap(True)
+        self.merged_result_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        merge_display_row.addWidget(self.merged_result_label, 1)
+        copy_merge_btn = QPushButton("复制合并")
+        copy_merge_btn.setFixedWidth(70)
+        copy_merge_btn.setToolTip("将合并结果复制到剪贴板（Tab 分隔，可粘贴到 Excel）")
+        copy_merge_btn.clicked.connect(self._copy_merged_result)
+        merge_display_row.addWidget(copy_merge_btn)
+        self.multi_merge_layout.addLayout(merge_display_row)
+        self.multi_merge_widget.setVisible(True)
+        self._update_merged_result(result, pr_list)
+
+    def _set_all_pattern_checks(self, checked: bool, result: dict, pr_list: list) -> None:
+        """全选/取消勾选所有模式"""
+        for cb in self._pattern_checkboxes:
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        self._update_merged_result(result, pr_list)
+
+    def _update_merged_result(self, result: dict, pr_list: list) -> None:
+        """根据勾选更新合并结果显示及 Excel 文本"""
+        checked = [pr_list[i] for i, cb in enumerate(self._pattern_checkboxes) if cb.isChecked()]
+        if not checked:
+            self.merged_result_label.setText("（请至少勾选一个模式）")
+            self._excel_clipboard_text = self._build_excel_text(result, pr_list, multi=True)
+            return
+        total_matches = sum(pr['matches'] for pr in checked)
+        use_tenpai = result.get("analysis_target") == "tenpai"
+        keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
+        merged_dist = {k: 0 for k in keys}
+        for pr in checked:
+            d = pr.get('target_count_distribution', {})
+            for k in keys:
+                merged_dist[k] += d.get(k, 0)
+        probs = [(merged_dist[k] / total_matches * 100) if total_matches > 0 else 0 for k in keys]
+        if use_tenpai:
+            target_label = "听牌"
+            txt = (
+                f"合并结果（分析目标 {target_label}）：总匹配 {total_matches:,} 次\n"
+                f"  未听牌: {probs[0]:.1f}% ({merged_dist[0]:,} 例)  听牌: {probs[1]:.1f}% ({merged_dist[1]:,} 例)"
+            )
+        else:
+            target = checked[0]['target']
+            txt = (
+                f"合并结果（目标 {target}）：总匹配 {total_matches:,} 次\n"
+                f"  有0张: {probs[0]:.1f}% ({merged_dist[0]:,} 例)  有1张: {probs[1]:.1f}% ({merged_dist[1]:,} 例)  "
+                f"有2张: {probs[2]:.1f}% ({merged_dist[2]:,} 例)  有3张: {probs[3]:.1f}% ({merged_dist[3]:,} 例)"
+            )
+        self.merged_result_label.setText(txt)
+        # 更新 Excel 文本：在原有表格后追加合并行
+        if use_tenpai:
+            base_rows = ["模式\t匹配数\t未听牌\t听牌\t未听牌%\t听牌%"]
+            for pr in checked:
+                dist = pr.get('target_count_distribution', {})
+                prob = pr.get('probability_distribution', {})
+                base_rows.append(
+                    f"{pr['pattern_str']}\t{pr['matches']}\t{dist.get(0, 0)}\t{dist.get(1, 0)}\t"
+                    f"{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}"
+                )
+            base_rows.append("")
+            base_rows.append("【合并】\t" + str(total_matches) + "\t" +
+                             f"{merged_dist[0]}\t{merged_dist[1]}\t{probs[0]:.2f}\t{probs[1]:.2f}")
+        else:
+            target = checked[0]['target']
+            base_rows = ["模式\t目标\t匹配数\t有0张\t有1张\t有2张\t有3张\t有0张%\t有1张%\t有2张%\t有3张%"]
+            for pr in checked:
+                dist = pr.get('target_count_distribution', {})
+                prob = pr.get('probability_distribution', {})
+                base_rows.append(
+                    f"{pr['pattern_str']}\t{pr['target']}\t{pr['matches']}\t"
+                    f"{dist.get(0, 0)}\t{dist.get(1, 0)}\t{dist.get(2, 0)}\t{dist.get(3, 0)}\t"
+                    f"{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}\t{prob.get(2, 0):.2f}\t{prob.get(3, 0):.2f}"
+                )
+            base_rows.append("")
+            base_rows.append("【合并】\t" + target + "\t" + str(total_matches) + "\t" +
+                             f"{merged_dist[0]}\t{merged_dist[1]}\t{merged_dist[2]}\t{merged_dist[3]}\t" +
+                             f"{probs[0]:.2f}\t{probs[1]:.2f}\t{probs[2]:.2f}\t{probs[3]:.2f}")
+        base_rows.append("")
+        base_rows.append(f"分析对局数\t{result.get('total_logs_analyzed', 0)}")
+        tr = result.get('turn_range')
+        base_rows.append(f"巡目范围\t{'%s-%s' % tr if tr else '不限'}")
+        self._excel_clipboard_text = "\n".join(base_rows)
 
     def download_data(self):
         """下载历史数据"""
@@ -1175,9 +1509,12 @@ class MainWindow(QMainWindow):
     
     def execute_query(self):
         """执行查询"""
-        query_items = self._get_pattern_items()
+        analysis_target = self.analysis_target_combo.currentData() or "target_count"
+        use_tenpai = (analysis_target == "tenpai")
+        query_items = self._get_pattern_items(require_target=not use_tenpai)
         if not query_items:
-            QMessageBox.warning(self, "输入错误", "请至少输入一个舍牌模式和对应的目标牌")
+            msg = "请至少输入一个舍牌模式" + ("" if use_tenpai else "和对应的目标牌")
+            QMessageBox.warning(self, "输入错误", msg)
             return
         first_pattern, first_target = query_items[0]
         
@@ -1206,6 +1543,12 @@ class MainWindow(QMainWindow):
             call_constraint = "has_call"
         else:
             call_constraint = "no_call"
+
+        # 副露区域约束（目标玩家必须有这些副露，AND，最多 4 个）
+        call_area_constraints = [
+            le.text().strip() for le in self.call_area_inputs
+            if le.text().strip()
+        ][:4]
         
         # 场况约束
         visible_constraints = {}
@@ -1230,10 +1573,12 @@ class MainWindow(QMainWindow):
 
         params = {
             "query_items": query_items,
+            "analysis_target": analysis_target,
             "visible_constraints": visible_constraints if visible_constraints else None,
             "dora_constraint": dora_constraint,
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
+            "call_area_constraints": call_area_constraints if call_area_constraints else None,
             "turn_range": turn_range,
             "sample_limit": sample_limit,
             "total_logs_hint": total_logs_hint,
@@ -1269,9 +1614,14 @@ class MainWindow(QMainWindow):
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
-        # 搭子模式：样本筛选 全部/没有/有；单张模式：全部/有0张~有3张
+        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张
+        use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
         is_combo = self.last_query_params.get("is_combo", False)
-        if is_combo:
+        if use_tenpai:
+            if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "未听牌":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
+        elif is_combo:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "没有":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "没有", "有"])
@@ -1341,10 +1691,13 @@ class MainWindow(QMainWindow):
             samples = samples_or_error
             query_str = getattr(self, "_last_sample_pattern_str", None) or self.last_query_params.get("query_pattern_str", "-".join(self.last_query_params.get("query_pattern", [])))
             target_tile = getattr(self, "_last_sample_target_tile", None) or self.last_query_params.get("target_tile", "")
+            if self.last_query_params.get("analysis_target") == "tenpai":
+                target_tile = "听牌"  # 样本展示用
             text = format_samples_for_display(
                 samples,
                 query_str,
-                target_tile
+                target_tile,
+                analysis_target=self.last_query_params.get("analysis_target", "target_count"),
             )
             dlg = SampleDialog(self, text, query_str.replace("-", "_"))
             dlg.exec_()
@@ -1400,6 +1753,7 @@ class MainWindow(QMainWindow):
                 call_constraint = "has_call"
             else:
                 call_constraint = "no_call"
+            call_area_constraints = [le.text().strip() for le in self.call_area_inputs if le.text().strip()][:4]
             visible_constraints = {}
             for i in range(self.constraint_list.count()):
                 item = self.constraint_list.item(i)
@@ -1416,10 +1770,12 @@ class MainWindow(QMainWindow):
                 "query_pattern": first_pattern,
                 "query_pattern_str": "-".join(first_pattern),
                 "target_tile": first_target,
+                "analysis_target": result.get("analysis_target", "target_count"),
                 "dora_constraint": dora_constraint,
                 "visible_constraints": visible_constraints if visible_constraints else None,
                 "riichi_constraint": riichi_constraint,
                 "call_constraint": call_constraint,
+                "call_area_constraints": call_area_constraints,
                 "turn_range": turn_range,
                 "sample_limit": self.sample_limit_input.value(),
                 "is_combo": result.get("is_combo", False),
@@ -1429,29 +1785,41 @@ class MainWindow(QMainWindow):
             # 舍牌模式选择：多模式时列出每个模式供生成样本时选择
             self.sample_pattern_combo.clear()
             pr_list = result.get("pattern_results", []) if result.get("multi_pattern") else []
+            use_tenpai = (result.get("analysis_target") == "tenpai")
             if result.get("multi_pattern") and pr_list:
                 for pr in pr_list:
-                    self.sample_pattern_combo.addItem(f"{pr['pattern_str']} → {pr['target']}")
+                    lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
+                    self.sample_pattern_combo.addItem(lbl)
             else:
                 first_pattern, first_target = query_items[0]
-                self.sample_pattern_combo.addItem("-".join(first_pattern) + " → " + first_target)
-            # 搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；多模式混合时用单张选项
+                lbl = "-".join(first_pattern) + (" → 听牌" if use_tenpai else f" → {first_target}")
+                self.sample_pattern_combo.addItem(lbl)
+            # 搭子模式：全部/没有/有；听牌模式：全部/未听牌/听牌；单张模式：全部/有0张~有3张
             self.sample_target_combo.clear()
-            any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
-            if result.get("multi_pattern") and any_single:
-                self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
-            elif result.get("is_combo", False) and not result.get("multi_pattern"):
-                self.sample_target_combo.addItems(["全部", "没有", "有"])
+            if use_tenpai:
+                self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
             else:
-                self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
+                any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
+                if result.get("multi_pattern") and any_single:
+                    self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
+                elif result.get("is_combo", False) and not result.get("multi_pattern"):
+                    self.sample_target_combo.addItems(["全部", "没有", "有"])
+                else:
+                    self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
 
             is_combo = result.get('is_combo', False)
             multi = result.get('multi_pattern', False)
-            if multi and result.get('pattern_results'):
+            pr_list = result.get('pattern_results', []) if multi else []
+
+            if multi and pr_list:
+                use_tenpai = (result.get("analysis_target") == "tenpai")
                 lines = ["查询完成！\n", f"总匹配数: {result['total_matches']:,}\n"]
-                for pr in result['pattern_results']:
-                    lines.append(f"  {pr['pattern_str']} → {pr['target']}: {pr['matches']:,} 次")
-                    if pr['is_combo']:
+                for pr in pr_list:
+                    pr_label = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
+                    lines.append(f"  {pr_label}: {pr['matches']:,} 次")
+                    if use_tenpai:
+                        lines.append(f"    未听牌: {pr['probability_distribution'][0]:.1f}%  听牌: {pr['probability_distribution'][1]:.1f}%")
+                    elif pr['is_combo']:
                         lines.append(f"    没有: {pr['probability_distribution'][0]:.1f}%  有: {pr['probability_distribution'][1]:.1f}%")
                     else:
                         lines.append(
@@ -1464,12 +1832,24 @@ class MainWindow(QMainWindow):
                     f"等价变体数: {result['variants_count']}",
                 ])
                 result_text = "\n".join(lines)
+
+                # 多模式：勾选与合并
+                self._setup_multi_pattern_merge(result, pr_list)
+                self._excel_clipboard_text = self._build_excel_text(result, pr_list, multi=True)
             else:
-                if is_combo:
+                use_tenpai = (result.get("analysis_target") == "tenpai")
+                if use_tenpai:
+                    dist_text = (
+                        f"  未听牌: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
+                        f"  听牌: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)"
+                    )
+                    target_label = "分析目标: 听牌"
+                elif is_combo:
                     dist_text = (
                         f"  没有: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
                         f"  有: {result['probability_distribution'][1]:.2f}% ({result['target_count_distribution'][1]:,} 例)"
                     )
+                    target_label = f"目标: {result['target_tile']} (搭子)"
                 else:
                     dist_text = (
                         f"  有0张: {result['probability_distribution'][0]:.2f}% ({result['target_count_distribution'][0]:,} 例)\n"
@@ -1477,10 +1857,11 @@ class MainWindow(QMainWindow):
                         f"  有2张: {result['probability_distribution'][2]:.2f}% ({result['target_count_distribution'][2]:,} 例)\n"
                         f"  有3张: {result['probability_distribution'][3]:.2f}% ({result['target_count_distribution'][3]:,} 例)"
                     )
+                    target_label = f"目标: {result['target_tile']}"
                 result_text = f"""
 查询完成！
 
-目标: {result['target_tile']}{' (搭子)' if is_combo else ''}
+{target_label}
 匹配状态数: {result['total_matches']:,}
 
 概率分布:
@@ -1491,11 +1872,19 @@ class MainWindow(QMainWindow):
 巡目范围: {result.get('turn_range', '不限')}
 等价变体数: {result['variants_count']}
 """
+                result_text = result_text.strip()
+                self.multi_merge_widget.setVisible(False)
+                self._excel_clipboard_text = self._build_excel_text(result, None, multi=False)
+
             self.result_text.setText(result_text)
+            self.copy_excel_btn.setEnabled(True)
         else:
             self.gen_sample_btn.setEnabled(False)
             self.last_query_params = None
             self.last_query_result = None
+            self.copy_excel_btn.setEnabled(False)
+            self._excel_clipboard_text = ""
+            self.multi_merge_widget.setVisible(False)
             QMessageBox.critical(self, "查询失败", f"查询失败: {result}")
 
 
