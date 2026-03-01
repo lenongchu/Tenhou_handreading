@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
+from .simple_normalizer import split_discard_pattern
+
 # PyQt5 统一导入，避免各函数内遗漏
 from PyQt5.QtCore import Qt, QPointF, QRectF, QRect
 from PyQt5.QtGui import (
@@ -142,8 +144,9 @@ def render_illustration_to_qimage(
     """
     w = int((tile_width * 4 + 80) * scale)
     h = int((tile_height * 2 + 100) * scale)
-    img = QImage(w, h, QImage.Format_RGB32)
-    img.fill(QColor(*bg_color))
+    is_big_q = notation.strip() == "?"
+    img = QImage(w, h, QImage.Format_ARGB32 if is_big_q else QImage.Format_RGB32)
+    img.fill(Qt.transparent if is_big_q else QColor(*bg_color))
 
     painter = QPainter(img)
     painter.setRenderHint(QPainter.Antialiasing)
@@ -158,20 +161,66 @@ def render_illustration_to_qimage(
         elif pon_data:
             _draw_pon_meld(painter, pon_data, tile_width, tile_height, scale, w, h)
         else:
-            tiles = re.findall(r"[0-9][mps]|\d?z|[东南西北白发中]", notation.replace(" ", ""))
-            if not tiles:
-                tiles = [t.strip() for t in notation.split("-") if t.strip() and len(t.strip()) >= 2]
-            if tiles:
-                _draw_tile_row(painter, tiles, tile_width, tile_height, scale, w, h)
+            # 单独输入 ?（无 -）：输出一个更大的问号，无色背景便于复制到作图软件
+            if is_big_q:
+                _draw_big_question_mark(painter, w, h, scale)
             else:
-                _draw_placeholder(painter, notation, w, h)
+                # 优先按 - 分割，以支持 7s-?-9s 中的 ?（问号牌）
+                _draw_tiles_or_placeholder(painter, notation, tile_width, tile_height, scale, w, h)
 
-        # 右下角署名
-        _draw_credit(painter, w, h, scale)
+        # 右下角署名（单独问号时不显示，保持透明背景洁净）
+        if not is_big_q:
+            _draw_credit(painter, w, h, scale)
     finally:
         painter.end()
 
     return img
+
+
+def _draw_big_question_mark(painter: "QPainter", img_w: int, img_h: int, scale: float) -> None:
+    """单独输入 ? 时，在画布中央绘制一个更大的问号。"""
+    sz = int(min(img_w, img_h) * 0.35)
+    font = QFont("Arial", sz)
+    font.setWeight(87)
+    painter.setFont(font)
+    painter.setPen(QColor(40, 40, 55))
+    rect = QRectF(0, 0, img_w, img_h)
+    painter.drawText(rect, Qt.AlignCenter, "?")
+
+
+def _draw_tiles_or_placeholder(
+    painter: "QPainter",
+    notation: str,
+    tile_width: int, tile_height: int,
+    scale: float,
+    img_w: int, img_h: int,
+) -> None:
+    """按 - 或 AND 分割解析牌序列并绘制，或显示占位提示。"""
+    parts = split_discard_pattern(notation)
+    if len(parts) > 1:
+        tiles = []
+        for p in parts:
+            if p in "?$*":
+                tiles.append("?")
+            elif "NOT" in p.upper() or "OR" in p.upper() or re.match(r"^\[\d\d\][mpsz]$", p, re.I):
+                tiles.append("?")  # NOT/OR/[xy] 逻辑符在示意图中用 ? 表示
+            elif p in ("m", "p", "s"):
+                tiles.append("?")  # 花色通配符 任意万/饼/索
+            elif re.match(r"^[Nn][Oo][Tt][mps]$", p):
+                tiles.append("?")  # NOTm/NOTp/NOTs 任意一张非万/饼/索
+            elif re.fullmatch(r"[0-9][mps]|\d?z|[东南西北白发中]", p):
+                tiles.append(p)
+            elif len(p) >= 2:
+                tiles.append(p)
+    else:
+        tiles = re.findall(r"[0-9][mps]|\d?z|[东南西北白发中]", notation.replace(" ", ""))
+    if not tiles and parts:
+        tiles = [p if p in "?$*" or len(p) >= 2 else "?" for p in parts if p]
+        tiles = ["?" if t in ("$", "*") else t for t in tiles]
+    if tiles:
+        _draw_tile_row(painter, tiles, tile_width, tile_height, scale, img_w, img_h)
+    else:
+        _draw_placeholder(painter, notation, img_w, img_h)
 
 
 def _draw_credit(painter: "QPainter", img_w: int, img_h: int, scale: float) -> None:
@@ -209,6 +258,10 @@ def _draw_tile_composite(
     iw, ih = int(w), int(h)
     blank = _create_blank_tile(iw, ih)
     painter.drawImage(QRectF(x, y, w, h), blank, QRectF(0, 0, iw, ih))
+    # 问号牌：粗体醒目绘制
+    if tile_str == "?":
+        _draw_question_mark_tile(painter, x, y, w, h, horizontal)
+        return
     # 尝试叠加 repo 字符（中心裁剪），否则手绘
     char_img = _load_character_image(tile_str)
     if char_img and not char_img.isNull():
@@ -251,6 +304,22 @@ def _overlay_character(
     sx = x + (w - scaled.width()) / 2
     sy = y + (h - scaled.height()) / 2
     painter.drawPixmap(int(sx), int(sy), scaled)
+
+
+def _draw_question_mark_tile(
+    painter: "QPainter",
+    x: float, y: float,
+    w: float, h: float,
+    horizontal: bool,
+) -> None:
+    """绘制问号牌：粗体醒目的 ?，表示未知/任意牌。"""
+    sz = int(min(w, h) * 0.45)
+    font = QFont("Arial", sz)
+    font.setWeight(87)  # QFont.Black，最粗字重，更醒目
+    painter.setFont(font)
+    painter.setPen(QColor(40, 40, 55))
+    rect = QRectF(x, y, w, h)
+    painter.drawText(rect, Qt.AlignCenter, "?")
 
 
 def _draw_character_text(

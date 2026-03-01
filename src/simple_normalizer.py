@@ -1,17 +1,19 @@
 """
 等价变体生成工具
 
-根据输入的舍牌序列、目标牌、可见牌约束，生成所有等价的变体（6个）。
+根据输入的舍牌序列、目标牌、可见牌约束，生成所有等价的变体。
 直接与舍牌序列精确比对，不使用标准化。
 
-等价规则：
-1. 花色等价：1s-3s ≡ 1m-3m ≡ 1p-3p
-2. 镜像等价：1s-3s ≡ 9s-7s（数字 1↔9, 2↔8, 3↔7, 4↔6）
+等价规则（仅花色对称，无镜像）：
+1. 花色等价：1s-3s ≡ 1m-3m ≡ 1p-3p（m/p/s 排列映射）
+2. 变体数：0 种花色 1 个；1 种花色 3 个；2 或 3 种花色 6 个
 3. 顺序敏感：3s-1s ≠ 1s-3s
 
-摸切符号：牌后加 t 表示必须摸切，如 "3mt-1m" 表示 3m 摸切、1m 手切。
+摸切符号：牌后加 t 表示必须摸切，f 表示手切或摸切皆可；如 "3mt-1m" = 3m 摸切、1m 手切；"3mf" = 3m 手摸切皆可。
 * : 任意数量的摸切
 $ : 任意一张手切（吃/碰之后的牌必为手切，如 c0p6p-$）
+cd1/cd2 : 拆搭（两张同花色数值差1-2的手切，如1m3m、4s5s；1s9s不是搭子）。cd2 约束：拆搭花色≠下一张舍牌花色
+cdm/cdp/cds : 拆万字/饼/索搭
 """
 import re
 from typing import List, Dict, Tuple, Optional, Union
@@ -29,9 +31,86 @@ Z_TO_WIND = {"1z": "东", "2z": "南", "3z": "西", "4z": "北"}
 # 赤五输入：0m=赤5m, 0p=赤5p, 0s=赤5s（编码独立 base 34/35/36，与 5m/5p/5s 视为不同牌）
 RED_FIVES = frozenset({"0m", "0p", "0s"})
 
+# 花色通配符：单字符 m/p/s = 任意万/饼/索（与 1m,2p,3s 等具体牌区分：后者为数字+花色两字符）
+SUIT_WILDCARDS = frozenset({"m", "p", "s"})
+
 # 吃碰占位符前缀：解析后为 @c:... 或 @p:...；语义为具体吃的/碰的牌（如 4mc3m5m=用3m5m吃4m）
 # 含吃或数牌碰时不生成花色/镜像等价变体，仅碰字牌时仍生成变体
 CALL_PREFIX = "@"
+# 拆搭占位符：@cd:1 任意拆搭、@cd:2 拆搭花色≠下一张、@cd:m/p/s 拆万/饼/索搭
+CD_PREFIX = "@cd:"
+# 逻辑符号：@n:base,excl 表示 NOT（base 但排除 excl）；@o:a,b,c 表示 OR（匹配其一）
+NOT_PREFIX = "@n:"
+OR_PREFIX = "@o:"
+
+# 各花色 base 集合（含赤五）：用于 prior_discard_exclusion NOTm/p/s
+_SUIT_FORBIDDEN_BASES = {
+    "m": frozenset(range(9)) | {34},   # 1m-9m, 0m
+    "p": frozenset(range(9, 18)) | {35},
+    "s": frozenset(range(18, 27)) | {36},
+}
+
+
+def get_forbidden_bases_from_exclusion_str(prior_str: str) -> frozenset:
+    """
+    前段不可打：从模式字符串解析禁止的 base 集合。
+    支持 OR 组合多元素（如 4mOR2m），与舍牌模式语法一致。
+    例：NOTm -> 万字全部；4mOR2m -> {4m,2m}；NOT[45]m -> {4m,5m}
+    """
+    if not prior_str or not prior_str.strip():
+        return frozenset()
+    s = prior_str.strip()
+    parsed, _ = parse_discard_element(s)
+    return _forbidden_bases_from_parsed_tile(parsed)
+
+
+def _forbidden_bases_from_parsed_tile(tile: str) -> frozenset:
+    """从解析后的单元素（@n:m、@o:4m,2m 等）计算禁止 base 集合"""
+    if tile.startswith(NOT_PREFIX):
+        rest = tile[len(NOT_PREFIX):].strip()
+        comps = [x.strip() for x in rest.split(",") if x.strip()]
+        if len(comps) == 1 and comps[0] in SUIT_WILDCARDS:
+            return _SUIT_FORBIDDEN_BASES[comps[0]]
+        if len(comps) >= 2 and comps[0] == "*":
+            out = set()
+            for e in comps[1:]:
+                out.add(MjlogParser.string_to_tile(e))
+            return frozenset(out)
+        if len(comps) >= 2:
+            out = set()
+            for e in comps[1:]:
+                out.add(MjlogParser.string_to_tile(e))
+            return frozenset(out)
+    if tile.startswith(OR_PREFIX):
+        parts = [x.strip() for x in tile[len(OR_PREFIX):].split(",") if x.strip()]
+        out = set()
+        for p in parts:
+            tp = p[:-1] if (p.endswith("t") or p.endswith("f")) else p
+            if tp.startswith(NOT_PREFIX) or tp.startswith(OR_PREFIX):
+                out |= _forbidden_bases_from_parsed_tile(tp)
+            else:
+                out.add(MjlogParser.string_to_tile(tp))
+        return frozenset(out)
+    if tile in SUIT_WILDCARDS:
+        return _SUIT_FORBIDDEN_BASES[tile]
+    if tile in RED_FIVES or (len(tile) >= 2 and tile[-1] in "mps" and tile[0].isdigit()):
+        return frozenset([MjlogParser.string_to_tile(tile)])
+    if len(tile) == 2 and tile[0] in "1234567" and tile[1] == "z":
+        return frozenset([MjlogParser.string_to_tile(tile)])
+    return frozenset()
+
+
+def split_discard_pattern(s: str) -> List[str]:
+    """
+    将舍牌模式字符串按顺序分隔符切分为元素列表。
+    支持 "-" 与 "AND"（大小写不敏感），如 3mAND4m-zNOT1z -> ["3m","4m","zNOT1z"]
+    """
+    if not s or not s.strip():
+        return []
+    s = s.strip()
+    # 用正则按 - 或 AND 切分，保留顺序；AND 前后可有可选空格
+    parts = re.split(r"\s*-\s*|\s*[Aa][Nn][Dd]\s*", s)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _wind_to_z(wind: str) -> str:
@@ -482,15 +561,36 @@ def _parse_call_element(s: str) -> Optional[Tuple[str, bool]]:
     return None
 
 
-def parse_discard_element(s: str) -> Tuple[str, bool]:
+def _is_simple_tile_or_placeholder(t: str) -> bool:
+    """判断是否为可用于 OR 的简单牌或占位符（不含 NOT/OR/c/吃碰等）"""
+    t = t.strip()
+    if not t:
+        return False
+    if t in ("*", "$") or t in HONOR_PLACEHOLDERS or t in RED_FIVES or t in SUIT_WILDCARDS:
+        return True
+    if len(t) >= 2 and t[-1] in "mps" and (t[0].isdigit() or t in RED_FIVES):
+        return True
+    if len(t) == 2 and t[0] in "1-7" and t[1] == "z":
+        return True
+    # 带 t 摸切或 f 手摸切皆可：3mt、3mf
+    if (t.endswith("t") or t.endswith("f")) and len(t) >= 3:
+        return _is_simple_tile_or_placeholder(t[:-1])
+    return False
+
+
+def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
     """
     解析舍牌模式元素。
     "3mt" -> ("3m", True)  摸切
+    "3mf" -> ("3m", None) 手摸切皆可
     "3m" -> ("3m", False) 手切
     "0m","0p","0s" -> 赤5m/赤5p/赤5s
     "4mc3m5m" -> 用 3m5m 吃 4m；"c5m6m" -> 用 56m 吃 4m 或 7m
     "p1z1z" -> 用两个东碰；"pkfkf" -> 客风碰
     "z" -> ("z", False) 任意字牌；"zf"/"kf" 等
+    "zNOT1z" -> ("@n:z,1z", False) 任意字牌但排除东
+    "3mOR5m" -> ("@o:3m,5m", False) 3m 或 5m
+    "m"/"p"/"s" -> 任意万字/饼子/索子（单字符，与 1m,2p,3s 等区分）
     """
     s = s.strip()
     if not s:
@@ -499,6 +599,81 @@ def parse_discard_element(s: str) -> Tuple[str, bool]:
         return ("*", False)
     if s == "$":
         return ("$", False)  # 任意一张手切
+    # 花色通配符 m/p/s 及 mf/pf/sf：mf/pf/sf = 任意该花色且手摸切皆可
+    if s in ("mf", "pf", "sf"):
+        return (s[0], None)
+    if s in SUIT_WILDCARDS:
+        return (s, False)
+    # [xy] 数字范围：[25]m = 2m,3m,4m,5m 其一；[17]z = 1z..7z；支持 t/r/f 后缀
+    m_range = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f)?$", s, re.IGNORECASE)
+    if m_range:
+        x, y, suit_or_z, suffix = m_range.group(1), m_range.group(2), m_range.group(3).lower(), m_range.group(4)
+        lo, hi = int(x), int(y)
+        if lo <= hi:
+            tiles = []
+            if suit_or_z == "z":
+                for n in range(lo, hi + 1):
+                    tiles.append(f"{n}z" + (suffix or ""))
+            else:
+                for n in range(lo, hi + 1):
+                    tiles.append(f"{n}{suit_or_z}" + (suffix or ""))
+            tsumo_val = True if suffix == "t" else (None if suffix == "f" else False)
+            return (f"{OR_PREFIX}{','.join(tiles)}", tsumo_val)
+    # NOT[xy] 排除范围：NOT[45]m = 4m,5m 之外均可；NOT[17]z = 1z..7z 之外均可
+    m_not_range = re.match(r"^[Nn][Oo][Tt]\[(\d)(\d)\]([mpsz])$", s)
+    if m_not_range:
+        x, y, suit_or_z = m_not_range.group(1), m_not_range.group(2), m_not_range.group(3).lower()
+        lo, hi = int(x), int(y)
+        if lo <= hi:
+            excl = []
+            if suit_or_z == "z":
+                excl = [f"{n}z" for n in range(lo, hi + 1)]
+            else:
+                excl = [f"{n}{suit_or_z}" for n in range(lo, hi + 1)]
+            return (f"{NOT_PREFIX}*,{','.join(excl)}", False)
+    # OR: 3mOR5m / 3mOR5mOR7m -> @o:3m,5m,7m；3mOR[25]m 中 [25]m 展开为 2m,3m,4m,5m
+    if "OR" in s.upper():
+        parts = re.split(r"\s*[Oo][Rr]\s*", s)
+        parts = [p.strip() for p in parts if p.strip()]
+        expanded = []
+        for p in parts:
+            m_r = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f)?$", p, re.IGNORECASE)
+            if m_r:
+                x, y, suit_or_z, suffix = m_r.group(1), m_r.group(2), m_r.group(3).lower(), m_r.group(4)
+                lo, hi = int(x), int(y)
+                if lo <= hi:
+                    for n in range(lo, hi + 1):
+                        expanded.append(f"{n}{suit_or_z}" + (suffix or ""))
+                    continue
+            expanded.append(p)
+        if len(expanded) >= 2 and all(_is_simple_tile_or_placeholder(p) for p in expanded):
+            has_f = any(p.endswith("f") for p in expanded)
+            return (f"{OR_PREFIX}{','.join(expanded)}", None if has_f else False)
+    # NOT 花色：NOTm/NOTp/NOTs、NOTmf/NOTpf/NOTsf（f=手摸切皆可）
+    if re.match(r"^[Nn][Oo][Tt][mps]f?$", s):
+        suit = s[-2] if s.endswith("f") else s[-1]
+        tsumo_val = None if s.endswith("f") else False
+        return (f"{NOT_PREFIX}{suit.lower()}", tsumo_val)
+    # NOT 字牌：zNOT1z / zNOT1zNOT2z -> @n:z,1z 或 @n:z,1z,2z
+    if "NOT" in s.upper():
+        parts = re.split(r"\s*[Nn][Oo][Tt]\s*", s)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) >= 2:
+            base = parts[0]
+            excl = parts[1:]
+            # base 须为 z/zt/zf/kf 等字牌占位；excl 须为 1z-7z
+            if base in ("z", "zt", "zf", "kf", "yp") or base in HONOR_PLACEHOLDERS:
+                valid_excl = all(
+                    len(e) == 2 and e[0] in "1234567" and e[1] == "z"
+                    for e in excl
+                )
+                if valid_excl:
+                    return (f"{NOT_PREFIX}{base},{','.join(excl)}", base == "zt")
+    # 拆搭：cd1/cd2/cdm/cdp/cds
+    if s.lower() in ("cd1", "cd2", "cdm", "cdp", "cds"):
+        # cd1->@cd:1, cd2->@cd:2, cdm->@cd:m, cdp->@cd:p, cds->@cd:s
+        suf = s.lower()[2:]  # "1","2","m","p","s"
+        return (f"{CD_PREFIX}{suf}", False)
     # 吃/碰
     call = _parse_call_element(s)
     if call is not None:
@@ -516,6 +691,14 @@ def parse_discard_element(s: str) -> Tuple[str, bool]:
             return (f"{CALL_PREFIX}r:{base}", True)  # 立直宣言牌必为摸切
         if base in HONOR_PLACEHOLDERS:
             return (f"{CALL_PREFIX}r:{base}", True)
+    if s.endswith("f") and len(s) >= 2:
+        base = s[:-1]
+        if base in HONOR_PLACEHOLDERS or base in SUIT_WILDCARDS:
+            return (base, None)  # 手摸切皆可
+        if base in RED_FIVES or (len(base) >= 2 and base[-1] in "mps" and (base[0].isdigit() or base in RED_FIVES)):
+            return (base, None)
+        if len(base) == 2 and base[0] in "1-7" and base[1] == "z":
+            return (base, None)
     if s.endswith("t") and len(s) >= 2:
         base = s[:-1]
         if base in HONOR_PLACEHOLDERS:
@@ -569,22 +752,218 @@ def parse_target_tiles(target_str: str) -> Tuple[List[str], bool]:
     return (tiles, is_combo) if tiles else (["2m"], False)  # fallback
 
 
+def parse_multi_targets(target_str: str) -> List[Tuple[List[str], bool]]:
+    """
+    解析多目标牌字符串，支持同时分析多个目标。
+    "6s 2m 5p" 或 "6s,2m,5p" -> [(["6s"],False), (["2m"],False), (["5p"],False)]
+    "6s" -> [(["6s"],False)]
+    "1m3m" -> [(["1m","3m"],True)]  # 搭子仍为单一目标
+    """
+    s = (target_str or "").strip()
+    if not s:
+        return [(["2m"], False)]
+    parts = re.split(r'[\s,;]+', s)
+    result = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        tiles, is_combo = parse_target_tiles(p)
+        result.append((tiles, is_combo))
+    return result if result else [(["2m"], False)]
+
+
 def mirror_number(n: int) -> int:
-    """镜像数字: 1↔9, 2↔8, 3↔7, 4↔6, 5↔5"""
+    """镜像数字: 1↔9, 2↔8, 3↔7, 4↔6, 5↔5。等价变体已取消镜像，仅保留供 _transform_tile_for_constraint 等兼容。"""
     return 10 - n
 
 
-def _change_suit(tile: str, new_suit: str) -> str:
-    """将数牌的花色改为 new_suit，字牌、*、$ 与吃碰占位符不变；@r: 后牌参与花色变换"""
+def _get_suits_in_pattern(parsed_pattern: List[Tuple[str, bool]]) -> set:
+    """从解析后的舍牌模式中收集出现的花色 m/p/s"""
+    suits = set()
+
+    def _add_suits_from_tile(tile: str):
+        if tile in SUIT_WILDCARDS:
+            suits.add(tile)
+        elif tile.startswith(NOT_PREFIX):
+            rest = tile[len(NOT_PREFIX):].strip()
+            comps = [x.strip() for x in rest.split(",") if x.strip()]
+            if comps and comps[0] == "*":
+                for e in comps[1:]:
+                    if len(e) >= 2 and e[-1] in "mps":
+                        suits.add(e[-1])
+            elif rest in SUIT_WILDCARDS:
+                suits.add(rest)
+        elif tile.startswith(OR_PREFIX):
+            for part in tile[len(OR_PREFIX):].split(","):
+                part = part.strip()
+                tp = part[:-1] if part.endswith("t") else part
+                if tp in SUIT_WILDCARDS:
+                    suits.add(tp)
+                elif tp in RED_FIVES or (len(tp) >= 2 and tp[-1] in "mps"):
+                    suits.add(tp[-1])
+        elif tile.startswith("@r:"):
+            sub = tile[3:]
+            if sub in RED_FIVES or (len(sub) >= 2 and sub[-1] in "mps"):
+                suits.add(sub[-1])
+        elif tile.startswith(CD_PREFIX):
+            suf = tile[len(CD_PREFIX):]
+            if suf in "mps":
+                suits.add(suf)
+        elif tile.startswith(CALL_PREFIX) and ":" in tile:
+            rest = tile.split(":", 1)[1]
+            for i in range(0, len(rest) - 1, 2):
+                if rest[i + 1 : i + 2] in "mps":
+                    suits.add(rest[i + 1])
+        elif tile in RED_FIVES or (len(tile) >= 2 and tile[-1] in "mps"):
+            suits.add(tile[-1])
+
+    for tile, _ in parsed_pattern:
+        _add_suits_from_tile(tile)
+    return suits
+
+
+def _apply_suit_mapping_to_string(raw: str, mapping: Dict[str, str]) -> str:
+    """
+    对原始舍牌元素做花色映射：仅替换 m/p/s 字符，t、r 等后缀保持不变。
+    例：2mt + m→p -> 2pt；NOTm + m→p -> NOTp
+    """
+    return "".join(mapping[c] if c in "mps" else c for c in raw)
+
+
+def _apply_suit_mapping_to_tile(tile: str, mapping: Dict[str, str]) -> str:
+    """对单张牌/占位符应用花色映射 mapping: {m,p,s} -> {m,p,s}"""
     if tile in ("*", "$"):
         return tile
-    if tile.startswith("@r:"):
-        return f"@r:{_change_suit(tile[3:], new_suit)}"
-    if tile.startswith(CALL_PREFIX):
+    if tile.startswith(CD_PREFIX):
+        suf = tile[len(CD_PREFIX):]
+        if suf in "mps":
+            return f"{CD_PREFIX}{mapping[suf]}"
         return tile
-    if len(tile) >= 2 and tile[-1] in "mps" and (tile[0].isdigit() or tile in RED_FIVES):
-        return f"{tile[0]}{new_suit}"  # 0m->0s, 5m->5s
+    if tile.startswith("@r:"):
+        sub = tile[3:]
+        if sub in RED_FIVES or (len(sub) >= 2 and sub[-1] in "mps"):
+            return f"@r:{sub[0]}{mapping[sub[-1]]}"
+        return tile
+    if tile.startswith(NOT_PREFIX):
+        rest = tile[len(NOT_PREFIX):].strip()
+        comps = [x.strip() for x in rest.split(",") if x.strip()]
+        if comps and comps[0] == "*":
+            transformed = []
+            for e in comps[1:]:
+                if len(e) >= 2 and e[-1] in "mps":
+                    transformed.append(f"{e[0]}{mapping[e[-1]]}")
+                else:
+                    transformed.append(e)
+            return f"{NOT_PREFIX}*,{','.join(transformed)}" if transformed else tile
+        if rest in SUIT_WILDCARDS:
+            return f"{NOT_PREFIX}{mapping[rest]}"
+        return tile
+    if tile.startswith(OR_PREFIX):
+        parts = tile[len(OR_PREFIX):].split(",")
+        transformed = []
+        for p in parts:
+            p = p.strip()
+            suffix = ("t" if p.endswith("t") else ("f" if p.endswith("f") else ""))
+            tile_part = p[:-1] if suffix else p
+            if tile_part in RED_FIVES:
+                transformed.append(f"0{mapping[tile_part[-1]]}" + suffix)
+            elif len(tile_part) >= 2 and tile_part[-1] in "mps":
+                transformed.append(f"{tile_part[0]}{mapping[tile_part[-1]]}" + suffix)
+            elif tile_part in SUIT_WILDCARDS:
+                transformed.append(mapping[tile_part] + suffix)
+            else:
+                transformed.append(p)
+        return f"{OR_PREFIX}{','.join(transformed)}"
+    if tile.startswith(CALL_PREFIX) and ":" in tile:
+        prefix, rest = tile.split(":", 1)
+        if any(c in rest for c in "mps"):
+            new_rest = ""
+            i = 0
+            while i < len(rest):
+                if i + 1 < len(rest) and rest[i + 1] in "mps":
+                    new_rest += rest[i] + mapping[rest[i + 1]]
+                    i += 2
+                else:
+                    new_rest += rest[i]
+                    i += 1
+            return f"{prefix}:{new_rest}"
+        return tile
+    if tile in SUIT_WILDCARDS:
+        return mapping[tile]
+    if tile in RED_FIVES or (len(tile) >= 2 and tile[-1] in "mps"):
+        return f"{tile[0]}{mapping[tile[-1]]}"
     return tile
+
+
+def _apply_suit_mapping_to_pattern(pattern: List[Tuple[str, bool]], mapping: Dict[str, str]) -> List[Tuple[str, bool]]:
+    """对舍牌模式应用花色映射"""
+    return [(_apply_suit_mapping_to_tile(t, mapping), ts) for t, ts in pattern]
+
+
+def _get_suit_mappings_for_variants(suits_in_pattern: set) -> List[Dict[str, str]]:
+    """
+    根据舍牌序列中出现的花色，返回需要的映射列表。
+    - 0 种花色：1 个映射（恒等）
+    - 1 种花色：3 个映射（该花色分别映到 m/p/s）
+    - 2 或 3 种花色：6 个映射（全排列）
+    """
+    base = ["m", "p", "s"]
+    all_perms = list(permutations(base))
+    if not suits_in_pattern:
+        return [dict(zip(base, base))]
+    if len(suits_in_pattern) == 1:
+        (suit,) = suits_in_pattern
+        result = []
+        for target in base:
+            for p in all_perms:
+                m = dict(zip(base, p))
+                if m[suit] == target:
+                    result.append(m)
+                    break
+        return result
+    return [dict(zip(base, p)) for p in all_perms]
+
+
+def _change_suit(tile: str, new_suit: str) -> str:
+    """将数牌的花色改为 new_suit，字牌、*、$、@cd: 与吃碰占位符不变；@r:、@o: 后牌参与花色变换；@n: 不变；t/f 后缀保留"""
+    suffix = ("t" if tile.endswith("t") else ("f" if tile.endswith("f") else ""))
+    if suffix:
+        tile = tile[:-1]
+    if tile in ("*", "$"):
+        return tile + suffix
+    if tile.startswith(CD_PREFIX):
+        return tile
+    if tile.startswith("@r:"):
+        return f"@r:{_change_suit(tile[3:], new_suit)}{suffix}"
+    if tile.startswith(OR_PREFIX):
+        rest = tile[len(OR_PREFIX):]
+        opts = [x.strip() for x in rest.split(",") if x.strip()]
+        transformed = [_change_suit(o, new_suit) for o in opts]
+        return f"{OR_PREFIX}{','.join(transformed)}"
+    # 以下分支：tile 已被 strip suffix，最后需加回
+    # @n: 须在 CALL_PREFIX(@) 之前，因 @n: 也以 @ 开头
+    if tile.startswith(NOT_PREFIX):
+        rest = tile[len(NOT_PREFIX):].strip()
+        comps = [x.strip() for x in rest.split(",") if x.strip()]
+        if comps and comps[0] == "*":
+            transformed = []
+            for e in comps[1:]:
+                if len(e) >= 2 and e[-1] in "mps":
+                    transformed.append(f"{e[0]}{new_suit}")
+                else:
+                    transformed.append(e)
+            return f"{NOT_PREFIX}*,{','.join(transformed)}" if transformed else tile
+        if rest in SUIT_WILDCARDS:
+            return f"{NOT_PREFIX}{new_suit}{suffix}"  # NOTm -> NOTp 等
+        return tile + suffix
+    if tile.startswith(CALL_PREFIX):
+        return tile + suffix
+    if tile in SUIT_WILDCARDS:
+        return new_suit + suffix
+    if len(tile) >= 2 and tile[-1] in "mps" and (tile[0].isdigit() or tile in RED_FIVES):
+        return f"{tile[0]}{new_suit}" + suffix
+    return tile + suffix
 
 
 def _apply_suit(tiles: List[str], suit: str) -> List[str]:
@@ -615,9 +994,9 @@ def _apply_mirror(tiles: List[str]) -> List[str]:
 def _apply_suit_to_pattern(
     pattern: List[Tuple[str, bool]], suit: str
 ) -> List[Tuple[str, bool]]:
-    """对模式应用花色变换，保留摸切标记。赤五参与：0m→0s 等。*、$ 不变。"""
+    """对模式应用花色变换，保留摸切标记。赤五参与：0m→0s 等。*、$、@cd: 不变；@n:m/p/s 随主花色变换；@o: 内数牌参与。"""
     return [
-        (_change_suit(tile, suit) if tile not in ("*", "$") else tile, is_tsumogiri)
+        (_change_suit(tile, suit) if tile not in ("*", "$") and not tile.startswith(CD_PREFIX) else tile, is_tsumogiri)
         for tile, is_tsumogiri in pattern
     ]
 
@@ -630,6 +1009,8 @@ def _apply_suit_to_pattern_dual(
     for tile, is_tsumogiri in pattern:
         if tile in ("*", "$"):
             result.append((tile, is_tsumogiri))
+        elif tile.startswith(CD_PREFIX):
+            result.append((tile, is_tsumogiri))
         elif tile.startswith("@r:"):
             sub = tile[3:]
             if sub in RED_FIVES:
@@ -640,8 +1021,40 @@ def _apply_suit_to_pattern_dual(
                 result.append((tile, is_tsumogiri))
         elif tile.startswith(CALL_PREFIX):
             result.append((tile, is_tsumogiri))
+        elif tile.startswith(NOT_PREFIX):
+            rest = tile[len(NOT_PREFIX):].strip()
+            comps = [x.strip() for x in rest.split(",") if x.strip()]
+            if comps and comps[0] == "*":
+                transformed = []
+                for e in comps[1:]:
+                    if e in RED_FIVES:
+                        transformed.append(f"0{suit_red}")
+                    elif len(e) >= 2 and e[-1] in "mps" and e[0].isdigit():
+                        transformed.append(f"{e[0]}{suit_num}")
+                    else:
+                        transformed.append(e)
+                result.append((f"{NOT_PREFIX}*,{','.join(transformed)}" if transformed else tile, is_tsumogiri))
+            elif rest in SUIT_WILDCARDS:
+                result.append((f"{NOT_PREFIX}{suit_num}", is_tsumogiri))
+            else:
+                result.append((tile, is_tsumogiri))
+        elif tile.startswith(OR_PREFIX):
+            parts = [x.strip() for x in tile[len(OR_PREFIX):].split(",") if x.strip()]
+            transformed = []
+            for p in parts:
+                if p in RED_FIVES:
+                    transformed.append(f"0{suit_red}")
+                elif len(p) >= 2 and p[-1] in "mps" and p[0].isdigit():
+                    transformed.append(f"{p[0]}{suit_num}")
+                elif p in SUIT_WILDCARDS:
+                    transformed.append(suit_num)
+                else:
+                    transformed.append(p)
+            result.append((f"{OR_PREFIX}{','.join(transformed)}", is_tsumogiri))
         elif tile in RED_FIVES:
             result.append((f"0{suit_red}", is_tsumogiri))
+        elif tile in SUIT_WILDCARDS:
+            result.append((suit_num, is_tsumogiri))
         elif len(tile) >= 2 and tile[-1] in "mps" and tile[0].isdigit():
             result.append((f"{tile[0]}{suit_num}", is_tsumogiri))
         else:
@@ -655,6 +1068,8 @@ def _apply_mirror_to_pattern(pattern: List[Tuple[str, bool]]) -> List[Tuple[str,
     for tile, is_tsumogiri in pattern:
         if tile in ("*", "$"):
             result.append((tile, is_tsumogiri))
+        elif tile.startswith(CD_PREFIX):
+            result.append((tile, is_tsumogiri))
         elif tile.startswith("@r:"):
             sub = tile[3:]
             if sub in RED_FIVES:
@@ -665,6 +1080,34 @@ def _apply_mirror_to_pattern(pattern: List[Tuple[str, bool]]) -> List[Tuple[str,
                 result.append((tile, is_tsumogiri))
         elif tile.startswith(CALL_PREFIX):
             result.append((tile, is_tsumogiri))
+        elif tile.startswith(NOT_PREFIX):
+            rest = tile[len(NOT_PREFIX):].strip()
+            comps = [x.strip() for x in rest.split(",") if x.strip()]
+            if comps and comps[0] == "*":
+                transformed = []
+                for e in comps[1:]:
+                    if len(e) >= 2 and e[-1] in "mps" and e[0].isdigit():
+                        transformed.append(f"{mirror_number(int(e[0]))}{e[-1]}")
+                    else:
+                        transformed.append(e)
+                result.append((f"{NOT_PREFIX}*,{','.join(transformed)}" if transformed else tile, is_tsumogiri))
+            else:
+                result.append((tile, is_tsumogiri))
+        elif tile in SUIT_WILDCARDS:
+            result.append((tile, is_tsumogiri))  # m/p/s 无数可镜像
+        elif tile.startswith(OR_PREFIX):
+            parts = [x.strip() for x in tile[len(OR_PREFIX):].split(",") if x.strip()]
+            transformed = []
+            for p in parts:
+                suffix = ("t" if p.endswith("t") else ("f" if p.endswith("f") else ""))
+                base = p[:-1] if suffix else p
+                if len(base) >= 2 and base[-1] in "mps" and base[0].isdigit():
+                    transformed.append(f"{mirror_number(int(base[0]))}{base[-1]}" + suffix)
+                elif base in SUIT_WILDCARDS:
+                    transformed.append(base + suffix)
+                else:
+                    transformed.append(p)
+            result.append((f"{OR_PREFIX}{','.join(transformed)}", is_tsumogiri))
         elif tile in RED_FIVES:
             result.append((tile, is_tsumogiri))
         elif len(tile) >= 2 and tile[-1] in "mps" and tile[0].isdigit():
@@ -676,12 +1119,16 @@ def _apply_mirror_to_pattern(pattern: List[Tuple[str, bool]]) -> List[Tuple[str,
 
 
 def _transform_tile_for_constraint(tile_str: str, suit: str, mirror: bool) -> str:
-    """转换可见约束中的牌"""
+    """转换可见约束中的牌（mirror 已废弃，保留签名兼容）"""
     if len(tile_str) >= 2 and tile_str[-1] in 'mps' and tile_str[0].isdigit():
-        n = int(tile_str[0])
-        if mirror:
-            n = mirror_number(n)
-        return f"{n}{suit}"
+        return f"{tile_str[0]}{suit}"
+    return tile_str
+
+
+def _transform_tile_with_mapping(tile_str: str, mapping: Dict[str, str]) -> str:
+    """对目标牌/约束牌应用花色映射"""
+    if tile_str in RED_FIVES or (len(tile_str) >= 2 and tile_str[-1] in "mps"):
+        return f"{tile_str[0]}{mapping[tile_str[-1]]}"
     return tile_str
 
 
@@ -690,7 +1137,7 @@ def _transform_visible_constraints(
     suit: str,
     mirror: bool
 ) -> Dict[str, Tuple[int, int]]:
-    """转换可见约束到指定花色和镜像"""
+    """转换可见约束到指定花色（mirror 已废弃）"""
     if not visible_constraints:
         return {}
     result = {}
@@ -698,6 +1145,16 @@ def _transform_visible_constraints(
         new_tile = _transform_tile_for_constraint(tile_str, suit, mirror)
         result[new_tile] = (min_count, max_count)
     return result
+
+
+def _transform_visible_constraints_with_mapping(
+    visible_constraints: Optional[Dict[str, Tuple[int, int]]],
+    mapping: Dict[str, str]
+) -> Dict[str, Tuple[int, int]]:
+    """对可见约束应用花色映射"""
+    if not visible_constraints:
+        return {}
+    return {_transform_tile_with_mapping(t, mapping): v for t, v in visible_constraints.items()}
 
 
 def _expand_pure_honor_pattern(parsed: List[Tuple[str, bool]]) -> List[List[Tuple[str, bool]]]:
@@ -732,14 +1189,16 @@ def _expand_pure_honor_pattern(parsed: List[Tuple[str, bool]]) -> List[List[Tupl
 def generate_equivalent_variants(
     discard_pattern: List[str],
     target_tile: str,
-    visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None
+    visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+    prior_discard_exclusion: Optional[str] = None,
 ) -> List[Dict]:
     """
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
+    仅花色对称，无镜像对称。
 
-    - 仅普通数牌：6 个变体 = 3 花色 × 2（原始/镜像）。
-    - 同时含普通数牌与赤五（0m/0p/0s）：18 个变体 = 数牌花色×赤五花色 各 3 × 2（镜像）。
-      例：7s-0m-9s 等价于 7s-0p-9s、7m-0s-9m、7m-0p-9s、7p-0m-9p 等及镜像；赤五参与花色变换且与数牌独立等价。
+    - 0 种花色（纯字牌等）：1 个变体
+    - 1 种花色：3 个变体（该花色映到 m/p/s）
+    - 2 或 3 种花色：6 个变体（全排列）
     """
     if not discard_pattern:
         return []
@@ -747,111 +1206,63 @@ def generate_equivalent_variants(
     parsed_pattern = [parse_discard_element(p) for p in discard_pattern]
     target_tiles, is_combo = parse_target_tiles(target_tile)
 
-    def _transform_target(tiles: List[str], suit: str, mirror: bool) -> Union[str, List[str]]:
-        transformed = [_transform_tile_for_constraint(t, suit, mirror) for t in tiles]
-        return transformed[0] if len(transformed) == 1 else transformed
-
     def _is_number_tile(tile: str) -> bool:
         return len(tile) >= 2 and tile[-1] in 'mps' and tile[0].isdigit()
 
     def _is_red_five(tile: str) -> bool:
         return tile in RED_FIVES
 
-    # 检查是否包含数牌、赤五、吃、碰、立直宣言
     has_number = any(_is_number_tile(tile) for tile, _ in parsed_pattern) or any(
         tile.startswith("@r:") and _is_number_tile(tile[3:]) for tile, _ in parsed_pattern
-    )
-    has_red_five = any(_is_red_five(tile) for tile, _ in parsed_pattern) or any(
-        tile.startswith("@r:") and tile[3:] in RED_FIVES for tile, _ in parsed_pattern
     )
     has_chi = any(tile.startswith("@c:") for tile, _ in parsed_pattern)
     has_pon = any(tile.startswith("@p:") for tile, _ in parsed_pattern)
     has_riichi = any(tile.startswith("@r:") for tile, _ in parsed_pattern)
-    # 立直宣言牌(r)与副露(c/p)互斥：立直玩家不可能有吃碰
-    if has_riichi and (has_chi or has_pon):
-        raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
-    # 数牌碰：@p: 后的内容含 m/p/s（如将来支持 p5m5m）；@p:1z1z、@p:kf 为字牌碰
     has_number_pon = any(
         tile.startswith("@p:") and any(c in tile[3:] for c in "mps")
         for tile, _ in parsed_pattern
     )
-    # 含吃或数牌碰时不生成等价变体（只保留原模式 1 个）；仅碰字牌时仍可生成变体
-    no_suit_mirror_variants = has_chi or (has_pon and has_number_pon)
+    if has_riichi and (has_chi or has_pon):
+        raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
+    no_suit_variants = has_chi or (has_pon and has_number_pon)
 
-    # 纯字牌模式：展开或保留占位符
+    # 纯字牌模式
     if not has_number:
         honor_variants = _expand_pure_honor_pattern(parsed_pattern)
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
+        prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
         return [
-            {
-                "discard": p,
-                "target": t,
-                "visible_constraints": dict(visible_constraints) if visible_constraints else {},
-                "is_combo": is_combo
-            }
+            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior}
             for p in honor_variants
         ]
 
-    # 含吃或数牌碰：不生成花色/镜像变体，仅 1 个变体（原模式）
-    if no_suit_mirror_variants:
+    # 含吃或数牌碰：不生成花色变体
+    if no_suit_variants:
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
+        prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
         return [
-            {
-                "discard": list(parsed_pattern),
-                "target": t,
-                "visible_constraints": dict(visible_constraints) if visible_constraints else {},
-                "is_combo": is_combo,
-            }
+            {"discard": list(parsed_pattern), "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior}
         ]
 
+    # 花色对称：直接对舍牌元素中的 m/p/s 做映射替换，t、r 等保持不变
+    suits_in_pattern = _get_suits_in_pattern(parsed_pattern)
+    mappings = _get_suit_mappings_for_variants(suits_in_pattern)
+
     variants = []
-    suits = ['s', 'm', 'p']
-
-    # 同时含普通数牌与赤五：数牌花色 × 赤五花色 互相等价，生成 9 + 9(镜像) = 18 变体
-    if has_number and has_red_five:
-        for suit_num in suits:
-            for suit_red in suits:
-                discard_orig = _apply_suit_to_pattern_dual(parsed_pattern, suit_num, suit_red)
-                target_orig = _transform_target(target_tiles, suit_num, False)
-                visible_orig = _transform_visible_constraints(visible_constraints, suit_num, False)
-                variants.append({
-                    "discard": discard_orig,
-                    "target": target_orig,
-                    "visible_constraints": visible_orig,
-                    "is_combo": is_combo
-                })
-                discard_mir = _apply_mirror_to_pattern(
-                    _apply_suit_to_pattern_dual(parsed_pattern, suit_num, suit_red)
-                )
-                target_mir = _transform_target(target_tiles, suit_num, True)
-                visible_mir = _transform_visible_constraints(visible_constraints, suit_num, True)
-                variants.append({
-                    "discard": discard_mir,
-                    "target": target_mir,
-                    "visible_constraints": visible_mir,
-                    "is_combo": is_combo
-                })
-        return variants
-
-    # 无数牌+赤五混合：原逻辑 3 花色 × 2 镜像 = 6 变体
-    for suit in suits:
-        discard_orig = _apply_suit_to_pattern(parsed_pattern, suit)
-        target_orig = _transform_target(target_tiles, suit, False)
-        visible_orig = _transform_visible_constraints(visible_constraints, suit, False)
+    for mapping in mappings:
+        # 在原始字符串上替换 m/p/s，再解析（保证 t/r 不丢失）
+        mapped_raw = [_apply_suit_mapping_to_string(elem, mapping) for elem in discard_pattern]
+        discard_new = [parse_discard_element(e) for e in mapped_raw]
+        target_new = [_transform_tile_with_mapping(t, mapping) for t in target_tiles]
+        target_new = target_new[0] if len(target_new) == 1 else target_new
+        visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
+        prior_mapped = _apply_suit_mapping_to_string(prior_discard_exclusion.strip(), mapping) if prior_discard_exclusion else None
         variants.append({
-            "discard": discard_orig,
-            "target": target_orig,
-            "visible_constraints": visible_orig,
-            "is_combo": is_combo
-        })
-        discard_mir = _apply_mirror_to_pattern(_apply_suit_to_pattern(parsed_pattern, suit))
-        target_mir = _transform_target(target_tiles, suit, True)
-        visible_mir = _transform_visible_constraints(visible_constraints, suit, True)
-        variants.append({
-            "discard": discard_mir,
-            "target": target_mir,
-            "visible_constraints": visible_mir,
-            "is_combo": is_combo
+            "discard": discard_new,
+            "target": target_new,
+            "visible_constraints": visible_new,
+            "is_combo": is_combo,
+            "prior_discard_exclusion": prior_mapped,
         })
     return variants
 
@@ -952,6 +1363,67 @@ def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] =
     return False
 
 
+def _is_number_tile(tile_str: str) -> bool:
+    """是否为数牌（万筒索，非字牌）"""
+    if len(tile_str) < 2:
+        return False
+    if tile_str[-1] not in "mps":
+        return False
+    return tile_str[0].isdigit() or tile_str in RED_FIVES
+
+
+def _number_tile_value(tile_str: str) -> Optional[int]:
+    """数牌数值，0m/0p/0s 视为 5"""
+    if tile_str in RED_FIVES:
+        return 5
+    if len(tile_str) >= 2 and tile_str[-1] in "mps" and tile_str[0].isdigit():
+        return int(tile_str[0])
+    return None
+
+
+def _is_meld(t1: str, t2: str) -> bool:
+    """两数牌是否构成搭子（同花色，数值差1或2）。1s9s 不是搭子。"""
+    if not _is_number_tile(t1) or not _is_number_tile(t2):
+        return False
+    if t1[-1] != t2[-1]:
+        return False
+    v1, v2 = _number_tile_value(t1), _number_tile_value(t2)
+    if v1 is None or v2 is None:
+        return False
+    diff = abs(v1 - v2)
+    return diff in (1, 2)
+
+
+def _discard_is_chaida(
+    full_discards: List[Tuple[str, bool]],
+    d_idx: int,
+    require_suit: Optional[str] = None,
+    exclude_suit: Optional[str] = None,
+) -> bool:
+    """
+    检查 full_discards[d_idx] 是否为拆搭（与另一张手切构成搭子）。
+    require_suit: 必须为该花色（cdm/cdp/cds）
+    exclude_suit: 不能为该花色（cd2 约束）
+    """
+    if d_idx < 0 or d_idx >= len(full_discards):
+        return False
+    tile_str, is_tsumogiri = full_discards[d_idx]
+    if is_tsumogiri or not _is_number_tile(tile_str):
+        return False
+    if require_suit and tile_str[-1] != require_suit:
+        return False
+    if exclude_suit and tile_str[-1] == exclude_suit:
+        return False
+    for i, (t2, ts2) in enumerate(full_discards):
+        if i == d_idx or ts2:
+            continue
+        if not _is_number_tile(t2):
+            continue
+        if _is_meld(tile_str, t2):
+            return True
+    return False
+
+
 def _match_pattern_at_end(
     full_discards: List[Tuple[str, bool]],
     pattern: List[Tuple[str, bool]],
@@ -995,6 +1467,134 @@ def _match_pattern_at_end(
             if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
                 return False
             if tile_str != want_tile or not is_tsumogiri:
+                return False
+            consumed_any_discard = True
+            d_idx -= 1
+            p_idx -= 1
+            continue
+
+        # 拆搭 @cd:1/2/m/p/s：消耗一张舍牌，须为手切且与另一手切构成搭子
+        if pat_tile.startswith(CD_PREFIX):
+            if is_tsumogiri:
+                return False
+            cd_suffix = pat_tile[len(CD_PREFIX):]
+            require_suit = cd_suffix if cd_suffix in "mps" else None
+            exclude_suit = None
+            if cd_suffix == "2":
+                next_tile = None
+                if d_idx + 1 < len(full_discards):
+                    next_tile = full_discards[d_idx + 1][0]
+                if next_tile and _is_number_tile(next_tile):
+                    exclude_suit = next_tile[-1]
+            if not _discard_is_chaida(full_discards, d_idx, require_suit, exclude_suit):
+                return False
+            consumed_any_discard = True
+            d_idx -= 1
+            p_idx -= 1
+            continue
+
+        # @n: 与 @o: 须在 CALL_PREFIX 之前检查（因皆以 @ 开头）
+        if pat_tile.startswith(NOT_PREFIX):
+            rest = pat_tile[len(NOT_PREFIX):].strip()
+            comps = [x.strip() for x in rest.split(",") if x.strip()]
+            # @n:*,4m,5m：NOT[45]m，匹配除 4m、5m 外的任意牌
+            if len(comps) >= 2 and comps[0] == "*":
+                excl_set = set()
+                excl_suit = None  # 排除牌花色；等价变换时仅匹配该花色的舍牌，避免 4m 误匹配 NOT[45]p
+                for e in comps[1:]:
+                    if _is_honor_tile(e):
+                        excl_set.add(_honor_tile_to_z(e))
+                    else:
+                        excl_set.add(e)
+                        if len(e) >= 2 and e[-1] in "mps":
+                            excl_suit = e[-1]
+                tile_canon = _honor_tile_to_z(tile_str) if _is_honor_tile(tile_str) else tile_str
+                if tile_canon in excl_set:
+                    return False
+                # 等价变换：排除为某花色时，数牌舍牌须同花色（NOT[45]p 只匹配 1p~9p 且非 4p5p，避免 4m 误匹配）
+                if excl_suit and (_is_number_tile(tile_str) or tile_str in RED_FIVES):
+                    if tile_str[-1] != excl_suit:
+                        return False
+                consumed_any_discard = True
+                d_idx -= 1
+                p_idx -= 1
+                continue
+            # @n:m / @n:p / @n:s：任意一张非万/饼/索
+            if len(comps) == 1 and comps[0] in SUIT_WILDCARDS:
+                excl_suit = comps[0]
+                tile_suit = None
+                if _is_number_tile(tile_str) or tile_str in RED_FIVES:
+                    tile_suit = tile_str[-1]
+                elif _is_honor_tile(tile_str):
+                    tile_suit = None  # 字牌无花色，视为非数牌花色
+                if tile_suit == excl_suit:
+                    return False
+                consumed_any_discard = True
+                d_idx -= 1
+                p_idx -= 1
+                continue
+            if len(comps) >= 2:
+                base, excl_z = comps[0], set(comps[1:])
+                tile_z = _honor_tile_to_z(tile_str)
+                if not _is_honor_tile(tile_str):
+                    return False
+                if tile_z in excl_z:
+                    return False
+                if base == "zf" and (jikaze is None or tile_str != jikaze):
+                    return False
+                if base == "kf" and (not kyokuze_list or tile_str not in kyokuze_list):
+                    return False
+                consumed_any_discard = True
+                d_idx -= 1
+                p_idx -= 1
+                continue
+
+        if pat_tile.startswith(OR_PREFIX):
+            rest = pat_tile[len(OR_PREFIX):]
+            options = [x.strip() for x in rest.split(",") if x.strip()]
+            matched_opt = None
+            for opt in options:
+                want_tsumogiri_opt = True if opt.endswith("t") else (None if opt.endswith("f") else False)
+                tile_part = opt[:-1] if (opt.endswith("t") or opt.endswith("f")) else opt
+                if tile_part in ("$", "*"):
+                    # $=手切 *＝摸切，不比较牌面，只比较摸切状态
+                    want_hand = tile_part == "$"
+                    if want_hand and not is_tsumogiri:
+                        matched_opt = opt
+                        break
+                    if not want_hand and is_tsumogiri:
+                        matched_opt = opt
+                        break
+                elif tile_part in SUIT_WILDCARDS:
+                    if want_tsumogiri_opt is not None and is_tsumogiri != want_tsumogiri_opt:
+                        continue
+                    if (_is_number_tile(tile_str) or tile_str in RED_FIVES) and tile_str[-1] == tile_part:
+                        matched_opt = opt
+                        break
+                elif tile_part in HONOR_PLACEHOLDERS:
+                    if want_tsumogiri_opt is not None and is_tsumogiri != want_tsumogiri_opt:
+                        continue
+                    if tile_part in ("z", "zt", "z1", "z2", "z3"):
+                        if _is_honor_tile(tile_str) and tile_str not in matched_honors:
+                            matched_opt = opt
+                            matched_honors.add(tile_str)
+                            break
+                    elif tile_part == "zf":
+                        if jikaze is not None and tile_str == jikaze:
+                            matched_opt = opt
+                            break
+                    elif tile_part in ("kf", "kf1", "kf2", "kf3"):
+                        if kyokuze_list and tile_str in kyokuze_list and tile_str not in matched_honors:
+                            matched_opt = opt
+                            matched_honors.add(tile_str)
+                            break
+                else:
+                    tile_canon = _honor_tile_to_z(tile_str) if _is_honor_tile(tile_str) else tile_str
+                    opt_canon = _honor_tile_to_z(tile_part) if _is_honor_tile(tile_part) else tile_part
+                    if tile_canon == opt_canon and (want_tsumogiri_opt is None or is_tsumogiri == want_tsumogiri_opt):
+                        matched_opt = opt
+                        break
+            if matched_opt is None:
                 return False
             consumed_any_discard = True
             d_idx -= 1
@@ -1065,8 +1665,8 @@ def _match_pattern_at_end(
             p_idx -= 1
             continue
 
-        # 摸切要求须一致
-        if is_tsumogiri != pat_want_tsumogiri:
+        # 摸切要求须一致（pat_want_tsumogiri 为 None 时手摸切皆可）
+        if pat_want_tsumogiri is not None and is_tsumogiri != pat_want_tsumogiri:
             return False
 
         # 字牌占位符匹配
@@ -1106,6 +1706,17 @@ def _match_pattern_at_end(
                 if tile_str in matched_honors:
                     return False
                 matched_honors.add(tile_str)
+            consumed_any_discard = True
+            d_idx -= 1
+            p_idx -= 1
+            continue
+
+        # 花色通配符 m/p/s：任意该花色的数牌（含赤五 0m/0p/0s）
+        if pat_tile in SUIT_WILDCARDS:
+            if not _is_number_tile(tile_str) and tile_str not in RED_FIVES:
+                return False
+            if tile_str[-1] != pat_tile:
+                return False
             consumed_any_discard = True
             d_idx -= 1
             p_idx -= 1
@@ -1209,7 +1820,6 @@ if __name__ == "__main__":
         ([("4z", False), ("5z", False), ("9m", False), ("1m", False), ("8m", True), ("3m", False)],
          "4z,5z,9m,1m,8m(摸切),3m - 1m与3m中间有摸切，应不匹配"),
         ([("1m", False), ("3m", False)], "1m-3m 相邻手切"),
-        ([("9m", False), ("7m", False)], "9m-7m（镜像）"),
     ]
     for full_discards, desc in test_cases:
         matched = match_discard_to_variant(full_discards, variants)
