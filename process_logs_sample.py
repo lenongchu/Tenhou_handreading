@@ -14,7 +14,6 @@ import gzip
 from src.database import Database
 from src.live_analyzer import parse_log_to_game_states
 from src.mjlog_parser import MjlogParser
-from src.simple_normalizer import normalize_discard_pattern
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,7 +103,7 @@ def main():
                             # Convert tile codes to strings
                             pattern_strings = [MjlogParser.tile_to_string(t) for t in pattern_so_far]
                             # Normalize the pattern for equivalence matching
-                            norm_pattern = normalize_discard_pattern(pattern_strings)
+                            norm_pattern = "-".join(pattern_strings) if pattern_strings else ""
                         else:
                             norm_pattern = None
                         

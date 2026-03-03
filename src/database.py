@@ -283,7 +283,7 @@ class Database:
         for state in game_states:
             for i, discard in enumerate(state.discards):
                 # 计算该巡的标准化模式（累计到该巡的所有手切）
-                # 使用 simple_normalizer.normalize_discard_pattern
+                # 舍牌模式存储为 "-".join(tiles)，等价变体逻辑见 equivalent_variants
                 normalized_pattern = None
                 
                 self.insert_game_state(

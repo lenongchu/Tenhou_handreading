@@ -17,7 +17,7 @@ import logging
 
 from .mjlog_parser import MjlogParser, GameState
 from .tenpai_utils import is_tenpai
-from .simple_normalizer import (
+from .equivalent_variants import (
     generate_equivalent_variants,
     get_forbidden_bases_from_exclusion_str,
     match_discard_to_variant,
@@ -2461,7 +2461,7 @@ def verify_sample_consistency(
         full_discards = _actual_pattern_to_full_discards(actual)
         if not full_discards:
             return (False, "actual_pattern parsed to empty sequence")
-        from .simple_normalizer import parse_multi_targets
+        from .equivalent_variants import parse_multi_targets
         first_t = parse_multi_targets(target_tile)[0]
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
         variants = generate_equivalent_variants(query_pattern, variant_target, visible_constraints)

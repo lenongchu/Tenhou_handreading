@@ -27,7 +27,7 @@ from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont, QIntValidator
 
 from .data_downloader import DataDownloader
 from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_display
-from .simple_normalizer import split_discard_pattern
+from .equivalent_variants import split_discard_pattern
 from .tile_illustration import render_illustration_to_qimage
 logger = logging.getLogger(__name__)
 

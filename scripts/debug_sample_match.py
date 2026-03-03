@@ -35,7 +35,7 @@ def main():
 
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
     from src.live_analyzer import parse_log_to_game_states
-    from src.simple_normalizer import match_discard_to_variant, generate_equivalent_variants
+    from src.equivalent_variants import match_discard_to_variant, generate_equivalent_variants
     from src.mjlog_parser import MjlogParser
 
     db_path = __import__("pathlib").Path(__file__).parent.parent / "data" / "tenhou.db"

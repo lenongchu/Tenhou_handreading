@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
-from .simple_normalizer import split_discard_pattern
+from .equivalent_variants import split_discard_pattern
 
 # PyQt5 统一导入，避免各函数内遗漏
 from PyQt5.QtCore import Qt, QPointF, QRectF, QRect

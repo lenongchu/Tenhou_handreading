@@ -6,7 +6,7 @@
 
 ## 一、映射的生成（全局、分析开始时）
 
-映射关系在 `src/simple_normalizer.py` 的 `generate_equivalent_variants()` 中生成，依据是**舍牌模式中出现的花色数量**：
+映射关系在 `src/equivalent_variants.py` 的 `generate_equivalent_variants()` 中生成，依据是**舍牌模式中出现的花色数量**：
 
 | 模式花色数 | 映射数量 | 说明 |
 |-----------|----------|------|
@@ -107,10 +107,10 @@ generate_equivalent_variants()
 
 | 功能 | 文件 | 函数/位置 |
 |------|------|-----------|
-| 映射生成 | simple_normalizer.py | `_get_suit_mappings_for_variants` |
-| 变体生成 | simple_normalizer.py | `generate_equivalent_variants` |
-| 目标牌变换 | simple_normalizer.py | `_transform_tile_with_mapping` |
-| 可见约束变换 | simple_normalizer.py | `_transform_visible_constraints_with_mapping` |
+| 映射生成 | equivalent_variants.py | `_get_suit_mappings_for_variants` |
+| 变体生成 | equivalent_variants.py | `generate_equivalent_variants` |
+| 目标牌变换 | equivalent_variants.py | `_transform_tile_with_mapping` |
+| 可见约束变换 | equivalent_variants.py | `_transform_visible_constraints_with_mapping` |
 | 宝牌等价检查 | live_analyzer.py | `_dora_matches_constraint` |
 | 宝牌 round 过滤 | live_analyzer.py | 多处 `if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(...)` |
 | 宝牌无关（pattern_suit） | live_analyzer.py | 从 `matched_variant["discard"]` 提取花色后比较 |

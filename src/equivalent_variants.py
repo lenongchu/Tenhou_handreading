@@ -1292,26 +1292,16 @@ def get_acceptable_last_tiles(variants: List[Dict]) -> frozenset:
     return frozenset(last_tiles)
 
 
-def normalize_discard_pattern(tiles: List[str]) -> str:
-    """
-    已废弃：仅保留供 process_logs 等旧脚本兼容。
-    返回原始序列的字符串形式，不做等价标准化。
-    新代码请使用 generate_equivalent_variants + match_discard_to_variant。
-    """
-    import warnings
-    warnings.warn("normalize_discard_pattern 已废弃，请使用 generate_equivalent_variants", DeprecationWarning)
-    return "-".join(tiles) if tiles else ""
-
-
-def map_target_tile(query_pattern: List[str], actual_pattern: List[str], target_tile: str) -> str:
-    """
-    已废弃：仅保留供旧代码兼容。
-    当 query_pattern 与 actual_pattern 等价时映射目标牌。
-    新代码请使用 generate_equivalent_variants + match_discard_to_variant。
-    """
-    full_discards = [(t, False) for t in actual_pattern]  # 假定全为手切
-    matched = match_discard_to_variant(full_discards, generate_equivalent_variants(query_pattern, target_tile, None))
-    return matched["target"] if matched else target_tile
+# [已废弃] 以下函数已注释，请使用 generate_equivalent_variants + match_discard_to_variant
+# def normalize_discard_pattern(tiles: List[str]) -> str:
+#     """已废弃：返回原始序列的字符串形式，不做等价标准化。"""
+#     return "-".join(tiles) if tiles else ""
+#
+# def map_target_tile(query_pattern: List[str], actual_pattern: List[str], target_tile: str) -> str:
+#     """已废弃：当 query_pattern 与 actual_pattern 等价时映射目标牌。"""
+#     full_discards = [(t, False) for t in actual_pattern]
+#     matched = match_discard_to_variant(full_discards, generate_equivalent_variants(query_pattern, target_tile, None))
+#     return matched["target"] if matched else target_tile
 
 
 def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] = None,
