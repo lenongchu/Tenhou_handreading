@@ -204,7 +204,29 @@ def _parse_round_from_tenhou6(
                     for s in game_states:
                         s.dora_indicators = list(dora_indicators_list)
                         s.visible_tiles[ind] += 1
-    
+
+        elif ev_type == "agari":
+            # 和牌：actor=和牌者，fromwho=供牌者；actor==fromwho 则为自摸
+            actor = ev.get("actor", 0)
+            fromwho = ev.get("fromwho", actor)
+            if actor not in game_states[0].round_winners:
+                game_states[0].round_winners.append(actor)
+            if actor != fromwho:
+                # 荣和：fromwho 放铳（一炮双响时同一人只记 1 次）
+                if game_states[0].round_deal_in is None:
+                    game_states[0].round_deal_in = fromwho
+
+        elif ev_type == "ryuukyoku":
+            # 流局：无和牌、无放铳，round_winners/round_deal_in 保持空/None
+            pass
+
+    # 将结局信息同步到 4 个 GameState（每个玩家共享同一局的结局）
+    round_winners = game_states[0].round_winners
+    round_deal_in = game_states[0].round_deal_in
+    for s in game_states:
+        s.round_winners = list(round_winners)
+        s.round_deal_in = round_deal_in
+
     # 同步最终手牌（转为 set 以兼容 GameState 类型）
     for i in range(4):
         game_states[i].hand_tiles = set(hands[i])

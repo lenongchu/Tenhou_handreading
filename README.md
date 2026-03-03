@@ -188,6 +188,15 @@ tenhou_handreading/
 - [ ] GUI界面开发
 - [ ] 单元测试
 
+## 麻将示意图 3D 牌面
+
+示意图默认使用 2D 绘制。若需 3D 牌面效果：
+
+1. 将 `3d_tile.glb` 置于项目根目录
+2. 安装依赖：`pip install trimesh pyrender Pillow`
+3. 运行预烘焙脚本：`python bake_3d_tiles.py`（需 OpenGL，部分环境可试 `set PYOPENGL_PLATFORM=osmesa`）
+4. 烘焙结果输出到 `assets/3d-tile/`，示意图将自动使用
+
 ## 参考资源
 
 - [houou-logs 项目](https://github.com/Apricot-S/houou-logs)

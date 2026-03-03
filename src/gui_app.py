@@ -20,9 +20,10 @@ from PyQt5.QtWidgets import (
     QMessageBox, QFormLayout, QListWidget, QListWidgetItem,
     QDialog, QComboBox, QDialogButtonBox, QSizePolicy,
     QScrollArea, QFrame, QGridLayout, QCheckBox, QSplitter,
+    QTabWidget, QTabBar, QInputDialog,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QRectF, QSettings, QTimer
-from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont
+from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont, QIntValidator
 
 from .data_downloader import DataDownloader
 from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_display
@@ -222,7 +223,44 @@ def _get_app_stylesheet() -> str:
     
     /* === Tab / 对话框 === */
     QDialog { background-color: #0d1117; }
-    QTabWidget::pane { border: 1px solid #30363d; border-radius: 6px; }
+    QTabWidget::pane {
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        background-color: #161b22;
+        margin-top: 0;
+        padding: 12px;
+        top: 2px;
+    }
+    QTabBar {
+        background: transparent;
+        border: none;
+    }
+    QTabBar::tab {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #21262d, stop:1 #161b22);
+        color: #8b949e;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 6px 16px;
+        margin-right: 6px;
+        font-weight: 500;
+        min-width: 64px;
+    }
+    QTabBar::tab:selected {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #1a5fb4, stop:1 #388bfd);
+        color: #fff;
+        border-color: #58a6ff;
+    }
+    QTabBar::tab:hover:!selected {
+        color: #c9d1d9;
+        border-color: #58a6ff;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 #30363d, stop:1 #21262d);
+    }
+    QTabBar::tab:first {
+        margin-left: 0;
+    }
     """
 
 
@@ -580,6 +618,62 @@ class QueryThread(QThread):
             self.finished.emit(False, str(e))
 
 
+class OutcomeQueryThread(QThread):
+    """结局统计线程：仅统计和了率、放铳率"""
+    progress = pyqtSignal(str)
+    progress_num = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, object)
+
+    def __init__(self, analyzer: LiveAnalyzer, params: dict):
+        super().__init__()
+        self.analyzer = analyzer
+        self.params = params
+        self._should_cancel = False
+
+    def cancel(self):
+        self._should_cancel = True
+
+    def run(self):
+        try:
+            self.progress.emit("正在统计和铳率...")
+
+            def progress_callback(current, total):
+                self.progress_num.emit(current, total)
+                if total > 0:
+                    percent = current / total * 100
+                    self.progress.emit(f"正在分析: {_fmt_int(current)}/{_fmt_int(total)} ({percent:.1f}%)")
+                else:
+                    self.progress.emit(f"正在分析: 已扫描 {_fmt_int(current)} 场")
+
+            def should_cancel():
+                return self._should_cancel
+
+            outcome_params = {
+                k: v for k, v in self.params.items()
+                if k in ("query_pattern", "target_tile", "query_items", "dora_constraint",
+                         "visible_constraints", "riichi_constraint", "call_constraint",
+                         "call_area_constraints", "turn_range", "sample_limit",
+                         "exclude_south4", "exclude_south3", "prior_discard_exclusion",
+                         "max_workers")
+            }
+            result = self.analyzer.compute_pattern_outcome_rates(
+                **outcome_params,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+            )
+
+            if self._should_cancel:
+                self.progress.emit("已取消")
+                self.finished.emit(False, "用户取消")
+            else:
+                self.progress.emit("统计完成")
+                self.finished.emit(True, result)
+        except Exception as e:
+            logger.exception("结局统计失败")
+            self.progress.emit(f"统计失败: {str(e)}")
+            self.finished.emit(False, str(e))
+
+
 class SampleThread(QThread):
     """样本收集线程"""
     progress = pyqtSignal(str)
@@ -587,7 +681,7 @@ class SampleThread(QThread):
     finished = pyqtSignal(bool, object)  # success, samples list
 
     def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter,
-                 sample_pool=None, target_tile_filter=None):
+                 sample_pool=None, target_tile_filter=None, outcome_filter=None):
         super().__init__()
         self.analyzer = analyzer
         self.params = params
@@ -595,6 +689,7 @@ class SampleThread(QThread):
         self.target_count_filter = target_count_filter
         self.sample_pool = sample_pool  # 主统计时预收集的样本池，有则无需二次遍历
         self.target_tile_filter = target_tile_filter  # 多目标时指定按哪个目标筛选
+        self.outcome_filter = outcome_filter  # "win"|"deal_in"|"neither" 和铳率模式下的结局筛选
         self._should_cancel = False
 
     def cancel(self):
@@ -619,6 +714,7 @@ class SampleThread(QThread):
                 progress_callback=progress_cb,
                 should_cancel=lambda: self._should_cancel,
                 sample_pool=self.sample_pool,
+                outcome_filter=self.outcome_filter,
             )
             self.progress.emit(f"收集完成，共 {len(samples)} 条")
             self.finished.emit(True, samples)
@@ -678,32 +774,50 @@ def _archive_file_path(db_path: str) -> Path:
     return p.parent / "query_archive.json"
 
 
-def _load_archive(db_path: str) -> List[Dict[str, Any]]:
-    """加载存档列表"""
+def _new_folder_id() -> str:
+    """生成新文件夹 ID"""
+    import uuid
+    return "f_" + uuid.uuid4().hex[:12]
+
+
+def _load_archive(db_path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """加载存档列表与文件夹。返回 (items, folders)。兼容旧格式。"""
     path = _archive_file_path(db_path)
     if not path.exists():
-        return []
+        return [], []
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("items", [])
     except Exception:
-        return []
+        return [], []
+    items = data.get("items", [])
+    folders = data.get("folders", [])
+    if not isinstance(folders, list):
+        folders = []
+    # 旧格式无 folder_id，补全
+    for e in items:
+        if "folder_id" not in e:
+            e["folder_id"] = None
+    return items, folders
 
 
-def _save_archive(db_path: str, items: List[Dict[str, Any]]) -> None:
-    """保存存档列表"""
+def _save_archive(db_path: str, items: List[Dict[str, Any]], folders: List[Dict[str, Any]]) -> None:
+    """保存存档列表与文件夹"""
     path = _archive_file_path(db_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+            json.dump({"items": items, "folders": folders}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         raise RuntimeError(f"保存存档失败: {e}")
 
 
 def _build_pattern_summary(result: dict) -> str:
     """从查询结果提取舍牌模式摘要，用于列表展示与搜索"""
+    if result.get("table_dist") is not None:
+        hc = result.get("header_col", [])
+        hr = result.get("header_row", [])
+        return f"矩阵 {len(hc)}×{len(hr)}: " + " | ".join(hc[:3]) + ("..." if len(hc) > 3 else "")
     multi = result.get("multi_pattern", False)
     pr_list = result.get("pattern_results", []) if multi else []
     use_tenpai = result.get("analysis_target") == "tenpai"
@@ -951,13 +1065,11 @@ class TargetHelpDialog(QDialog):
         layout.addWidget(btn, alignment=Qt.AlignRight)
 
 
-class TileIllustrationDialog(QDialog):
-    """麻将示意图生成对话框"""
+class TileIllustrationWidget(QWidget):
+    """麻将示意图生成功能页（可嵌入标签页或对话框）"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("麻将示意图")
-        self.setMinimumSize(520, 420)
         self._current_image = None
         layout = QVBoxLayout(self)
 
@@ -965,8 +1077,8 @@ class TileIllustrationDialog(QDialog):
         input_row = QHBoxLayout()
         input_row.addWidget(QLabel("符号输入:"))
         self.notation_edit = QLineEdit()
-        self.notation_edit.setPlaceholderText("例: 4mc3m5m（用3m5m吃4m）、p1z1z（碰东）、7s-?-9s（?=未知牌）")
-        self.notation_edit.setMinimumWidth(260)
+        self.notation_edit.setPlaceholderText("例: 4mc3m5m（用3m5m吃4m）、p1z1z（碰东）、7s-?-9s（?=未知牌）、1m-_3m（_=牌背）")
+        self.notation_edit.setMinimumWidth(280)
         self.notation_edit.returnPressed.connect(self._generate)
         input_row.addWidget(self.notation_edit, 1)
         self.gen_btn = QPushButton("生成")
@@ -974,7 +1086,7 @@ class TileIllustrationDialog(QDialog):
         input_row.addWidget(self.gen_btn)
         layout.addLayout(input_row)
 
-        hint = QLabel("支持：?（单独大问号）、7s-?-9s（? 为问号牌）、4mc3m5m、p1z1z、7s-9s 等")
+        hint = QLabel("支持：?（单独大问号）、7s-?-9s（? 为问号牌）、_（牌背）、4mc3m5m、p1z1z、7s-9s 等。输出 600×336。")
         hint.setStyleSheet("color: #8b949e; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -1003,7 +1115,6 @@ class TileIllustrationDialog(QDialog):
             return
         try:
             from PyQt5.QtGui import QPixmap
-            from PyQt5.QtCore import QByteArray, QBuffer
             img = render_illustration_to_qimage(notation, scale=3.0)
             self._current_image = img
             pix = QPixmap.fromImage(img)
@@ -1031,6 +1142,17 @@ class TileIllustrationDialog(QDialog):
                 QMessageBox.information(self, "保存成功", f"已保存至 {path}")
             else:
                 QMessageBox.critical(self, "保存失败", "无法写入文件")
+
+
+class TileIllustrationDialog(QDialog):
+    """麻将示意图生成对话框（弹窗形式，兼容旧入口）"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("麻将示意图")
+        self.setMinimumSize(520, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(TileIllustrationWidget(self))
 
 
 def _parse_pattern_target(line: str) -> Optional[Tuple[List[str], str]]:
@@ -1061,6 +1183,11 @@ def _parse_pattern_target(line: str) -> Optional[Tuple[List[str], str]]:
     return (pattern, target) if pattern else None
 
 
+def _turn_range_validator():
+    """输入 1-18 的整数验证器"""
+    return QIntValidator(1, 18)
+
+
 def _parse_turn_range(s: str) -> Optional[Tuple[int, int]]:
     """解析巡目范围，支持 1-3、1~3、1 3、1,3 等格式"""
     s = s.strip().replace("～", "-").replace("~", "-").replace("，", ",")
@@ -1079,6 +1206,154 @@ def _parse_turn_range(s: str) -> Optional[Tuple[int, int]]:
         except (ValueError, IndexError):
             pass
     return None
+
+
+class GridQueryThread(QThread):
+    """主界面矩阵分析线程：M>1 巡目时调用 analyze_discard_pattern_grid"""
+    progress = pyqtSignal(str)
+    progress_num = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, object)
+
+    def __init__(self, analyzer, params: dict, patterns: List[Tuple[List[str], str]],
+                 turn_ranges: List[Tuple[int, int]], analysis_target: str = "target_count"):
+        super().__init__()
+        self.analyzer = analyzer
+        self.params = params
+        self.patterns = patterns
+        self.turn_ranges = turn_ranges
+        self.analysis_target = analysis_target
+        self._should_cancel = False
+
+    def cancel(self):
+        self._should_cancel = True
+
+    def run(self):
+        try:
+            self.progress.emit(f"矩阵分析中：{len(self.patterns)} 模式 × {len(self.turn_ranges)} 巡目...")
+            shared = {k: v for k, v in self.params.items()
+                      if k in ("dora_constraint", "riichi_constraint", "call_constraint",
+                               "call_area_constraints", "visible_constraints", "sample_limit",
+                               "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
+                               "prior_discard_exclusion", "max_workers")}
+
+            def progress_fn(c, t):
+                if t > 0:
+                    self.progress_num.emit(c, t)
+                if t and (t <= 100 or c <= 10 or c % max(1, t // 20) == 0):
+                    self.progress.emit(f"已处理 {c:,}/{t:,} 场对局")
+
+            result = self.analyzer.analyze_discard_pattern_grid(
+                patterns=self.patterns,
+                turn_ranges=self.turn_ranges,
+                merge_keys=[1, 2],
+                analysis_target=self.analysis_target,
+                progress_callback=progress_fn,
+                should_cancel=lambda: self._should_cancel,
+                **shared,
+            )
+            if self._should_cancel:
+                self.finished.emit(False, "用户取消")
+                return
+            result["patterns"] = self.patterns
+            result["turn_ranges"] = self.turn_ranges
+            result["analysis_target"] = self.analysis_target
+            result["header_row"] = [f"{tmin}-{tmax}巡" for tmin, tmax in self.turn_ranges]
+            result["header_col"] = [f"{'-'.join(p)}→{t}" for p, t in self.patterns]
+            self.finished.emit(True, result)
+        except Exception as e:
+            logger.exception("矩阵分析失败")
+            self.finished.emit(False, str(e))
+
+
+class MatrixDisplayDialog(QDialog):
+    """矩阵展示窗口：勾选 0/1/2/3 张，动态预览并复制 Excel 格式"""
+    def __init__(self, parent, grid_result: dict):
+        super().__init__(parent)
+        self.setWindowTitle("矩阵数据展示")
+        self.setMinimumSize(560, 420)
+        self._result = grid_result
+        self._table_dist = grid_result.get("table_dist", {})
+        self._header_row = grid_result.get("header_row", [])
+        self._header_col = grid_result.get("header_col", [])
+        self._analysis_target = grid_result.get("analysis_target", "target_count")
+        self._use_tenpai = (self._analysis_target == "tenpai")
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        use_tenpai = self._use_tenpai
+        labels = ["未听牌", "听牌"] if use_tenpai else ["0张", "1张", "2张", "3张"]
+        keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
+        cb_row = QHBoxLayout()
+        cb_row.addWidget(QLabel("勾选展示（可多选合并）:"))
+        self._checkboxes = []
+        for k, lbl in zip(keys, labels):
+            cb = QCheckBox(lbl)
+            cb.setChecked(k in (1, 2) if not use_tenpai else True)
+            cb.stateChanged.connect(self._update_preview)
+            self._checkboxes.append((k, cb))
+            cb_row.addWidget(cb)
+        cb_row.addStretch()
+        layout.addLayout(cb_row)
+        self._preview = QTextEdit()
+        self._preview.setReadOnly(True)
+        self._preview.setMinimumHeight(200)
+        layout.addWidget(self._preview)
+        btn_row = QHBoxLayout()
+        self._copy_btn = QPushButton("复制到 Excel")
+        self._copy_btn.clicked.connect(self._copy_excel)
+        btn_row.addWidget(self._copy_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        self._update_preview()
+
+    def _get_checked_keys(self):
+        return [k for k, cb in self._checkboxes if cb.isChecked()]
+
+    def _compute_table(self):
+        keys = self._get_checked_keys()
+        if not keys:
+            return None
+        out = {}
+        for (tr_idx, pat_idx), dist in self._table_dist.items():
+            val = sum(dist.get(k, 0) for k in keys)
+            out[(tr_idx, pat_idx)] = round(val, 2)
+        return out
+
+    def _update_preview(self):
+        tbl = self._compute_table()
+        if tbl is None:
+            self._preview.setPlainText("请至少勾选一项")
+            return
+        header_col = self._header_col
+        header_row = self._header_row
+        rows = []
+        rows.append("巡目范围\t" + "\t".join(header_col))
+        for tr_idx, tr_label in enumerate(header_row):
+            cells = [tr_label]
+            for pat_idx in range(len(header_col)):
+                v = tbl.get((tr_idx, pat_idx), "")
+                cells.append(str(v))
+            rows.append("\t".join(cells))
+        self._preview.setPlainText("\n".join(rows))
+
+    def _copy_excel(self):
+        tbl = self._compute_table()
+        if tbl is None:
+            QMessageBox.information(self, "提示", "请至少勾选一项")
+            return
+        header_col = self._header_col
+        header_row = self._header_row
+        rows = []
+        rows.append("巡目范围\t" + "\t".join(header_col))
+        for tr_idx, tr_label in enumerate(header_row):
+            cells = [tr_label]
+            for pat_idx in range(len(header_col)):
+                v = tbl.get((tr_idx, pat_idx), "")
+                cells.append(str(v))
+            rows.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(rows))
+        QMessageBox.information(self, "已复制", "表格已复制到剪贴板，可粘贴到 Excel 中绘制折线图。")
 
 
 class BatchChartThread(QThread):
@@ -1109,8 +1384,8 @@ class BatchChartThread(QThread):
             shared_filtered = {k: v for k, v in shared.items()
                               if k in ("dora_constraint", "riichi_constraint", "call_constraint",
                                        "call_area_constraints", "visible_constraints", "sample_limit",
-                                       "total_logs_hint", "analysis_batch_size", "exclude_south4",
-                                       "prior_discard_exclusion", "max_workers")}
+                                       "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
+                                       "prior_discard_exclusion", "max_workers", "gc_interval_batches")}
             self.progress.emit(f"单次扫描分析 {len(self.patterns)} 模式 × {len(self.turn_ranges)} 巡目...")
 
             def progress_fn(c, t):
@@ -1359,8 +1634,10 @@ class BatchChartDialog(QDialog):
             "matched_states_cap": mw.matched_states_cap_spin.value(),
             "analysis_batch_size": mw.analysis_batch_size_spin.value(),
             "exclude_south4": mw.exclude_south4_check.isChecked(),
+            "exclude_south3": mw.exclude_south3_check.isChecked(),
             "prior_discard_exclusion": prior_excl,
             "max_workers": mw.max_workers_spin.value(),
+            "gc_interval_batches": mw.gc_interval_batches_spin.value(),
         }
         if self.constraint_group.isChecked():
             dora = "dora_unrelated" if self.batch_dora_irrelevant.isChecked() else (self.batch_dora_input.text().strip() or "any")
@@ -1584,9 +1861,11 @@ class MainWindow(QMainWindow):
         self._excel_clipboard_text = ""  # 当前结果的 Excel 格式文本
         self._pattern_checkboxes = []  # 多模式勾选框列表
         self._archive_entries: List[Dict[str, Any]] = []  # 存档条目列表
+        self._archive_folders: List[Dict[str, Any]] = []  # 文件夹列表 [{id, name}, ...]
 
         self.init_ui()
-        self._archive_entries = _load_archive(self.db_path)
+        self._archive_entries, self._archive_folders = _load_archive(self.db_path)
+        self._populate_folder_combo()
         self._refresh_archive_list()
         # 优先使用缓存的统计值，数据库未更新时避免重复执行耗时的 COUNT(*)
         cached = _load_db_status_from_cache(self.db_path)
@@ -1611,17 +1890,31 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout()
         main_widget.setLayout(main_layout)
         
-        # 1. 数据管理区
+        # 1. 数据管理区（顶部固定）
         data_group = self._create_data_management_group()
-        main_layout.addWidget(data_group)
         
-        # 2. 查询输入区
+        # 2. 查询输入区 + 3. 结果显示区 -> 放入标签页
         query_group = self._create_query_input_group()
-        main_layout.addWidget(query_group)
-        
-        # 3. 结果显示区
         result_group = self._create_result_display_group()
-        main_layout.addWidget(result_group)
+        
+        self.main_tab = QTabWidget()
+        # 使用独立 TabBar 便于放到数据管理区标题旁
+        tab_bar = QTabBar()
+        self.main_tab.setTabBar(tab_bar)
+        self.main_tab.addTab(query_group, "查询条件")
+        self.main_tab.addTab(result_group, "查询结果")
+        illustration_group = QWidget()
+        ill_layout = QVBoxLayout(illustration_group)
+        ill_layout.addWidget(TileIllustrationWidget(self))
+        self.main_tab.addTab(illustration_group, "麻将示意图")
+        
+        # 将标签页按钮放到数据管理区第一行（紧邻标题/状态）
+        status_row = data_group.layout().itemAt(0).layout()
+        if status_row:
+            status_row.addWidget(tab_bar, 0)
+        
+        main_layout.addWidget(data_group)
+        main_layout.addWidget(self.main_tab, 1)  # 标签页内容区域占据剩余空间
     
     def _create_data_management_group(self) -> QGroupBox:
         """创建数据管理区"""
@@ -1640,11 +1933,11 @@ class MainWindow(QMainWindow):
         batch_row = QHBoxLayout()
         batch_row.addWidget(QLabel("分析批次大小:"))
         self.analysis_batch_size_spin = QSpinBox()
-        self.analysis_batch_size_spin.setRange(500, 10000)
-        self.analysis_batch_size_spin.setSingleStep(500)
-        saved_batch = QSettings().value("analysis_batch_size", 2000, type=int)
+        self.analysis_batch_size_spin.setRange(100, 5000)
+        self.analysis_batch_size_spin.setSingleStep(100)
+        saved_batch = QSettings().value("analysis_batch_size", 400, type=int)
         self.analysis_batch_size_spin.blockSignals(True)
-        self.analysis_batch_size_spin.setValue(max(500, min(10000, saved_batch or 2000)))
+        self.analysis_batch_size_spin.setValue(max(100, min(5000, saved_batch or 400)))
         self.analysis_batch_size_spin.blockSignals(False)
         self.analysis_batch_size_spin.setToolTip(
             "每批从数据库读取的对局数。请根据本机内存选择：\n"
@@ -1667,6 +1960,18 @@ class MainWindow(QMainWindow):
         )
         self.max_workers_spin.valueChanged.connect(self._save_max_workers)
         batch_row.addWidget(self.max_workers_spin)
+        batch_row.addWidget(QLabel("内存维护:"))
+        self.gc_interval_batches_spin = QSpinBox()
+        self.gc_interval_batches_spin.setRange(1, 20)
+        saved_gc = QSettings().value("gc_interval_batches", 4, type=int) or 4
+        self.gc_interval_batches_spin.blockSignals(True)
+        self.gc_interval_batches_spin.setValue(max(1, min(20, saved_gc)))
+        self.gc_interval_batches_spin.blockSignals(False)
+        self.gc_interval_batches_spin.setToolTip("每 N 批执行 gc + DB 重连，释放 tenhou.db 缓存。可自行调整找到最合适数值。")
+        self.gc_interval_batches_spin.valueChanged.connect(self._save_gc_interval_batches)
+        self.gc_interval_batches_spin.setMinimumWidth(52)
+        batch_row.addWidget(self.gc_interval_batches_spin)
+        batch_row.addWidget(QLabel("批"))
         batch_row.addStretch()
         layout.addLayout(batch_row)
         
@@ -1733,7 +2038,8 @@ class MainWindow(QMainWindow):
         
         # ========== 右列：开始分析相关（巡目、约束、样本、执行） ==========
         right_widget = QWidget()
-        right_widget.setMaximumWidth(400)
+        right_widget.setMinimumWidth(380)
+        right_widget.setMaximumWidth(520)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -1750,6 +2056,29 @@ class MainWindow(QMainWindow):
         turn_layout.addWidget(self.turn_range_slider, 1)
         turn_layout.addWidget(self.turn_range_label, 0)
         right_layout.addLayout(turn_layout)
+
+        # 巡目范围（并排输入框，矩阵分析可添加多组）
+        turn_ranges_header = QHBoxLayout()
+        turn_ranges_header.addWidget(QLabel("巡目范围（矩阵分析可添加多组）:"))
+        turn_ranges_help_btn = QPushButton("?")
+        turn_ranges_help_btn.setToolTip("巡目范围使用说明")
+        turn_ranges_help_btn.setFixedWidth(28)
+        turn_ranges_help_btn.clicked.connect(self._show_turn_range_help)
+        turn_ranges_header.addWidget(turn_ranges_help_btn)
+        turn_ranges_header.addStretch()
+        right_layout.addLayout(turn_ranges_header)
+        turn_ranges_row = QHBoxLayout()
+        turn_ranges_row.setSpacing(6)
+        self._turn_range_pairs: List[Tuple[QLineEdit, QLineEdit]] = []
+        for _ in range(5):
+            self._add_turn_range_pair(turn_ranges_row, None)
+        add_tr_btn = QPushButton("+")
+        add_tr_btn.setFixedWidth(28)
+        add_tr_btn.setToolTip("添加一组巡目范围")
+        add_tr_btn.clicked.connect(lambda: self._add_turn_range_pair(turn_ranges_row, add_tr_btn))
+        turn_ranges_row.addWidget(add_tr_btn)
+        turn_ranges_row.addStretch()
+        right_layout.addLayout(turn_ranges_row)
         
         # 宝牌 / 立直 / 副露 各占一行，避免文字重叠
         dora_row = QHBoxLayout()
@@ -1799,12 +2128,15 @@ class MainWindow(QMainWindow):
         call_row.addWidget(self.call_no_radio)
         call_row.addStretch()
         right_layout.addLayout(call_row)
-        exclude_south4_row = QHBoxLayout()
-        self.exclude_south4_check = QCheckBox("不考虑南四局")
+        exclude_south_row = QHBoxLayout()
+        self.exclude_south4_check = QCheckBox("禁止南四局")
         self.exclude_south4_check.setToolTip("南四局打法会根据点数状况有极大改变，勾选时跳过南四局")
-        exclude_south4_row.addWidget(self.exclude_south4_check)
-        exclude_south4_row.addStretch()
-        right_layout.addLayout(exclude_south4_row)
+        exclude_south_row.addWidget(self.exclude_south4_check)
+        self.exclude_south3_check = QCheckBox("禁止南三局")
+        self.exclude_south3_check.setToolTip("勾选时跳过南三局，可与南四局同时勾选")
+        exclude_south_row.addWidget(self.exclude_south3_check)
+        exclude_south_row.addStretch()
+        right_layout.addLayout(exclude_south_row)
         prior_excl_row = QHBoxLayout()
         prior_excl_row.addWidget(QLabel("前段禁打:"))
         self.prior_discard_exclusion_input = QLineEdit()
@@ -1872,8 +2204,17 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo = QComboBox()
         self.analysis_target_combo.addItem("目标牌存量", "target_count")
         self.analysis_target_combo.addItem("是否听牌", "tenpai")
-        self.analysis_target_combo.setToolTip("目标牌存量：统计手牌中目标牌数量；是否听牌：统计匹配时已听牌/未听牌比例")
+        self.analysis_target_combo.addItem("和铳率", "outcome")
+        self.analysis_target_combo.setMinimumWidth(100)
+        self.analysis_target_combo.setToolTip(
+            "目标牌存量：统计手牌中目标牌数量；"
+            "是否听牌：统计匹配时已听牌/未听牌比例；"
+            "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
+        )
+        self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
         opts_row.addWidget(self.analysis_target_combo)
+        # 初始化时同步目标牌区域显隐（和铳率模式下隐藏）
+        QTimer.singleShot(0, self._on_analysis_target_changed)
         opts_row.addWidget(QLabel("样本上限:"))
         self.sample_limit_input = QSpinBox()
         self.sample_limit_input.setRange(100, 10000000)
@@ -1884,18 +2225,18 @@ class MainWindow(QMainWindow):
         self.sample_limit_input.setValue(max(100, min(10000000, saved_limit)))
         self.sample_limit_input.blockSignals(False)
         self.sample_limit_input.valueChanged.connect(self._save_sample_limit)
-        self.sample_limit_input.setMaximumWidth(120)
+        self.sample_limit_input.setMinimumWidth(100)
         opts_row.addWidget(self.sample_limit_input)
         opts_row.addWidget(QLabel("匹配保留:"))
         self.matched_states_cap_spin = QSpinBox()
         self.matched_states_cap_spin.setRange(1, 500)
-        saved_cap = QSettings().value("matched_states_cap", 100, type=int) or 100
+        saved_cap = QSettings().value("matched_states_cap", 200, type=int) or 200
         self.matched_states_cap_spin.blockSignals(True)
         self.matched_states_cap_spin.setValue(max(1, min(500, saved_cap)))
         self.matched_states_cap_spin.blockSignals(False)
         self.matched_states_cap_spin.setToolTip("分析时最多保留的匹配状态条数（用于展示，越大占内存越多）")
         self.matched_states_cap_spin.valueChanged.connect(self._save_matched_states_cap)
-        self.matched_states_cap_spin.setMaximumWidth(64)
+        self.matched_states_cap_spin.setMinimumWidth(56)
         opts_row.addWidget(self.matched_states_cap_spin)
         opts_row.addStretch()
         right_layout.addLayout(opts_row)
@@ -1910,6 +2251,51 @@ class MainWindow(QMainWindow):
         group.setLayout(main_row)
         return group
 
+    def _add_turn_range_pair(self, layout: QHBoxLayout, add_btn: Optional[QPushButton] = None):
+        """添加一组巡目范围输入框（最小-最大），默认留空，留空时用上方滑块"""
+        min_edit = QLineEdit()
+        min_edit.setPlaceholderText("最小")
+        min_edit.setAlignment(Qt.AlignCenter)
+        min_edit.setFixedWidth(36)
+        min_edit.setMaxLength(2)
+        min_edit.setValidator(_turn_range_validator())
+        max_edit = QLineEdit()
+        max_edit.setPlaceholderText("最大")
+        max_edit.setAlignment(Qt.AlignCenter)
+        max_edit.setFixedWidth(36)
+        max_edit.setMaxLength(2)
+        max_edit.setValidator(_turn_range_validator())
+        sep = QLabel("-")
+        sep.setStyleSheet("color: #8b949e; font-size: 11px;")
+        if add_btn is not None:
+            idx = layout.indexOf(add_btn)
+            layout.insertWidget(idx, min_edit)
+            layout.insertWidget(idx + 1, sep)
+            layout.insertWidget(idx + 2, max_edit)
+        else:
+            layout.addWidget(min_edit)
+            layout.addWidget(sep)
+            layout.addWidget(max_edit)
+        self._turn_range_pairs.append((min_edit, max_edit))
+
+    def _get_turn_ranges_from_ui(self) -> List[Tuple[int, int]]:
+        """从巡目范围输入框读取有效范围列表（去重保留顺序）。留空则跳过该组，全部留空时由滑块决定"""
+        seen = set()
+        turn_ranges = []
+        for min_edit, max_edit in self._turn_range_pairs:
+            ms, mx = min_edit.text().strip(), max_edit.text().strip()
+            if not ms or not mx:
+                continue
+            try:
+                a, b = int(ms), int(mx)
+            except ValueError:
+                continue
+            a, b = max(1, min(18, a)), max(1, min(18, b))
+            if a <= b and (a, b) not in seen:
+                seen.add((a, b))
+                turn_ranges.append((a, b))
+        return turn_ranges
+
     def _add_pattern_row(self):
         """添加一行舍牌模式+目标牌"""
         row = QHBoxLayout()
@@ -1920,6 +2306,7 @@ class MainWindow(QMainWindow):
         target_edit = QLineEdit()
         target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
         target_edit.setMaximumWidth(80)
+        arrow_label = QLabel("→")
         target_help_btn = QPushButton("?")
         target_help_btn.setToolTip("目标牌说明")
         target_help_btn.setFixedWidth(24)
@@ -1928,11 +2315,11 @@ class MainWindow(QMainWindow):
         del_btn.setMaximumWidth(50)
         row.addWidget(QLabel("模式:"))
         row.addWidget(pattern_edit, 1)
-        row.addWidget(QLabel("→"))
+        row.addWidget(arrow_label)
         row.addWidget(target_edit)
         row.addWidget(target_help_btn)
         row.addWidget(del_btn)
-        entry = (pattern_edit, target_edit, del_btn, row)
+        entry = (pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row)
         self._pattern_row_widgets.append(entry)
         del_btn.clicked.connect(lambda checked=False, e=entry: self._remove_pattern_row(e))
         self.pattern_rows_layout.addLayout(row)
@@ -1942,7 +2329,7 @@ class MainWindow(QMainWindow):
         if len(self._pattern_row_widgets) <= 1:
             QMessageBox.warning(self, "提示", "至少需保留一个舍牌模式")
             return
-        pattern_edit, target_edit, del_btn, row = entry
+        pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row = entry
         while row.count():
             item = row.takeAt(0)
             if item.widget():
@@ -1951,11 +2338,28 @@ class MainWindow(QMainWindow):
         if entry in self._pattern_row_widgets:
             self._pattern_row_widgets.remove(entry)
 
+    def _on_analysis_target_changed(self):
+        """和铳率模式下隐藏目标牌输入（无需目标牌）"""
+        if not hasattr(self, "analysis_target_combo"):
+            return
+        is_outcome = (self.analysis_target_combo.currentData() or "") == "outcome"
+        for pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row in getattr(
+            self, "_pattern_row_widgets", []
+        ):
+            arrow_label.setVisible(not is_outcome)
+            target_edit.setVisible(not is_outcome)
+            target_help_btn.setVisible(not is_outcome)
+            if is_outcome:
+                target_edit.clear()
+                target_edit.setPlaceholderText("（和铳率无需）")
+            else:
+                target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
+
     def _get_pattern_items(self, require_target: bool = True) -> List[Tuple[List[str], str]]:
-        """从界面获取所有 (pattern, target) 对。require_target=False 时（听牌模式）目标可为空，以 5z 占位"""
+        """从界面获取所有 (pattern, target) 对。require_target=False 时（听牌/和铳率模式）目标可为空，以 5z 占位"""
         items = []
-        placeholder = "5z"  # 听牌模式无目标牌时占位，仅用于等价变体生成
-        for pattern_edit, target_edit, _, _ in self._pattern_row_widgets:
+        placeholder = "5z"  # 听牌/和铳率模式无目标牌时占位
+        for pattern_edit, target_edit, _, _, _, _ in self._pattern_row_widgets:
             pt = pattern_edit.text().strip()
             tg = target_edit.text().strip()
             if pt and (tg or not require_target):
@@ -1965,6 +2369,17 @@ class MainWindow(QMainWindow):
     def _show_pattern_help(self):
         """显示舍牌模式输入说明"""
         PatternHelpDialog(self).exec_()
+
+    def _show_turn_range_help(self):
+        """显示巡目范围使用说明"""
+        QMessageBox.information(
+            self,
+            "巡目范围说明",
+            "• 下方输入框全部留空时：使用上方滑块的巡目范围。\n\n"
+            "• 下方输入框有填入内容时：仅使用输入框中的范围，滑块会被忽略。\n\n"
+            "• 若希望矩阵分析包含滑块选中的范围，需在输入框中手动添加一组对应的最小/最大巡目。\n\n"
+            "• 矩阵分析：填入多组范围（如 1-3、4-6、7-9）时，将进行 N 模式 × M 巡目的矩阵分析。"
+        )
 
     def _show_target_help(self):
         """显示目标牌输入说明"""
@@ -1984,13 +2399,12 @@ class MainWindow(QMainWindow):
             "最多 4 个约束，留空表示无此约束。"
         )
 
-    def _show_tile_illustration_dialog(self):
-        """显示麻将示意图生成对话框"""
-        TileIllustrationDialog(self).exec_()
-
-    def _show_batch_chart_dialog(self):
-        """显示批量折线图数据生成对话框"""
-        BatchChartDialog(self).exec_()
+    def _show_matrix_display_dialog(self):
+        """打开展示矩阵窗口"""
+        if not self.last_query_result or self.last_query_result.get("table_dist") is None:
+            QMessageBox.information(self, "提示", "请先完成矩阵分析（巡目范围列表输入多行）")
+            return
+        MatrixDisplayDialog(self, self.last_query_result).exec_()
 
     def _create_result_display_group(self) -> QGroupBox:
         """创建结果显示区"""
@@ -2004,21 +2418,22 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 工具栏：复制到 Excel、麻将示意图
+        # 工具栏：复制到 Excel、展示矩阵
         tool_row = QHBoxLayout()
         self.copy_excel_btn = QPushButton("复制到 Excel")
         self.copy_excel_btn.setToolTip("复制分析结果为 Tab 分隔格式，可直接粘贴到 Excel 中计算")
         self.copy_excel_btn.clicked.connect(self._copy_result_to_excel)
         self.copy_excel_btn.setEnabled(False)
         tool_row.addWidget(self.copy_excel_btn)
-        self.tile_illustration_btn = QPushButton("麻将示意图")
-        self.tile_illustration_btn.setToolTip("根据舍牌/副露符号生成示意图图片，如 4mc3m5m")
-        self.tile_illustration_btn.clicked.connect(self._show_tile_illustration_dialog)
-        tool_row.addWidget(self.tile_illustration_btn)
-        self.batch_chart_btn = QPushButton("生成折线图数据")
-        self.batch_chart_btn.setToolTip("批量分析多个舍牌模式×巡目范围，生成折线图用 Excel 表格")
-        self.batch_chart_btn.clicked.connect(self._show_batch_chart_dialog)
-        tool_row.addWidget(self.batch_chart_btn)
+        self.matrix_display_btn = QPushButton("展示矩阵")
+        self.matrix_display_btn.setToolTip("打开展示窗口，可勾选 0/1/2/3 张并复制 Excel 格式（仅矩阵分析结果可用）")
+        self.matrix_display_btn.setEnabled(False)
+        self.matrix_display_btn.clicked.connect(self._show_matrix_display_dialog)
+        tool_row.addWidget(self.matrix_display_btn)
+        scroll_bottom_btn = QPushButton("到底部")
+        scroll_bottom_btn.setToolTip("一键滚动到结果最下方")
+        scroll_bottom_btn.clicked.connect(self._scroll_result_to_bottom)
+        tool_row.addWidget(scroll_bottom_btn)
         tool_row.addStretch()
         left_layout.addLayout(tool_row)
 
@@ -2067,7 +2482,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_widget)
 
-        # 右侧：存档管理区
+        # 右侧：存档管理区（扩大显示区域）
         archive_widget = QGroupBox("存档管理")
         archive_layout = QVBoxLayout()
 
@@ -2077,6 +2492,38 @@ class MainWindow(QMainWindow):
         self.save_archive_btn.setEnabled(False)
         archive_layout.addWidget(self.save_archive_btn)
 
+        # 文件夹设定
+        folder_label = QLabel("文件夹:")
+        folder_label.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        archive_layout.addWidget(folder_label)
+        folder_row = QHBoxLayout()
+        self.archive_folder_combo = QComboBox()
+        self.archive_folder_combo.setMinimumWidth(140)
+        self.archive_folder_combo.setToolTip("选择存档所属文件夹，新建存档时使用")
+        folder_row.addWidget(self.archive_folder_combo, 1)
+        new_folder_btn = QPushButton("新建")
+        new_folder_btn.setMinimumWidth(56)
+        new_folder_btn.setToolTip("创建新文件夹")
+        new_folder_btn.clicked.connect(self._new_archive_folder)
+        folder_row.addWidget(new_folder_btn)
+        rename_folder_btn = QPushButton("重命名")
+        rename_folder_btn.setMinimumWidth(68)
+        rename_folder_btn.clicked.connect(self._rename_archive_folder)
+        folder_row.addWidget(rename_folder_btn)
+        del_folder_btn = QPushButton("删除")
+        del_folder_btn.setMinimumWidth(56)
+        del_folder_btn.clicked.connect(self._delete_archive_folder)
+        folder_row.addWidget(del_folder_btn)
+        archive_layout.addLayout(folder_row)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("显示:"))
+        self.archive_filter_combo = QComboBox()
+        self.archive_filter_combo.setMinimumWidth(100)
+        self.archive_filter_combo.currentIndexChanged.connect(self._refresh_archive_list)
+        filter_row.addWidget(self.archive_filter_combo, 1)
+        archive_layout.addLayout(filter_row)
+
         archive_layout.addWidget(QLabel("搜索舍牌模式:"))
         self.archive_search_edit = QLineEdit()
         self.archive_search_edit.setPlaceholderText("输入关键词筛选...")
@@ -2084,10 +2531,22 @@ class MainWindow(QMainWindow):
         archive_layout.addWidget(self.archive_search_edit)
 
         self.archive_list = QListWidget()
-        self.archive_list.setMinimumWidth(240)
-        self.archive_list.setToolTip("双击条目展开查看完整结果")
+        self.archive_list.setMinimumWidth(280)
+        self.archive_list.setMinimumHeight(180)
+        self.archive_list.setToolTip("双击条目展开查看完整结果；可选中后移动到文件夹")
         self.archive_list.itemDoubleClicked.connect(self._on_archive_item_clicked)
-        archive_layout.addWidget(self.archive_list)
+        archive_layout.addWidget(self.archive_list, 1)
+
+        move_archive_row = QHBoxLayout()
+        move_label = QLabel("移动到:")
+        self.archive_move_combo = QComboBox()
+        self.archive_move_combo.setMinimumWidth(100)
+        move_archive_row.addWidget(move_label)
+        move_archive_row.addWidget(self.archive_move_combo, 1)
+        move_archive_btn = QPushButton("移动")
+        move_archive_btn.clicked.connect(self._move_archive_to_folder)
+        move_archive_row.addWidget(move_archive_btn)
+        archive_layout.addLayout(move_archive_row)
 
         del_archive_btn = QPushButton("删除选中")
         del_archive_btn.clicked.connect(self._delete_selected_archive)
@@ -2095,7 +2554,7 @@ class MainWindow(QMainWindow):
 
         archive_widget.setLayout(archive_layout)
         splitter.addWidget(archive_widget)
-        splitter.setSizes([600, 280])
+        splitter.setSizes([420, 480])  # 存档区至少约黄色框大小
 
         main_layout.addWidget(splitter)
         group.setLayout(main_layout)
@@ -2128,6 +2587,10 @@ class MainWindow(QMainWindow):
         """保存匹配状态保留条数到本地设置"""
         QSettings().setValue("matched_states_cap", value)
 
+    def _save_gc_interval_batches(self, value: int):
+        """保存内存维护间隔到本地设置"""
+        QSettings().setValue("gc_interval_batches", value)
+
     def _save_analysis_batch_size(self, value: int):
         """保存分析批次大小到本地设置"""
         QSettings().setValue("analysis_batch_size", value)
@@ -2148,11 +2611,125 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(self._excel_clipboard_text)
             QMessageBox.information(self, "已复制", "分析结果已复制到剪贴板，可直接粘贴到 Excel 中。")
 
+    def _scroll_result_to_bottom(self):
+        """将结果文本框滚动到最下方"""
+        sb = self.result_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _populate_folder_combo(self):
+        """刷新文件夹下拉框与筛选下拉框"""
+        for combo in (self.archive_folder_combo, self.archive_move_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("未分类", None)
+            for f in self._archive_folders:
+                combo.addItem(f["name"], f["id"])
+            combo.blockSignals(False)
+        # 筛选下拉框
+        if hasattr(self, "archive_filter_combo"):
+            self.archive_filter_combo.blockSignals(True)
+            self.archive_filter_combo.clear()
+            self.archive_filter_combo.addItem("全部", "all")
+            self.archive_filter_combo.addItem("未分类", None)
+            for f in self._archive_folders:
+                self.archive_filter_combo.addItem(f["name"], f["id"])
+            self.archive_filter_combo.blockSignals(False)
+
+    def _new_archive_folder(self):
+        """新建文件夹"""
+        name, ok = QInputDialog.getText(self, "新建文件夹", "请输入文件夹名称:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if any(f["name"] == name for f in self._archive_folders):
+            QMessageBox.warning(self, "提示", f"已存在同名文件夹: {name}")
+            return
+        fid = _new_folder_id()
+        self._archive_folders.append({"id": fid, "name": name})
+        try:
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
+            self._populate_folder_combo()
+            QMessageBox.information(self, "成功", f"已创建文件夹: {name}")
+        except Exception as e:
+            QMessageBox.critical(self, "创建失败", str(e))
+
+    def _rename_archive_folder(self):
+        """重命名当前选中的文件夹"""
+        idx = self.archive_folder_combo.currentIndex()
+        if idx <= 0:
+            QMessageBox.warning(self, "提示", "请先选择要重命名的文件夹（不能重命名「未分类」）")
+            return
+        fid = self.archive_folder_combo.currentData()
+        folder = next((f for f in self._archive_folders if f["id"] == fid), None)
+        if not folder:
+            return
+        name, ok = QInputDialog.getText(self, "重命名文件夹", "新名称:", text=folder["name"])
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if any(f["name"] == name and f["id"] != fid for f in self._archive_folders):
+            QMessageBox.warning(self, "提示", f"已存在同名文件夹: {name}")
+            return
+        folder["name"] = name
+        try:
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
+            self._populate_folder_combo()
+            QMessageBox.information(self, "成功", "文件夹已重命名")
+        except Exception as e:
+            QMessageBox.critical(self, "重命名失败", str(e))
+
+    def _delete_archive_folder(self):
+        """删除选中的文件夹（其中存档移至未分类）"""
+        idx = self.archive_folder_combo.currentIndex()
+        if idx <= 0:
+            QMessageBox.warning(self, "提示", "请先选择要删除的文件夹（不能删除「未分类」）")
+            return
+        fid = self.archive_folder_combo.currentData()
+        folder = next((f for f in self._archive_folders if f["id"] == fid), None)
+        if not folder:
+            return
+        if QMessageBox.question(
+            self, "确认删除", f"确定删除文件夹「{folder['name']}」？其中的存档将移至未分类。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        for e in self._archive_entries:
+            if e.get("folder_id") == fid:
+                e["folder_id"] = None
+        self._archive_folders = [f for f in self._archive_folders if f["id"] != fid]
+        try:
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
+            self._populate_folder_combo()
+            self._refresh_archive_list()
+            QMessageBox.information(self, "成功", "文件夹已删除")
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", str(e))
+
+    def _move_archive_to_folder(self):
+        """将选中的存档移动到指定文件夹"""
+        item = self.archive_list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "提示", "请先选择要移动的存档")
+            return
+        idx = item.data(Qt.UserRole)
+        if idx is None or idx >= len(self._archive_entries):
+            return
+        folder_id = self.archive_move_combo.currentData()
+        self._archive_entries[idx]["folder_id"] = folder_id
+        try:
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
+            self._refresh_archive_list()
+            folder_name = self.archive_move_combo.currentText()
+            QMessageBox.information(self, "成功", f"已移至「{folder_name}」")
+        except Exception as e:
+            QMessageBox.critical(self, "移动失败", str(e))
+
     def _save_current_to_archive(self):
         """将当前查询结果保存到存档"""
         if not self.last_query_result:
             QMessageBox.warning(self, "提示", "当前无查询结果可存档")
             return
+        folder_id = self.archive_folder_combo.currentData()
         pattern_summary = _build_pattern_summary(self.last_query_result)
         entry = {
             "id": datetime.now().strftime("%Y%m%d%H%M%S") + "_" + str(len(self._archive_entries)),
@@ -2160,10 +2737,11 @@ class MainWindow(QMainWindow):
             "pattern_summary": pattern_summary,
             "result_display_text": self.result_text.toPlainText(),
             "excel_text": self._excel_clipboard_text,
+            "folder_id": folder_id,
         }
         self._archive_entries.insert(0, entry)
         try:
-            _save_archive(self.db_path, self._archive_entries)
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
             self._refresh_archive_list()
             tip = pattern_summary[:50] + ("..." if len(pattern_summary) > 50 else "")
             QMessageBox.information(self, "存档成功", f"已保存: {tip}")
@@ -2171,14 +2749,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "存档失败", str(e))
 
     def _refresh_archive_list(self):
-        """刷新存档列表显示"""
+        """刷新存档列表显示（含文件夹筛选）"""
         self.archive_list.clear()
+        filter_val = getattr(self, "archive_filter_combo", None)
+        fdata = filter_val.currentData() if (filter_val and filter_val.count()) else "all"
         for i, e in enumerate(self._archive_entries):
+            if fdata != "all":
+                fid = e.get("folder_id")
+                if (fdata is None and fid is not None) or (fdata is not None and fid != fdata):
+                    continue
+            folder_name = ""
+            if e.get("folder_id"):
+                f = next((x for x in self._archive_folders if x["id"] == e["folder_id"]), None)
+                if f:
+                    folder_name = f" [{f['name']}]"
             summary = e.get("pattern_summary", "")
             time_str = e.get("created_at", "")[:19].replace("T", " ")
-            item = QListWidgetItem(f"{summary}\n  {time_str}")
+            item = QListWidgetItem(f"{summary}{folder_name}\n  {time_str}")
             item.setData(Qt.UserRole, i)
             self.archive_list.addItem(item)
+        self._filter_archive_list()
 
     def _filter_archive_list(self):
         """根据搜索框内容筛选存档列表"""
@@ -2218,7 +2808,7 @@ class MainWindow(QMainWindow):
             return
         self._archive_entries.pop(idx)
         try:
-            _save_archive(self.db_path, self._archive_entries)
+            _save_archive(self.db_path, self._archive_entries, self._archive_folders)
             self._refresh_archive_list()
         except Exception as e:
             QMessageBox.critical(self, "删除失败", str(e))
@@ -2277,23 +2867,38 @@ class MainWindow(QMainWindow):
 
         _clear_layout(self.multi_merge_layout)
 
-        cb_row = QHBoxLayout()
         use_tenpai = self.last_query_result and self.last_query_result.get("analysis_target") == "tenpai"
-        cb_row.addWidget(QLabel("勾选合并（目标牌相同）:" if not use_tenpai else "勾选合并:"))
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel("勾选合并（目标牌相同）:" if not use_tenpai else "勾选合并:"))
+        header_row.addStretch()
+        select_all_btn = QPushButton("全选")
+        select_all_btn.setFixedWidth(44)
+        select_all_btn.clicked.connect(lambda: self._set_all_pattern_checks(True, result, pr_list))
+        header_row.addWidget(select_all_btn)
+        self.multi_merge_layout.addLayout(header_row)
+
+        # 舍牌模式勾选框：每行一个（QCheckBox 无 setWordWrap，长文本靠 tooltip 查看）
+        cb_container = QWidget()
+        cb_vlayout = QVBoxLayout(cb_container)
+        cb_vlayout.setContentsMargins(0, 4, 0, 0)
+        cb_vlayout.setSpacing(4)
         for i, pr in enumerate(pr_list):
             lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
             cb = QCheckBox(lbl)
+            cb.setToolTip(lbl)
             cb.setChecked(True)
             cb.setProperty("idx", i)
             cb.stateChanged.connect(lambda *_: self._update_merged_result(result, pr_list))
             self._pattern_checkboxes.append(cb)
-            cb_row.addWidget(cb)
-        select_all_btn = QPushButton("全选")
-        select_all_btn.setFixedWidth(44)
-        select_all_btn.clicked.connect(lambda: self._set_all_pattern_checks(True, result, pr_list))
-        cb_row.addWidget(select_all_btn)
-        cb_row.addStretch()
-        self.multi_merge_layout.addLayout(cb_row)
+            cb_vlayout.addWidget(cb)
+        cb_scroll = QScrollArea()
+        cb_scroll.setWidget(cb_container)
+        cb_scroll.setWidgetResizable(True)
+        cb_scroll.setFrameShape(QFrame.NoFrame)
+        cb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cb_scroll.setMaximumHeight(150)
+        cb_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.multi_merge_layout.addWidget(cb_scroll)
 
         merge_display_row = QHBoxLayout()
         self.merged_result_label = QLabel("")
@@ -2493,9 +3098,15 @@ class MainWindow(QMainWindow):
         """执行查询"""
         analysis_target = self.analysis_target_combo.currentData() or "target_count"
         use_tenpai = (analysis_target == "tenpai")
-        query_items = self._get_pattern_items(require_target=not use_tenpai)
+        use_outcome = (analysis_target == "outcome")
+        require_target = not (use_tenpai or use_outcome)
+        query_items = self._get_pattern_items(require_target=require_target)
         if not query_items:
-            msg = "请至少输入一个舍牌模式" + ("" if use_tenpai else "和对应的目标牌")
+            msg = "请至少输入一个舍牌模式"
+            if require_target:
+                msg += "和对应的目标牌"
+            elif use_outcome:
+                msg += "（和铳率无需目标牌）"
             QMessageBox.warning(self, "输入错误", msg)
             return
         first_pattern, first_target = query_items[0]
@@ -2541,10 +3152,23 @@ class MainWindow(QMainWindow):
         
         # 样本上限
         sample_limit = self.sample_limit_input.value()
-        
-        # 巡目范围（1-18，1-18 表示不限制）
-        turn_min, turn_max = self.turn_range_slider.getRange()
-        turn_range = (turn_min, turn_max) if (turn_min <= turn_max and not (turn_min == 1 and turn_max == 18)) else None
+
+        # 巡目范围：优先从输入框读取，为空则用滑块
+        turn_ranges = self._get_turn_ranges_from_ui()
+        if not turn_ranges:
+            turn_min, turn_max = self.turn_range_slider.getRange()
+            if turn_min <= turn_max:
+                turn_ranges = [(turn_min, turn_max)]
+        use_grid = len(turn_ranges) > 1 and not use_outcome  # 和铳率不支持矩阵分析
+        if use_outcome and turn_ranges:
+            t_min = min(r[0] for r in turn_ranges)
+            t_max = max(r[1] for r in turn_ranges)
+            turn_range = None if (t_min == 1 and t_max == 18) else (t_min, t_max)
+        elif len(turn_ranges) == 1:
+            tr = turn_ranges[0]
+            turn_range = None if (tr[0] == 1 and tr[1] == 18) else tr
+        else:
+            turn_range = None
         
         # 从缓存读取对局总数，避免分析开始时执行耗时的 COUNT(*) 导致界面假死
         cached = _load_db_status_from_cache(self.db_path)
@@ -2567,16 +3191,25 @@ class MainWindow(QMainWindow):
             "matched_states_cap": matched_states_cap,
             "analysis_batch_size": analysis_batch_size,
             "exclude_south4": self.exclude_south4_check.isChecked(),
+            "exclude_south3": self.exclude_south3_check.isChecked(),
             "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
             "max_workers": self.max_workers_spin.value(),
+            "gc_interval_batches": self.gc_interval_batches_spin.value(),
         }
         
         # 启动查询线程
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        
-        self.query_thread = QueryThread(self.analyzer, params)
+
+        if use_outcome:
+            self.query_thread = OutcomeQueryThread(self.analyzer, params)
+        elif use_grid:
+            self.query_thread = GridQueryThread(
+                self.analyzer, params, query_items, turn_ranges, analysis_target
+            )
+        else:
+            self.query_thread = QueryThread(self.analyzer, params)
         self.query_thread.progress.connect(self.on_query_progress)
         self.query_thread.progress_num.connect(self.on_query_progress_num)
         self.query_thread.finished.connect(self.on_query_finished)
@@ -2599,10 +3232,15 @@ class MainWindow(QMainWindow):
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
-        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张
+        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
         use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
+        use_outcome = self.last_query_params.get("analysis_target") == "outcome"
         is_combo = self.last_query_params.get("is_combo", False)
-        if use_tenpai:
+        if use_outcome:
+            if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "和牌":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
+        elif use_tenpai:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "未听牌":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
@@ -2616,7 +3254,12 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
         count = self.sample_count_spin.value()
         idx = self.sample_target_combo.currentIndex()
-        target_count_filter = None if idx == 0 else idx - 1
+        if use_outcome:
+            outcome_filter = None if idx == 0 else ["win", "deal_in", "neither"][idx - 1]
+            target_count_filter = None
+        else:
+            outcome_filter = None
+            target_count_filter = None if idx == 0 else idx - 1
         target_tile_filter = None
         if self.sample_target_tile_combo.isVisible() and self.sample_target_tile_combo.currentIndex() > 0:
             target_tile_filter = self.sample_target_tile_combo.currentText()
@@ -2657,6 +3300,7 @@ class MainWindow(QMainWindow):
             target_count_filter,
             sample_pool=sample_pool,
             target_tile_filter=target_tile_filter,
+            outcome_filter=outcome_filter,
         )
         self.sample_thread.progress.connect(lambda s: self.result_text.append(s))
         self.sample_thread.progress_num.connect(self.on_sample_progress_num)
@@ -2682,6 +3326,8 @@ class MainWindow(QMainWindow):
             target_tile = getattr(self, "_last_sample_target_tile", None) or self.last_query_params.get("target_tile", "")
             if self.last_query_params.get("analysis_target") == "tenpai":
                 target_tile = "听牌"  # 样本展示用
+            elif self.last_query_params.get("analysis_target") == "outcome":
+                target_tile = "和铳率"  # 样本展示用
             text = format_samples_for_display(
                 samples,
                 query_str,
@@ -2718,7 +3364,85 @@ class MainWindow(QMainWindow):
         self.query_btn.clicked.connect(self.execute_query)
 
         if success:
+            # 和铳率统计结果
+            if isinstance(result, dict) and "win_rate" in result:
+                self.main_tab.setCurrentIndex(1)
+                n = result.get("total", 0)
+                wins = result.get("wins", 0)
+                deal_ins = result.get("deal_ins", 0)
+                wr = result.get("win_rate", 0)
+                dr = result.get("deal_in_rate", 0)
+                pattern_str = result.get("query_pattern_str", "")
+                outcome_text = f"""结局统计完成
+
+查询模式: {pattern_str}
+总样本数: {_fmt_int(n)}
+和了: {_fmt_int(wins)} 次  →  和了率: {wr:.2%}
+放铳: {_fmt_int(deal_ins)} 次  →  放铳率: {dr:.2%}
+
+分析半庄数: {_fmt_int(result.get('total_logs_analyzed', 0))}
+耗时: {result.get('elapsed_seconds', 0):.1f} 秒"""
+                self.result_text.setText(outcome_text)
+                self.last_query_result = result
+                qp = result.get("query_pattern", [])
+                qt = result.get("target_tile", "5z")
+                self.last_query_params = {
+                    "analysis_target": "outcome",
+                    "query_pattern": qp,
+                    "query_pattern_str": pattern_str,
+                    "target_tile": qt,
+                    "query_items": [(qp, qt)] if qp else [],
+                }
+                self.gen_sample_btn.setEnabled(True)
+                self.copy_excel_btn.setEnabled(True)
+                self.save_archive_btn.setEnabled(True)
+                self.matrix_display_btn.setEnabled(False)
+                self.multi_merge_widget.setVisible(False)
+                # 和铳率模式：样本按结局筛选
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
+                self.sample_pattern_combo.clear()
+                self.sample_pattern_combo.addItem(f"{pattern_str} → 和铳率")
+                self.sample_target_tile_combo.setVisible(False)
+                return
+
+            # 矩阵结果（M>1 巡目）
+            if result.get("table_dist") is not None:
+                self.last_query_result = result
+                self.last_query_params = {"analysis_target": result.get("analysis_target", "target_count")}
+                n_pat = len(result.get("patterns", []))
+                n_tr = len(result.get("turn_ranges", []))
+                summary = (
+                    f"矩阵分析完成：{n_pat} 模式 × {n_tr} 巡目，共 {n_pat * n_tr} 格\n"
+                    f"分析半庄数: {_fmt_int(result.get('total_logs_analyzed', 0))}\n"
+                    f"分析耗时: {result.get('elapsed_seconds', 0):.1f} 秒\n\n"
+                    "点击「展示矩阵」查看并可勾选 0/1/2/3 张后复制 Excel 格式。"
+                )
+                self.result_text.setText(summary)
+                self.multi_merge_widget.setVisible(False)
+                self.gen_sample_btn.setEnabled(False)
+                self.matrix_display_btn.setEnabled(True)
+                header_col = result.get("header_col", [])
+                header_row = result.get("header_row", [])
+                _merge_keys = [1, 2] if result.get("analysis_target") != "tenpai" else [1]
+                _tbl = {}
+                for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
+                    _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
+                _rows = ["巡目范围\t" + "\t".join(header_col)]
+                for tr_idx, lbl in enumerate(header_row):
+                    _cells = [lbl]
+                    for pat_idx in range(len(header_col)):
+                        _cells.append(str(_tbl.get((tr_idx, pat_idx), "")))
+                    _rows.append("\t".join(_cells))
+                self._excel_clipboard_text = "\n".join(_rows)
+                self.copy_excel_btn.setEnabled(True)
+                self.save_archive_btn.setEnabled(True)
+                self.main_tab.setCurrentIndex(1)
+                return
+
             self.last_query_result = result
+            self.matrix_display_btn.setEnabled(False)
+            self.main_tab.setCurrentIndex(1)  # 自动切换到查询结果标签页
             if result.get("multi_pattern") and result.get("pattern_results"):
                 query_items = [(pr["pattern"], pr["target"]) for pr in result["pattern_results"]]
             else:
@@ -2770,7 +3494,10 @@ class MainWindow(QMainWindow):
                 "is_combo": result.get("is_combo", False),
                 "total_logs_hint": total_logs_hint,
                 "exclude_south4": self.exclude_south4_check.isChecked(),
+            "exclude_south3": self.exclude_south3_check.isChecked(),
                 "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+                "analysis_batch_size": self.analysis_batch_size_spin.value(),
+                "gc_interval_batches": self.gc_interval_batches_spin.value(),
             }
             self.gen_sample_btn.setEnabled(True)
             # 舍牌模式选择：多模式时列出每个模式供生成样本时选择
@@ -2917,13 +3644,18 @@ class MainWindow(QMainWindow):
             self.last_query_params = None
             self.last_query_result = None
             self.copy_excel_btn.setEnabled(False)
-            self.save_archive_btn.setEnabled(False)
+            self.matrix_display_btn.setEnabled(False)
             self._excel_clipboard_text = ""
             self.multi_merge_widget.setVisible(False)
             QMessageBox.critical(self, "查询失败", f"查询失败: {result}")
 
 
 def main():
+    # 抑制 OpenGL/pyglet 的已知无害警告
+    import warnings
+    import logging
+    warnings.filterwarnings("ignore", message="Could not set COM MTA mode")
+    logging.getLogger("OpenGL.acceleratesupport").setLevel(logging.WARNING)
     """主函数"""
     # 配置日志
     logging.basicConfig(

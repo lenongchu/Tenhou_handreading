@@ -17,6 +17,11 @@ PyQt5>=5.15.0
 # 麻将示意图立体效果（可选）：pip install cairosvg
 cairosvg>=2.7.0
 
+# 3D 牌面渲染（可选）：pip install trimesh pyrender Pillow
+trimesh>=4.0.0
+pyrender>=0.1.45
+Pillow>=9.0.0
+
 # Database
 # SQLite is built-in, no need to install
 

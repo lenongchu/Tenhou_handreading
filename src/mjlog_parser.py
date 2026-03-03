@@ -43,6 +43,9 @@ class GameState:
     dora_indicators: List[int] = field(default_factory=list)  # 宝牌指示牌
     visible_tiles: PyCounter = field(default_factory=PyCounter)  # 其他3家可见牌统计
     calls: List["CallInfo"] = field(default_factory=list)  # 本家副露列表，用于 @p:kf 客风校验
+    # 小局结局（仅终局时有效，用于和了率/放铳率统计）
+    round_winners: List[int] = field(default_factory=list)   # 和牌者列表（自摸1人，一炮双响2-3人）
+    round_deal_in: Optional[int] = None  # 放铳者，None 表示自摸或流局；一炮双响时仅计1次
 
 
 class TileUtils:

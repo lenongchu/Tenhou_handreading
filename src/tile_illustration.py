@@ -15,11 +15,48 @@ from .simple_normalizer import split_discard_pattern
 from PyQt5.QtCore import Qt, QPointF, QRectF, QRect
 from PyQt5.QtGui import (
     QImage, QPainter, QColor, QPen, QBrush, QFont,
-    QLinearGradient, QPixmap, QTransform, QPolygonF,
+    QLinearGradient, QPixmap, QTransform, QPolygonF, QPainterPath,
 )
 
-# 空白牌体缓存（避免重复生成）
+# 空白牌体、3D 渲染缓存（避免重复生成）
 _BLANK_TILE_CACHE: Dict[Tuple[int, int], QImage] = {}
+_CHAR_IMG_CACHE: Dict[str, QImage] = {}
+_MODEL_TILE_CACHE: Dict[Tuple[int, int], QImage] = {}
+_TILE_3D_CACHE: Dict[Tuple[str, int, int], QImage] = {}
+
+
+def _draw_table_background(
+    painter: "QPainter",
+    width: int,
+    height: int,
+    bg_color: Tuple[int, int, int],
+) -> None:
+    """Draw a felt-like table background."""
+    base = QColor(*bg_color)
+    if bg_color == (220, 235, 255):
+        c0 = QColor(7, 64, 73)
+        c1 = QColor(7, 85, 96)
+        c2 = QColor(5, 50, 58)
+    else:
+        c0 = base.darker(230)
+        c1 = base.darker(170)
+        c2 = base.darker(260)
+
+    grad = QLinearGradient(0, 0, width, height)
+    grad.setColorAt(0.0, c0)
+    grad.setColorAt(0.5, c1)
+    grad.setColorAt(1.0, c2)
+    painter.fillRect(QRectF(0, 0, width, height), QBrush(grad))
+
+    top_glow = QLinearGradient(0, 0, 0, max(1, int(height * 0.28)))
+    top_glow.setColorAt(0.0, QColor(80, 195, 210, 110))
+    top_glow.setColorAt(1.0, QColor(80, 195, 210, 0))
+    painter.fillRect(QRectF(0, 0, width, int(height * 0.28)), QBrush(top_glow))
+
+    painter.setPen(QPen(QColor(0, 0, 0, 20), 1))
+    step = max(10, height // 24)
+    for y in range(step, height, step):
+        painter.drawLine(0, y, width, y)
 
 
 def _create_blank_tile(width: int, height: int) -> "QImage":
@@ -73,6 +110,56 @@ def _tiles_svg_dir() -> Path:
 
 def _tiles_png_dir() -> Path:
     return Path(__file__).parent.parent / "assets" / "riichi-mahjong-tiles" / "Export" / "Regular"
+
+
+def _tile_3d_bake_dir() -> Path:
+    return Path(__file__).parent.parent / "assets" / "3d-tile"
+
+
+def _load_baked_3d_tile(tile_str: str, width: int, height: int) -> Optional["QImage"]:
+    """
+    加载预烘焙 3D 牌图（bake_3d_tiles.py 生成）。
+    存在则用，否则返回 None 回退到 2D 绘制。
+    """
+    key = (tile_str, int(width), int(height))
+    if key in _MODEL_TILE_CACHE:
+        return _MODEL_TILE_CACHE[key].copy()
+    dir_ = _tile_3d_bake_dir()
+    if not dir_.exists():
+        return None
+    if tile_str == "_":
+        name = "back"
+    elif tile_str == "?":
+        name = "unknown"
+    else:
+        name = TILE_TO_FILENAME.get(tile_str) or ""
+    if not name:
+        return None
+    path = dir_ / f"{name}.png"
+    if not path.exists():
+        return None
+    img = QImage(str(path.resolve()))
+    if img.isNull():
+        return None
+    scaled = img.scaled(int(width), int(height), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    _MODEL_TILE_CACHE[key] = scaled.copy()
+    return scaled
+
+
+def _glyph_search_dirs() -> List[Path]:
+    """
+    Optional glyph-only assets (transparent foreground only).
+    We check a few common folder layouts to keep integration simple.
+    """
+    root = Path(__file__).parent.parent / "assets"
+    return [
+        root / "tile-glyphs",
+        root / "tile-glyphs" / "png",
+        root / "tile-glyphs" / "svg",
+        root / "mahjong-glyphs",
+        root / "mahjong-glyphs" / "png",
+        root / "mahjong-glyphs" / "svg",
+    ]
 
 CREDIT_TEXT = "Tiles: FluffyStuff/riichi-mahjong-tiles"
 
@@ -131,6 +218,30 @@ def _get_tile_path(tile_str: str) -> Optional[Tuple[str, Path]]:
     return None
 
 
+def _get_glyph_path(tile_str: str) -> Optional[Tuple[str, Path]]:
+    """Get glyph-only image path (transparent symbol) if provided by user."""
+    fname = TILE_TO_FILENAME.get(tile_str) or CN_TO_FILENAME.get(tile_str)
+    if not fname:
+        return None
+    for d in _glyph_search_dirs():
+        png_path = d / f"{fname}.png"
+        if png_path.exists():
+            return ("png", png_path)
+        svg_path = d / f"{fname}.svg"
+        if svg_path.exists():
+            return ("svg", svg_path)
+    return None
+
+
+def _get_regular_svg_path(tile_str: str) -> Optional[Path]:
+    """Get FluffyStuff Regular SVG path for a tile symbol."""
+    fname = TILE_TO_FILENAME.get(tile_str) or CN_TO_FILENAME.get(tile_str)
+    if not fname:
+        return None
+    p = _tiles_svg_dir() / f"{fname}.svg"
+    return p if p.exists() else None
+
+
 def render_illustration_to_qimage(
     notation: str,
     tile_width: int = 56,
@@ -154,6 +265,8 @@ def render_illustration_to_qimage(
     painter.setRenderHint(QPainter.TextAntialiasing)
 
     try:
+        if not is_big_q:
+            _draw_table_background(painter, w, h, bg_color)
         chi_data = parse_chi_notation(notation)
         pon_data = parse_pon_notation(notation)
         if chi_data:
@@ -249,44 +362,243 @@ def _draw_tile_composite(
     width: float, height: float,
     horizontal: bool,
 ) -> None:
-    """
-    绘制：立体空白牌体 + 字符叠加。
-    字符优先从 FluffyStuff PNG 中心裁剪，缺失时手绘文字。
-    """
+    """Draw tile: 优先 3d_tile.glb 渲染，其次预烘焙图，否则 2D 斜角绘制。"""
     w = height if horizontal else width
     h = width if horizontal else height
     iw, ih = int(w), int(h)
-    blank = _create_blank_tile(iw, ih)
-    painter.drawImage(QRectF(x, y, w, h), blank, QRectF(0, 0, iw, ih))
-    # 问号牌：粗体醒目绘制
+
+    # 竖牌：优先用 3d_tile.glb 实时渲染（字符贴到牌面）
+    if not horizontal:
+        cache_key = (tile_str, iw, ih)
+        if cache_key not in _TILE_3D_CACHE:
+            try:
+                from .tile_3d_renderer import render_tile_3d
+                char_img = _load_character_image(tile_str) if tile_str not in ("_", "?") else None
+                text = _tile_display_text(tile_str) if tile_str == "?" else None  # ? 用手绘
+                arr = render_tile_3d(tile_str, (iw, ih), char_img=char_img, text=text)
+                if arr is not None and arr.size > 0:
+                    import numpy as np
+                    h_arr, w_arr = arr.shape[:2]
+                    if arr.ndim == 3 and arr.shape[2] >= 3:
+                        rgb = np.ascontiguousarray(arr[:, :, :3])
+                        qimg = QImage(rgb.data, w_arr, h_arr, w_arr * 3, QImage.Format_RGB888)
+                    else:
+                        qimg = QImage(w_arr, h_arr, QImage.Format_RGB32)
+                        qimg.fill(QColor(253, 250, 242))
+                    if not qimg.isNull():
+                        _TILE_3D_CACHE[cache_key] = qimg.copy()
+            except Exception:
+                pass
+        if cache_key in _TILE_3D_CACHE:
+            painter.drawImage(QRectF(x, y, w, h), _TILE_3D_CACHE[cache_key], QRectF(0, 0, iw, ih))
+            return
+
+    # 竖牌回退：预烘焙 3D 图（bake_3d_tiles.py 生成，含完整字符）
+    if not horizontal:
+        baked = _load_baked_3d_tile(tile_str, iw, ih)
+        if baked is not None and not baked.isNull():
+            painter.drawImage(QRectF(x, y, w, h), baked, QRectF(0, 0, baked.width(), baked.height()))
+            return
+
+    # Depth vector points to upper-right, so top and side share the same slope.
+    depth_x = max(4.0, min(w, h) * 0.16)
+    depth_y = max(3.0, min(w, h) * 0.12)
+    rx, ry = max(3.0, w * 0.08), max(3.0, h * 0.06)
+    seam_overlap = max(0.8, min(w, h) * 0.012)
+
+    # Keep final bounds as (x, y, w, h) by placing front face lower.
+    fx = x
+    fy = y + depth_y
+    fw = max(1.0, w - depth_x)
+    fh = max(1.0, h - depth_y)
+    seam_x = fx + fw
+
+    # Soft shadow on table.
+    shadow_rect = QRectF(fx + depth_x * 0.7, fy + 2.0, fw, fh)
+    sh_grad = QLinearGradient(shadow_rect.left(), shadow_rect.top(), shadow_rect.right(), shadow_rect.bottom())
+    sh_grad.setColorAt(0.0, QColor(0, 0, 0, 70))
+    sh_grad.setColorAt(1.0, QColor(0, 0, 0, 8))
+    painter.setBrush(QBrush(sh_grad))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(shadow_rect, rx, ry)
+
+    top_poly = QPolygonF([
+        QPointF(fx, fy),
+        QPointF(seam_x, fy),
+        QPointF(fx + fw + depth_x, fy - depth_y),
+        QPointF(fx + depth_x, fy - depth_y),
+    ])
+    side_poly = QPolygonF([
+        QPointF(seam_x - seam_overlap, fy),
+        QPointF(fx + fw + depth_x, fy - depth_y),
+        QPointF(fx + fw + depth_x, fy + fh - depth_y),
+        QPointF(seam_x - seam_overlap, fy + fh),
+    ])
+
+    painter.setPen(QPen(QColor(186, 180, 166), 1))
+    painter.setBrush(QBrush(QColor(244, 239, 229)))
+    painter.drawPolygon(top_poly)
+    painter.setBrush(QBrush(QColor(225, 217, 202)))
+    painter.drawPolygon(side_poly)
+
+    blank = _create_blank_tile(int(fw), int(fh))
+    painter.drawImage(QRectF(fx, fy, fw, fh), blank, QRectF(0, 0, int(fw), int(fh)))
+
+    # Right half-tone band on the front face (your black-marked region).
+    front_rect = QRectF(fx, fy, fw, fh)
+    front_path = QPainterPath()
+    front_path.addRoundedRect(front_rect, rx, ry)
+    band_w = max(2.0, fw * 0.22)
+    band_rect = QRectF(seam_x - band_w, fy + 0.6, band_w, max(1.0, fh - 1.2))
+    band_grad = QLinearGradient(band_rect.left(), band_rect.top(), band_rect.right(), band_rect.bottom())
+    band_grad.setColorAt(0.0, QColor(235, 228, 214, 115))
+    band_grad.setColorAt(0.55, QColor(220, 210, 192, 145))
+    band_grad.setColorAt(1.0, QColor(205, 194, 175, 170))
+    painter.save()
+    painter.setClipPath(front_path)
+    painter.fillRect(band_rect, QBrush(band_grad))
+    painter.restore()
+
+    # Seam line to fully eliminate anti-alias gap at A.
+    painter.setPen(QPen(QColor(172, 164, 150, 110), 1))
+    painter.drawLine(QPointF(seam_x - 0.5, fy + 1), QPointF(seam_x - 0.5, fy + fh - 1))
+
+    # Round off sharp corner B with a blended cap.
+    cx = fx + fw + depth_x
+    cy = fy - depth_y
+    cr = max(1.8, min(depth_x, depth_y) * 0.62)
+    corner_grad = QLinearGradient(cx - cr, cy - cr, cx + cr, cy + cr)
+    corner_grad.setColorAt(0.0, QColor(244, 239, 229))
+    corner_grad.setColorAt(1.0, QColor(225, 217, 202))
+    painter.setPen(QPen(QColor(186, 180, 166), 1))
+    painter.setBrush(QBrush(corner_grad))
+    painter.drawEllipse(QRectF(cx - cr, cy - cr, cr * 2, cr * 2))
+
+    # Accent line on the top front edge.
+    painter.setPen(QPen(QColor(196, 78, 74), max(1, int(min(fw, fh) * 0.028))))
+    painter.drawLine(QPointF(fx + 3, fy + 1), QPointF(fx + fw - 3, fy + 1))
+
     if tile_str == "?":
-        _draw_question_mark_tile(painter, x, y, w, h, horizontal)
+        _draw_question_mark_tile(painter, fx, fy, fw, fh, horizontal)
         return
-    # 尝试叠加 repo 字符（中心裁剪），否则手绘
     char_img = _load_character_image(tile_str)
     if char_img and not char_img.isNull():
-        _overlay_character(painter, char_img, x, y, w, h, horizontal)
+        _overlay_character(painter, char_img, fx, fy, fw, fh, horizontal)
     else:
-        _draw_character_text(painter, tile_str, x, y, w, h, horizontal)
+        _draw_character_text(painter, tile_str, fx, fy, fw, fh, horizontal)
 
 
 def _load_character_image(tile_str: str) -> Optional["QImage"]:
-    """加载 repo 原始 PNG 完整图，不做裁剪，避免已有裁剪导致字符缺失。"""
-    res = _get_tile_path(tile_str)
-    if not res:
-        return None
-    _, path = res
-    if path.suffix.lower() != ".png":
-        png_path = _tiles_png_dir() / f"{path.stem}.png"
-        if not png_path.exists():
+    """加载字符层贴图：优先 glyph 素材，回退到旧整张牌图自动抠字。"""
+    cached = _CHAR_IMG_CACHE.get(tile_str)
+    if cached is not None:
+        return cached.copy()
+
+    def _load_png(path: Path) -> Optional["QImage"]:
+        img = QImage(str(path.resolve()))
+        if img.isNull():
             return None
-        path = png_path
-    img = QImage(str(path.resolve()))
-    if img.isNull():
+        if img.format() != QImage.Format_ARGB32:
+            img = img.convertToFormat(QImage.Format_ARGB32)
+        return img
+
+    def _render_svg(path: Path, size: int = 512) -> Optional["QImage"]:
+        # Prefer cairosvg to avoid black background artifacts in some Qt SVG renders.
+        try:
+            import cairosvg
+            import io
+            with open(path, "rb") as f:
+                svg_data = f.read()
+            buf = io.BytesIO()
+            cairosvg.svg2png(
+                bytestring=svg_data,
+                write_to=buf,
+                output_width=size,
+                output_height=size,
+                background_color="white",
+            )
+            img = QImage()
+            if img.loadFromData(buf.getvalue(), "PNG") and not img.isNull():
+                if img.format() != QImage.Format_ARGB32:
+                    img = img.convertToFormat(QImage.Format_ARGB32)
+                return img
+        except Exception:
+            pass
+        try:
+            from PyQt5.QtSvg import QSvgRenderer
+            renderer = QSvgRenderer(str(path.resolve()))
+            if not renderer.isValid():
+                return None
+            img = QImage(size, size, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            renderer.render(p, QRectF(0, 0, size, size))
+            p.end()
+            return img
+        except Exception:
+            return None
+
+    def _extract_symbol_from_full_tile(img: "QImage") -> "QImage":
+        """从旧整张牌图中去掉白色牌底，保留字符。"""
+        src = img if img.format() == QImage.Format_ARGB32 else img.convertToFormat(QImage.Format_ARGB32)
+        out = QImage(src.width(), src.height(), QImage.Format_ARGB32)
+        out.fill(Qt.transparent)
+        margin_x = max(1, int(src.width() * 0.12))
+        margin_y = max(1, int(src.height() * 0.10))
+        for y in range(src.height()):
+            for x in range(src.width()):
+                # Drop tile border area from legacy full-tile art.
+                if x < margin_x or x >= src.width() - margin_x or y < margin_y or y >= src.height() - margin_y:
+                    continue
+                c = QColor(src.pixel(x, y))
+                if c.alpha() < 8:
+                    continue
+                r, g, b = c.red(), c.green(), c.blue()
+                vmax = max(r, g, b)
+                vmin = min(r, g, b)
+                sat = vmax - vmin
+                # Keep dark strokes and colored symbols; discard bright low-sat tile body.
+                keep = (vmax < 195) or (sat > 16 and vmax < 250)
+                if keep:
+                    out.setPixelColor(x, y, QColor(r, g, b, c.alpha()))
+        return out
+
+    # 1) 优先读取用户提供的 glyph-only 素材（透明底）
+    glyph_res = _get_glyph_path(tile_str)
+    if glyph_res:
+        gtype, gpath = glyph_res
+        glyph_img = _load_png(gpath) if gtype == "png" else _render_svg(gpath)
+        if glyph_img and not glyph_img.isNull():
+            _CHAR_IMG_CACHE[tile_str] = glyph_img.copy()
+            return glyph_img
+
+    # 2) Prefer FluffyStuff Regular SVG -> render -> extract symbol.
+    regular_svg = _get_regular_svg_path(tile_str)
+    if regular_svg is not None:
+        base_svg = _render_svg(regular_svg, size=768)
+        if base_svg and not base_svg.isNull():
+            symbol = _extract_symbol_from_full_tile(base_svg)
+            _CHAR_IMG_CACHE[tile_str] = symbol.copy()
+            return symbol
+
+    # 3) 回退：旧整张牌图 -> 自动抠字
+    legacy_res = _get_tile_path(tile_str)
+    if not legacy_res:
         return None
-    if img.format() != QImage.Format_ARGB32 and img.hasAlphaChannel():
-        img = img.convertToFormat(QImage.Format_ARGB32)
-    return img
+    ltype, lpath = legacy_res
+    if ltype == "png":
+        base_img = _load_png(lpath)
+    else:
+        png_path = _tiles_png_dir() / f"{lpath.stem}.png"
+        base_img = _load_png(png_path) if png_path.exists() else _render_svg(lpath)
+    if not base_img or base_img.isNull():
+        return None
+
+    symbol = _extract_symbol_from_full_tile(base_img)
+    _CHAR_IMG_CACHE[tile_str] = symbol.copy()
+    return symbol
 
 
 def _overlay_character(
@@ -300,7 +612,7 @@ def _overlay_character(
     pix = QPixmap.fromImage(char_img)
     if horizontal:
         pix = pix.transformed(QTransform().rotate(-90))
-    scaled = pix.scaled(int(w * 0.63), int(h * 0.63), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    scaled = pix.scaled(int(w * 0.58), int(h * 0.58), Qt.KeepAspectRatio, Qt.SmoothTransformation)
     sx = x + (w - scaled.width()) / 2
     sy = y + (h - scaled.height()) / 2
     painter.drawPixmap(int(sx), int(sy), scaled)
@@ -530,11 +842,11 @@ def _draw_tile_row(
     img_w: int, img_h: int,
 ) -> None:
     """绘制一排牌。"""
-    pad = 4 * scale
+    pad = 1.4 * scale
     sw, sh = tw * scale, th * scale
     total_w = len(tiles) * sw + (len(tiles) - 1) * pad
     base_x = (img_w - total_w) / 2
-    base_y = (img_h - sh) / 2 - 30 * scale
+    base_y = (img_h - sh) / 2 - 16 * scale
     for i, t in enumerate(tiles):
         x = base_x + i * (sw + pad)
         _draw_single_tile(painter, t.strip(), x, base_y, sw, sh, False)
