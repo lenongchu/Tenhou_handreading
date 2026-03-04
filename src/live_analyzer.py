@@ -797,13 +797,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             visible_target = ", ".join(f"{t}:{_visible_count(visible_tiles_dict, t)}" for t in mapped_target)
                         else:
                             visible_target = str(_visible_count(visible_tiles_dict, mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
+                        call_area = _format_call_area_display(
+                            getattr(player_state, "calls", []) or [], discard.turn
+                        )
                         sp_entry = {
                             "log_id": log_id, "round_num": player_state.round_num, "honba": player_state.honba,
                             "oya": player_state.oya, "player_id": player_state.player_id, "turn": discard.turn,
                             "actual_pattern": hand_discard_strings.copy(), "mapped_target": mapped_target,
                             "hand_tiles": list(hand_at_turn), "visible_tiles": visible_tiles_dict,
                             "dora_readable": dora_readable, "visible_target": visible_target,
-                            "is_combo": item_combo, "matched_pattern_idx": matched_idx,
+                            "call_area": call_area, "is_combo": item_combo, "matched_pattern_idx": matched_idx,
                         }
                         if target_counts is not None:
                             sp_entry["target_counts"] = target_counts
@@ -1449,6 +1452,9 @@ class LiveAnalyzer:
                                             )
                                         else:
                                             visible_target = str(_visible_count(visible_tiles_dict, mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
+                                        call_area = _format_call_area_display(
+                                            getattr(player_state, "calls", []) or [], discard.turn
+                                        )
                                         sp_entry = {
                                             "log_id": log_id,
                                             "round_num": player_state.round_num,
@@ -1462,6 +1468,7 @@ class LiveAnalyzer:
                                             "visible_tiles": visible_tiles_dict,
                                             "dora_readable": dora_readable,
                                             "visible_target": visible_target,
+                                            "call_area": call_area,
                                             "is_combo": item_combo,
                                             "matched_pattern_idx": matched_idx,
                                         }
@@ -2385,6 +2392,9 @@ class LiveAnalyzer:
                                 else:
                                     t0 = mapped_target[0] if isinstance(mapped_target, list) else mapped_target
                                     visible_target = str(_visible_count(visible_tiles_dict, t0))
+                                call_area = _format_call_area_display(
+                                    getattr(player_state, "calls", []) or [], discard.turn
+                                )
                                 sp_entry = {
                                     "log_id": log_id,
                                     "round_num": player_state.round_num,
@@ -2398,6 +2408,7 @@ class LiveAnalyzer:
                                     "visible_tiles": visible_tiles_dict,
                                     "dora_readable": dora_readable,
                                     "visible_target": visible_target,
+                                    "call_area": call_area,
                                     "target_count": target_count,
                                     "is_combo": sample_is_combo,
                                 }
@@ -2443,6 +2454,28 @@ def _visible_count(visible_tiles: dict, tile_str: str) -> int:
     base = MjlogParser.string_to_tile(tile_str)
     equiv = MjlogParser.get_count_equivalent_bases(base)
     return sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
+
+
+def _format_call_area_display(calls: list, current_turn: int) -> str:
+    """将 CallInfo 列表格式化为副露区展示字符串（仅包含 current_turn 前已发生的副露）。"""
+    if not calls:
+        return "(无)"
+    parts = []
+    for c in calls:
+        from_turn = getattr(c, "from_discard_turn", 1)
+        if from_turn > current_turn:
+            continue
+        ct = getattr(c, "call_type", "")
+        pai = getattr(c, "pai", "")
+        consumed = getattr(c, "consumed", []) or []
+        if ct == "chii" and pai and len(consumed) >= 2:
+            parts.append(f"{pai}c{consumed[0]}{consumed[1]}")
+        elif ct == "pon" and len(consumed) >= 2:
+            parts.append(f"p{consumed[0]}{consumed[1]}")
+        elif ct in ("kan", "daiminkan", "kakan", "ankan") and consumed:
+            tiles = [pai] + list(consumed) if pai else list(consumed)
+            parts.append("k" + "".join(tiles[:4]))
+    return " ".join(parts) if parts else "(无)"
 
 
 def _fmt_target(mt) -> str:
@@ -2578,6 +2611,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             target_line = f"  Target cnts: {_target_desc(s, use_tenpai)}"
         else:
             target_line = f"  Target:      {_fmt_target(mt)} ({_target_desc(s, use_tenpai)})"
+        call_area_str = s.get("call_area", "(无)")
         block = [
             f"[Sample {i}]",
             f"  Log ID:      {s['log_id']}",
@@ -2587,6 +2621,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             f"  Turn:        {s['turn']}",
             f"  Dora:        {s['dora_readable']}",
             f"  Discards:    {' '.join(s['actual_pattern'])}",
+            f"  副露区:      {call_area_str}",
             target_line,
             f"  Hand({len(s['hand_tiles'])}): {hand_str}",
         ]
