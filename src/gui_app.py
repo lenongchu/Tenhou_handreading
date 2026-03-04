@@ -681,7 +681,7 @@ class SampleThread(QThread):
     finished = pyqtSignal(bool, object)  # success, samples list
 
     def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter,
-                 sample_pool=None, target_tile_filter=None, outcome_filter=None):
+                 sample_pool=None, target_tile_filter=None):
         super().__init__()
         self.analyzer = analyzer
         self.params = params
@@ -689,7 +689,6 @@ class SampleThread(QThread):
         self.target_count_filter = target_count_filter
         self.sample_pool = sample_pool  # 主统计时预收集的样本池，有则无需二次遍历
         self.target_tile_filter = target_tile_filter  # 多目标时指定按哪个目标筛选
-        self.outcome_filter = outcome_filter  # "win"|"deal_in"|"neither" 和铳率模式下的结局筛选
         self._should_cancel = False
 
     def cancel(self):
@@ -714,7 +713,6 @@ class SampleThread(QThread):
                 progress_callback=progress_cb,
                 should_cancel=lambda: self._should_cancel,
                 sample_pool=self.sample_pool,
-                outcome_filter=self.outcome_filter,
             )
             self.progress.emit(f"收集完成，共 {len(samples)} 条")
             self.finished.emit(True, samples)
@@ -1077,16 +1075,25 @@ class TileIllustrationWidget(QWidget):
         input_row = QHBoxLayout()
         input_row.addWidget(QLabel("符号输入:"))
         self.notation_edit = QLineEdit()
-        self.notation_edit.setPlaceholderText("例: 4mc3m5m（用3m5m吃4m）、p1z1z（碰东）、7s-?-9s（?=未知牌）、1m-_3m（_=牌背）")
+        self.notation_edit.setPlaceholderText("例: 4mc3m5m（用3m5m吃4m）、p1z1z（碰东）、7s-?-9s、1m-b-3m（b=牌背）")
         self.notation_edit.setMinimumWidth(280)
         self.notation_edit.returnPressed.connect(self._generate)
         input_row.addWidget(self.notation_edit, 1)
-        self.gen_btn = QPushButton("生成")
-        self.gen_btn.clicked.connect(self._generate)
-        input_row.addWidget(self.gen_btn)
         layout.addLayout(input_row)
 
-        hint = QLabel("支持：?（单独大问号）、7s-?-9s（? 为问号牌）、_（牌背）、4mc3m5m、p1z1z、7s-9s 等。输出 600×336。")
+        discard_row = QHBoxLayout()
+        discard_row.addWidget(QLabel("舍牌输入:"))
+        self.discard_edit = QLineEdit()
+        self.discard_edit.setPlaceholderText("可选。语法同上，使用桌上视角牌。例: 7s-9s、4m-b-5m")
+        self.discard_edit.setMinimumWidth(280)
+        self.discard_edit.returnPressed.connect(self._generate)
+        discard_row.addWidget(self.discard_edit, 1)
+        self.gen_btn = QPushButton("生成")
+        self.gen_btn.clicked.connect(self._generate)
+        discard_row.addWidget(self.gen_btn)
+        layout.addLayout(discard_row)
+
+        hint = QLabel("上排=正放牌，下排=舍牌（桌上视角）。支持 ?、b（牌背）、4mc3m5m、p1z1z、7s-9s 等。")
         hint.setStyleSheet("color: #8b949e; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -1111,11 +1118,12 @@ class TileIllustrationWidget(QWidget):
 
     def _generate(self):
         notation = self.notation_edit.text().strip()
-        if not notation:
+        discard_notation = self.discard_edit.text().strip() or None
+        if not notation and not discard_notation:
             return
         try:
             from PyQt5.QtGui import QPixmap
-            img = render_illustration_to_qimage(notation, scale=3.0)
+            img = render_illustration_to_qimage(notation, scale=3.0, discard_notation=discard_notation)
             self._current_image = img
             pix = QPixmap.fromImage(img)
             scaled = pix.scaled(380, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1129,7 +1137,9 @@ class TileIllustrationWidget(QWidget):
             return
         from PyQt5.QtWidgets import QFileDialog
         from PyQt5.QtCore import QStandardPaths
-        base = re.sub(r'[\\/:*?"<>|]', "_", self.notation_edit.text().strip().replace("-", "_")[:30])
+        n = self.notation_edit.text().strip()
+        d = self.discard_edit.text().strip()
+        base = re.sub(r'[\\/:*?"<>|]', "_", (n + "_" + d if d else n).replace("-", "_")[:40])
         default_name = f"mahjong_{base}.png" if base else "mahjong.png"
         start_dir = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation) or str(Path.home())
         default_path = str(Path(start_dir) / default_name)
@@ -2129,7 +2139,7 @@ class MainWindow(QMainWindow):
         call_row.addStretch()
         right_layout.addLayout(call_row)
         exclude_south_row = QHBoxLayout()
-        self.exclude_south4_check = QCheckBox("禁止南四局")
+        self.exclude_south4_check = QCheckBox("不考虑南四局")
         self.exclude_south4_check.setToolTip("南四局打法会根据点数状况有极大改变，勾选时跳过南四局")
         exclude_south_row.addWidget(self.exclude_south4_check)
         self.exclude_south3_check = QCheckBox("禁止南三局")
@@ -3232,15 +3242,10 @@ class MainWindow(QMainWindow):
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
-        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
+        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张
         use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
-        use_outcome = self.last_query_params.get("analysis_target") == "outcome"
         is_combo = self.last_query_params.get("is_combo", False)
-        if use_outcome:
-            if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "和牌":
-                self.sample_target_combo.clear()
-                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
-        elif use_tenpai:
+        if use_tenpai:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "未听牌":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
@@ -3254,12 +3259,7 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
         count = self.sample_count_spin.value()
         idx = self.sample_target_combo.currentIndex()
-        if use_outcome:
-            outcome_filter = None if idx == 0 else ["win", "deal_in", "neither"][idx - 1]
-            target_count_filter = None
-        else:
-            outcome_filter = None
-            target_count_filter = None if idx == 0 else idx - 1
+        target_count_filter = None if idx == 0 else idx - 1
         target_tile_filter = None
         if self.sample_target_tile_combo.isVisible() and self.sample_target_tile_combo.currentIndex() > 0:
             target_tile_filter = self.sample_target_tile_combo.currentText()
@@ -3300,7 +3300,6 @@ class MainWindow(QMainWindow):
             target_count_filter,
             sample_pool=sample_pool,
             target_tile_filter=target_tile_filter,
-            outcome_filter=outcome_filter,
         )
         self.sample_thread.progress.connect(lambda s: self.result_text.append(s))
         self.sample_thread.progress_num.connect(self.on_sample_progress_num)
@@ -3326,8 +3325,6 @@ class MainWindow(QMainWindow):
             target_tile = getattr(self, "_last_sample_target_tile", None) or self.last_query_params.get("target_tile", "")
             if self.last_query_params.get("analysis_target") == "tenpai":
                 target_tile = "听牌"  # 样本展示用
-            elif self.last_query_params.get("analysis_target") == "outcome":
-                target_tile = "和铳率"  # 样本展示用
             text = format_samples_for_display(
                 samples,
                 query_str,
@@ -3384,26 +3381,12 @@ class MainWindow(QMainWindow):
 耗时: {result.get('elapsed_seconds', 0):.1f} 秒"""
                 self.result_text.setText(outcome_text)
                 self.last_query_result = result
-                qp = result.get("query_pattern", [])
-                qt = result.get("target_tile", "5z")
-                self.last_query_params = {
-                    "analysis_target": "outcome",
-                    "query_pattern": qp,
-                    "query_pattern_str": pattern_str,
-                    "target_tile": qt,
-                    "query_items": [(qp, qt)] if qp else [],
-                }
-                self.gen_sample_btn.setEnabled(True)
+                self.last_query_params = {"analysis_target": "outcome"}
+                self.gen_sample_btn.setEnabled(False)
                 self.copy_excel_btn.setEnabled(True)
                 self.save_archive_btn.setEnabled(True)
                 self.matrix_display_btn.setEnabled(False)
                 self.multi_merge_widget.setVisible(False)
-                # 和铳率模式：样本按结局筛选
-                self.sample_target_combo.clear()
-                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
-                self.sample_pattern_combo.clear()
-                self.sample_pattern_combo.addItem(f"{pattern_str} → 和铳率")
-                self.sample_target_tile_combo.setVisible(False)
                 return
 
             # 矩阵结果（M>1 巡目）

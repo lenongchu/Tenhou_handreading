@@ -35,7 +35,7 @@ RED_FIVES = frozenset({"0m", "0p", "0s"})
 SUIT_WILDCARDS = frozenset({"m", "p", "s"})
 
 # 吃碰占位符前缀：解析后为 @c:... 或 @p:...；语义为具体吃的/碰的牌（如 4mc3m5m=用3m5m吃4m）
-# 含吃或数牌碰时不生成花色/镜像等价变体，仅碰字牌时仍生成变体
+# 含副露时也应用全局花色映射（4mc3m5m→4pc3p5p 等）；字牌不参与映射，不影响变体生成
 CALL_PREFIX = "@"
 # 拆搭占位符：@cd:1 任意拆搭、@cd:2 拆搭花色≠下一张、@cd:m/p/s 拆万/饼/索搭
 CD_PREFIX = "@cd:"
@@ -274,7 +274,8 @@ def _find_kf_call_index(
         if getattr(c, "call_type", None) != ev_type:
             continue
         got = getattr(c, "consumed", []) or []
-        if len(got) >= 2 and got[0] == got[1] and got[0] in kyokuze_z:
+        got_z = [_honor_tile_to_z(t) for t in got[:2]]
+        if len(got_z) >= 2 and got_z[0] == got_z[1] and got_z[0] in kyokuze_z:
             return i
     return None
 
@@ -551,11 +552,15 @@ def _parse_call_element(s: str) -> Optional[Tuple[str, bool]]:
         idx = s_lower.index("c")
         if idx > 0 and idx < len(s) - 1:
             return (f"{CALL_PREFIX}c:{s}", False)  # 4mc3m5m
-    # 碰：p1z1z 或 pkfkf
+    # 碰：p1z1z 或 pkfkf、pzfzf、pypyp
     if s_lower.startswith("p") and len(s) >= 2:
         rest = s_lower[1:]
         if rest == "kfkf":
             return (f"{CALL_PREFIX}p:kf", False)
+        if rest == "zfzf":
+            return (f"{CALL_PREFIX}p:zf", False)
+        if rest == "ypyp":
+            return (f"{CALL_PREFIX}p:yp", False)
         if len(rest) >= 4 and rest[0].isdigit() and rest[1] == "z":
             return (f"{CALL_PREFIX}p:{rest}", False)  # p1z1z -> @p:1z1z
     return None
@@ -1224,7 +1229,6 @@ def generate_equivalent_variants(
     )
     if has_riichi and (has_chi or has_pon):
         raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
-    no_suit_variants = has_chi or (has_pon and has_number_pon)
 
     # 纯字牌模式
     if not has_number:
@@ -1236,15 +1240,7 @@ def generate_equivalent_variants(
             for p in honor_variants
         ]
 
-    # 含吃或数牌碰：不生成花色变体
-    if no_suit_variants:
-        t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
-        prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
-        return [
-            {"discard": list(parsed_pattern), "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior}
-        ]
-
-    # 花色对称：直接对舍牌元素中的 m/p/s 做映射替换，t、r 等保持不变
+    # 花色对称：含副露时也应用映射（4mc3m5m→4pc3p5p 等）；字牌不参与映射
     suits_in_pattern = _get_suits_in_pattern(parsed_pattern)
     mappings = _get_suit_mappings_for_variants(suits_in_pattern)
 
@@ -1310,7 +1306,7 @@ def _consumed_matches_call(pat_tile: str, calls: list, context: Optional[Dict] =
     检查 pat_tile (@c:xyz 或 @p:xyz) 是否与 calls 中某次副露匹配。
     仅考虑在该舍牌之前发生的副露（context["current_discard_turn"]）。
     require_immediate: 若为 True，要求该舍牌必须为副露后立即打出的那张（from_discard_turn == current_turn），
-       以确保巡目/立直等场况约束正确作用（如 c0p6p-$ 中 $ 必须是吃完后立刻打出的牌）。
+       以确保巡目/立直等约束正确作用（如 c0p6p-$ 中 $ 必须是吃完后立刻打出的牌）。
     @c:0p6p -> 需有 chii 且 consumed 精确为 ["0p","6p"]（0p 与 5p 视为不同牌）
     @p:1z1z -> 需有 pon 且 consumed 含 1z、1z
     """
@@ -1438,12 +1434,19 @@ def _match_pattern_at_end(
 
     ctx = context or {}
     jikaze = ctx.get("jikaze")
+    bakaze = ctx.get("bakaze")
     kyokuze_list = ctx.get("kyokuze_list") or ()
     calls = ctx.get("calls") or ()
 
+    # 役牌集合：自风、场风、三元牌
+    yakuhai_set = set()
+    if jikaze: yakuhai_set.add(_honor_tile_to_z(jikaze))
+    if bakaze: yakuhai_set.add(_honor_tile_to_z(bakaze))
+    yakuhai_set.update({"5z", "6z", "7z"})
+
     d_idx = len(full_discards) - 1
     p_idx = len(pattern) - 1
-    matched_honors: set = set()
+    matched_honors: set = set() # 存储 z-canon 格式，确保 z1/z2/z3 互不相同
     consumed_any_discard = False  # 用于 z1,z2,z3 的“互不相同”约束
 
     while p_idx >= 0 and d_idx >= 0:
@@ -1570,13 +1573,18 @@ def _match_pattern_at_end(
                             matched_honors.add(tile_str)
                             break
                     elif tile_part == "zf":
-                        if jikaze is not None and tile_str == jikaze:
+                        if jikaze is not None and _honor_tile_to_z(tile_str) == _honor_tile_to_z(jikaze):
+                            matched_opt = opt
+                            break
+                    elif tile_part == "yp":
+                        if _honor_tile_to_z(tile_str) in yakuhai_set:
                             matched_opt = opt
                             break
                     elif tile_part in ("kf", "kf1", "kf2", "kf3"):
-                        if kyokuze_list and tile_str in kyokuze_list and tile_str not in matched_honors:
+                        tile_z = _honor_tile_to_z(tile_str)
+                        if kyokuze_list and tile_z in [_honor_tile_to_z(k) for k in kyokuze_list] and tile_z not in matched_honors:
                             matched_opt = opt
-                            matched_honors.add(tile_str)
+                            matched_honors.add(tile_z)
                             break
                 else:
                     tile_canon = _honor_tile_to_z(tile_str) if _is_honor_tile(tile_str) else tile_str
@@ -1607,6 +1615,7 @@ def _match_pattern_at_end(
                 )
                 has_kf_pon = False
                 current_turn = ctx.get("current_discard_turn")
+                kyokuze_z_list = [_honor_tile_to_z(k) for k in kyokuze_list]
                 for c in calls:
                     if current_turn is not None:
                         from_turn = getattr(c, "from_discard_turn", 1)
@@ -1615,16 +1624,46 @@ def _match_pattern_at_end(
                         if require_immediate_kf and from_turn != current_turn:
                             continue
                     if getattr(c, "call_type", None) == "pon":
-                        pai_cn = Z_TO_WIND.get(getattr(c, "pai", ""))
-                        if pai_cn and pai_cn in kyokuze_list:
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z in kyokuze_z_list:
                             has_kf_pon = True
                             break
                 if not has_kf_pon:
                     return False
+            elif pat_tile == f"{CALL_PREFIX}p:zf":
+                if not jikaze:
+                    return False
+                has_zf_pon = False
+                current_turn = ctx.get("current_discard_turn")
+                for c in calls:
+                    if current_turn is not None:
+                        if getattr(c, "from_discard_turn", 1) > current_turn:
+                            continue
+                    if getattr(c, "call_type", None) == "pon":
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z == _honor_tile_to_z(jikaze):
+                            has_zf_pon = True
+                            break
+                if not has_zf_pon:
+                    return False
+            elif pat_tile == f"{CALL_PREFIX}p:yp":
+                has_yp_pon = False
+                current_turn = ctx.get("current_discard_turn")
+                for c in calls:
+                    if current_turn is not None:
+                        if getattr(c, "from_discard_turn", 1) > current_turn:
+                            continue
+                    if getattr(c, "call_type", None) == "pon":
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z in yakuhai_set:
+                            has_yp_pon = True
+                            break
+                if not has_yp_pon:
+                    return False
             else:
                 # @c:xyz / @p:xyz：须校验 calls 中有对应吃/碰（且在该舍牌之前发生）
                 # require_immediate: 若副露后紧跟 $ 或具体牌（无 * 隔开），则当前舍牌必须是副露后立刻打出的那张，
-                #   以便巡目/立直等场况约束正确作用
+                #   以便巡目/立直等约束正确作用
                 next_elem = pattern[p_idx + 1] if p_idx + 1 < len(pattern) else None
                 next_tile = next_elem[0] if next_elem else None
                 require_immediate = (
@@ -1661,41 +1700,49 @@ def _match_pattern_at_end(
 
         # 字牌占位符匹配
         if pat_tile in ("z", "zt"):
-            if tile_str not in HONOR_NAMES and not _is_honor_tile(tile_str):
+            if not _is_honor_tile(tile_str):
                 return False
             consumed_any_discard = True
             d_idx -= 1
             p_idx -= 1
             continue
         if pat_tile == "zf":
-            if jikaze is None or tile_str != jikaze:
+            if jikaze is None or _honor_tile_to_z(tile_str) != _honor_tile_to_z(jikaze):
                 return False
             consumed_any_discard = True
             d_idx -= 1
             p_idx -= 1
             continue
         if pat_tile == "kf":
-            if not kyokuze_list or tile_str not in kyokuze_list:
+            if not kyokuze_list or _honor_tile_to_z(tile_str) not in [_honor_tile_to_z(k) for k in kyokuze_list]:
+                return False
+            consumed_any_discard = True
+            d_idx -= 1
+            p_idx -= 1
+            continue
+        if pat_tile == "yp":
+            if _honor_tile_to_z(tile_str) not in yakuhai_set:
                 return False
             consumed_any_discard = True
             d_idx -= 1
             p_idx -= 1
             continue
         if pat_tile in ("z1", "z2", "z3", "kf1", "kf2", "kf3"):
-            if pat_tile.startswith("kf") and pat_tile != "kf":
+            tile_z = _honor_tile_to_z(tile_str)
+            if pat_tile.startswith("kf"):
                 # kf1,kf2,kf3：客风，且互不相同
-                if not kyokuze_list or tile_str not in kyokuze_list:
+                if not kyokuze_list or tile_z not in [_honor_tile_to_z(k) for k in kyokuze_list]:
                     return False
-                if tile_str in matched_honors:
+                if tile_z in matched_honors:
                     return False
-                matched_honors.add(tile_str)
+                matched_honors.add(tile_z)
             else:
                 # z1,z2,z3：任意字牌，互不相同
-                if tile_str not in HONOR_NAMES and not _is_honor_tile(tile_str):
+                if not _is_honor_tile(tile_str):
                     return False
-                if tile_str in matched_honors:
+                if tile_z in matched_honors:
                     return False
-                matched_honors.add(tile_str)
+                matched_honors.add(tile_z)
             consumed_any_discard = True
             d_idx -= 1
             p_idx -= 1
@@ -1731,6 +1778,7 @@ def _match_pattern_at_end(
                     p_idx -= 1
                     continue
                 current_turn = ctx.get("current_discard_turn")
+                kyokuze_z_list = [_honor_tile_to_z(k) for k in kyokuze_list]
                 has_kf_pon = False
                 for c in calls:
                     if current_turn is not None:
@@ -1738,12 +1786,29 @@ def _match_pattern_at_end(
                         if from_turn > current_turn:
                             continue
                     if getattr(c, "call_type", None) == "pon":
-                        pai_cn = Z_TO_WIND.get(getattr(c, "pai", ""))
-                        if pai_cn and pai_cn in kyokuze_list:
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z in kyokuze_z_list:
                             has_kf_pon = True
                             break
                 if not has_kf_pon:
                     return False
+            elif pat_tile == f"{CALL_PREFIX}p:zf":
+                if not jikaze: return False
+                current_turn = ctx.get("current_discard_turn")
+                has_zf_pon = False
+                for c in calls:
+                    if current_turn is not None and getattr(c, "from_discard_turn", 1) > current_turn: continue
+                    if getattr(c, "call_type", None) == "pon" and _honor_tile_to_z(getattr(c, "pai", "")) == _honor_tile_to_z(jikaze):
+                        has_zf_pon = True; break
+                if not has_zf_pon: return False
+            elif pat_tile == f"{CALL_PREFIX}p:yp":
+                current_turn = ctx.get("current_discard_turn")
+                has_yp_pon = False
+                for c in calls:
+                    if current_turn is not None and getattr(c, "from_discard_turn", 1) > current_turn: continue
+                    if getattr(c, "call_type", None) == "pon" and _honor_tile_to_z(getattr(c, "pai", "")) in yakuhai_set:
+                        has_yp_pon = True; break
+                if not has_yp_pon: return False
             else:
                 if not _consumed_matches_call(pat_tile, calls, ctx):
                     return False

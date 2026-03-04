@@ -1,24 +1,6 @@
-# Tile Glyph Assets
+# Tile Assets
 
-Put transparent glyph-only files in one of these folders:
+舍牌示意图使用 `assets/tile-assets/Export/Regular/` 中的 **3D PNG** 素材，直接加载并绘制。
 
-- assets/tile-glyphs/
-- assets/tile-glyphs/png/
-- assets/tile-glyphs/svg/
-- assets/mahjong-glyphs/
-- assets/mahjong-glyphs/png/
-- assets/mahjong-glyphs/svg/
-
-Use these filenames (example): `Man1.png`, `Pin5-Dora.png`, `Ton.png`.
-
-The renderer now works as:
-
-1. Use glyph-only assets first.
-2. If missing, fallback to legacy full-tile art and auto-extract symbols.
-
-
-Default source priority now includes FluffyStuff Regular SVG:
-
-1. `assets/tile-glyphs*` / `assets/mahjong-glyphs*` (if you provide glyph-only files)
-2. `assets/riichi-mahjong-tiles/Regular/*.svg` (your requested source)
-3. legacy full-tile export assets with auto symbol extraction
+- 牌面：Man1.png、Pin5-Dora.png、Ton.png 等
+- 牌背：`tile_back.png`，示意图输入 `b` 可显示

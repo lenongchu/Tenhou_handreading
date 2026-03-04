@@ -51,23 +51,6 @@ HIGH_MEMORY_LOAD_RATIO = 0.90
 POOL_RESTART_EVERY_BATCHES = 3
 
 
-def _dora_matches_constraint(dora_str: str, dora_constraint: str) -> bool:
-    """
-    宝牌是否满足约束（支持花色等价：数牌 4s ≡ 4m ≡ 4p）。
-    用于「宝牌为 X」约束在等价变体下的正确匹配。
-    """
-    if dora_str == dora_constraint:
-        return True
-    # 数牌：同数字不同花色视为等价（1-9m/p/s）
-    if len(dora_constraint) == 2 and dora_constraint[-1] in "mps" and dora_constraint[0].isdigit():
-        if len(dora_str) == 2 and dora_str[-1] in "mps" and dora_str[0].isdigit():
-            return dora_constraint[0] == dora_str[0]
-    # 赤五：0m/0p/0s 等价
-    if dora_constraint in ("0m", "0p", "0s") and dora_str in ("0m", "0p", "0s"):
-        return True
-    return False
-
-
 def _clamp_analysis_batch_size(batch_size: int, workers: int, use_parallel: bool) -> int:
     """Clamp analysis batch size to keep parallel memory usage bounded."""
     requested = max(MIN_ANALYSIS_BATCH_SIZE, int(batch_size))
@@ -332,7 +315,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
             dora_str = None
             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                     continue
             if consumed_search_list:
                 if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
@@ -373,6 +356,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                 ]
                 honor_ctx_base = {
                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
                 }
@@ -583,7 +567,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             dora_str = None
             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                     continue
             if consumed_search_list:
                 if len(items) == 1:
@@ -615,6 +599,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 discards_precomputed = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for _, d in in_range]
                 honor_ctx_base = {
                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
                 }
@@ -782,8 +767,6 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             visible_target = ", ".join(f"{t}:{_visible_count(visible_tiles_dict, t)}" for t in mapped_target)
                         else:
                             visible_target = str(_visible_count(visible_tiles_dict, mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
-                        rw = getattr(player_state, "round_winners", [])
-                        rdi = getattr(player_state, "round_deal_in", None)
                         sp_entry = {
                             "log_id": log_id, "round_num": player_state.round_num, "honba": player_state.honba,
                             "oya": player_state.oya, "player_id": player_state.player_id, "turn": discard.turn,
@@ -791,8 +774,6 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "hand_tiles": list(hand_at_turn), "visible_tiles": visible_tiles_dict,
                             "dora_readable": dora_readable, "visible_target": visible_target,
                             "is_combo": item_combo, "matched_pattern_idx": matched_idx,
-                            "outcome_won": player_state.player_id in rw,
-                            "outcome_deal_in": rdi is not None and rdi == player_state.player_id,
                         }
                         if target_counts is not None:
                             sp_entry["target_counts"] = target_counts
@@ -878,7 +859,7 @@ class LiveAnalyzer:
         exclude_south3: bool = False,  # True 时跳过南三局，可与 exclude_south4 同选
         prior_discard_exclusion: Optional[str] = None,  # 鍓嶆涓嶅彲鎵擄紝濡?NOTm銆?mOR2m锛屼笌鑸嶇墝妯″紡鍚屾绛変环鍙樻崲
         max_workers: Optional[int] = None,
-        gc_interval_batches: Optional[int] = None,  # >1 鍒跺惎鐢?per-log 骞惰閔锛? 鎴?None 涓轰覆琛?
+        gc_interval_batches: Optional[int] = None,  # >1 鏃跺惎鐢?per-log 骞惰锛? 鎴?None 涓轰覆琛?
     ) -> Dict:
         """
         鍒嗘瀽鑸嶇墝妯″紡锛岃绠楃洰鏍囩墝鍦ㄦ墜鐗屼腑鐨勬鐜囥€?
@@ -1155,7 +1136,7 @@ class LiveAnalyzer:
                                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
                                 # 鎸囧畾瀹濈墝锛氬眬绾у垽鏂紝涓嶆弧瓒冲垯璺宠繃鏁村眬
                                 # 鐩墠娴嬭瘯锛屼箣鍚庡彲鑳戒篃浣滅瓑浠峰彉浣撳鐞?
-                                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                                if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                                     continue
 
                             # 灞€绾?consumed 棰勮繃婊わ細鍗曟ā寮忕敤鍗曚竴 consumed锛涘妯″紡闇€鑷冲皯涓€涓ā寮忕殑 consumed 瀛樺湪
@@ -1210,6 +1191,7 @@ class LiveAnalyzer:
                                 discarded_bases = set()
                                 honor_ctx_base = {
                                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
                                 }
@@ -1420,8 +1402,6 @@ class LiveAnalyzer:
                                             )
                                         else:
                                             visible_target = str(_visible_count(visible_tiles_dict, mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
-                                        rw = getattr(player_state, "round_winners", [])
-                                        rdi = getattr(player_state, "round_deal_in", None)
                                         sp_entry = {
                                             "log_id": log_id,
                                             "round_num": player_state.round_num,
@@ -1437,8 +1417,6 @@ class LiveAnalyzer:
                                             "visible_target": visible_target,
                                             "is_combo": item_combo,
                                             "matched_pattern_idx": matched_idx,
-                                            "outcome_won": player_state.player_id in rw,
-                                            "outcome_deal_in": rdi is not None and rdi == player_state.player_id,
                                         }
                                         if target_counts is not None:
                                             sp_entry["target_counts"] = target_counts
@@ -1657,7 +1635,6 @@ class LiveAnalyzer:
             "query_pattern": result.get("query_pattern", query_pattern or []),
             "query_pattern_str": result.get("query_pattern_str", ""),
             "target_tile": result.get("target_tile", target_tile),
-            "sample_pool": result.get("sample_pool", []),
         }
 
     def analyze_discard_pattern_grid(
@@ -1680,7 +1657,7 @@ class LiveAnalyzer:
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
         max_workers: Optional[int] = None,
-        gc_interval_batches: Optional[int] = None,  # >1 鍒跺惎鐢?per-log 骞惰閔锛? 鎴?None 涓轰覆琛?
+        gc_interval_batches: Optional[int] = None,  # >1 鏃跺惎鐢?per-log 骞惰锛? 鎴?None 涓轰覆琛?
     ) -> Dict:
         """
         鍗曟鎵弿鎵归噺鍒嗘瀽锛氳垗鐗屾ā寮?脳 宸＄洰鑼冨洿 缃戞牸锛屼竴娆￠亶鍘嗘暟鎹簱寰楀埌鎵€鏈夊崟鍏冩牸鐨勫悎骞舵鐜囥€?
@@ -1844,7 +1821,7 @@ class LiveAnalyzer:
                             dora_str = None
                             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                                if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                                     continue
                             if consumed_search_list:
                                 if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
@@ -1885,6 +1862,7 @@ class LiveAnalyzer:
                                 ]
                                 honor_ctx_base = {
                                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
                                 }
@@ -2081,8 +2059,7 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
-        gc_interval_batches: Optional[int] = None,  # >1 鍒跺惎鐢?per-log 骞惰閔锛? 鎴?None 涓轰覆琛?
-        outcome_filter: Optional[str] = None,  # 鍓嶆涓嶅彲鎵擄紝涓庤垗鐗屾ā寮忓悓姝ョ瓑浠峰彉鎹?
+        gc_interval_batches: Optional[int] = None,  # 鍓嶆涓嶅彲鎵擄紝涓庤垗鐗屾ā寮忓悓姝ョ瓑浠峰彉鎹?
     ) -> List[Dict]:
         """
         鏀堕泦楠岃瘉鏍锋湰锛岀敤浜庝汉宸ュ鐩樻牳瀵广€?
@@ -2096,13 +2073,6 @@ class LiveAnalyzer:
         if sample_pool and len(sample_pool) > 0:
             # 浠庨鏀堕泦鐨勬牱鏈睜涓瓫閫夊苟鍙栧墠 N 涓紝鏃犻渶閬嶅巻鐗岃氨锛堜富鍒嗘瀽宸叉帓闄ゅ崡鍥涘眬鍒欐棤闇€鍐嶈繃婊わ級
             candidates = sample_pool
-            if outcome_filter is not None:
-                if outcome_filter == "win":
-                    candidates = [s for s in candidates if s.get("outcome_won")]
-                elif outcome_filter == "deal_in":
-                    candidates = [s for s in candidates if s.get("outcome_deal_in")]
-                elif outcome_filter == "neither":
-                    candidates = [s for s in candidates if not s.get("outcome_won") and not s.get("outcome_deal_in")]
             if target_count_filter is not None:
                 if target_tile_filter and any("target_counts" in s for s in sample_pool):
                     candidates = [s for s in sample_pool if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
@@ -2182,7 +2152,7 @@ class LiveAnalyzer:
                         dora_str = None
                         if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                             dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                            if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                            if dora_constraint != "dora_unrelated" and dora_str != dora_constraint:
                                 continue
 
                         if consumed_search and not round_has_matching_consumed(round_players, consumed_search):
@@ -2215,6 +2185,7 @@ class LiveAnalyzer:
                             discarded_bases = set()
                             honor_ctx_base = {
                                 "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                             }
@@ -2461,7 +2432,6 @@ def verify_sample_consistency(
         full_discards = _actual_pattern_to_full_discards(actual)
         if not full_discards:
             return (False, "actual_pattern parsed to empty sequence")
-        from .equivalent_variants import parse_multi_targets
         first_t = parse_multi_targets(target_tile)[0]
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
         variants = generate_equivalent_variants(query_pattern, variant_target, visible_constraints)
@@ -2485,26 +2455,14 @@ def _target_counts_display_set(tc: dict) -> set:
     return out
 
 
-def _outcome_label(s: dict) -> str:
-    """和铳率模式下样本的结局标签"""
-    if s.get("outcome_won"):
-        return "和牌"
-    if s.get("outcome_deal_in"):
-        return "放铳"
-    return "两者皆无"
-
-
 def format_samples_for_display(samples: List[Dict], query_pattern_str: str, target_tile: str,
                                analysis_target: str = "target_count") -> str:
     """Format verification samples for readable display."""
     use_tenpai = (analysis_target == "tenpai")
-    use_outcome = (analysis_target == "outcome")
     is_combo = False if use_tenpai else (samples[0].get("is_combo", False) if samples else False)
     has_multi = bool(samples and samples[0].get("target_counts"))
-    target_label = "和铳率" if use_outcome else (
-        target_tile if use_tenpai else (
-            f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
-        )
+    target_label = target_tile if use_tenpai else (
+        f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
     )
     lines = [
         "=" * 80,
@@ -2513,13 +2471,11 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         "",
     ]
     for i, s in enumerate(samples, 1):
-        mt = s.get("mapped_target")
-        if use_outcome:
-            mt_set = set()
-        elif has_multi and s.get("target_counts"):
+        mt = s["mapped_target"]
+        if has_multi and s.get("target_counts"):
             mt_set = _target_counts_display_set(s["target_counts"])
         else:
-            mt_set = _target_display_set(mt) if not use_tenpai and mt else set()
+            mt_set = _target_display_set(mt) if not use_tenpai else set()
         hand_parts = []
         for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
             ts = MjlogParser.tile_to_string(t)
@@ -2527,9 +2483,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         hand_str = " ".join(hand_parts)
         round_display = MjlogParser.format_round_display(s["round_num"], s["honba"])
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
-        if use_outcome:
-            target_line = f"  结局:        {_outcome_label(s)}"
-        elif use_tenpai:
+        if use_tenpai:
             target_line = f"  Tenpai:      {_target_desc(s, use_tenpai)}"
         elif has_multi and s.get("target_counts"):
             target_line = f"  Target cnts: {_target_desc(s, use_tenpai)}"
@@ -2547,7 +2501,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             target_line,
             f"  Hand({len(s['hand_tiles'])}): {hand_str}",
         ]
-        if not use_tenpai and not use_outcome:
+        if not use_tenpai:
             if has_multi and s.get("target_counts"):
                 block.append(f"  Visible targets: {s['visible_target']}")
             else:

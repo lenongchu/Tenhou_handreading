@@ -10,10 +10,10 @@
 - **数据质量控制**：自动过滤低质量对局（掉线未重连），确保分析准确性
 - **舍牌分析**：识别手切/摸切，追踪玩家的舍牌序列
 - **模式匹配**：支持通配符查询（如 `7s-*-5s`），灵活匹配舍牌模式
-- **场况约束**：支持可见枚数约束、宝牌约束、立直约束，精确模拟实战环境
+- **场上可见枚数**：支持指定牌在场上可见枚数范围；另支持宝牌约束、立直约束，精确模拟实战环境
 - **概率计算**：统计目标牌在手牌中的概率分布（0/1/2/3张）
 - **图形界面**：提供直观的桌面GUI，方便查询和分析
-- **麻将示意图**：根据舍牌/副露符号生成示意图图片（如 `4mc3m5m`），牌面素材来自 [riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)
+- **麻将示意图**：根据舍牌/副露符号生成示意图图片（如 `4mc3m5m`），牌面素材来自 `assets/tile-assets`
 
 ## 技术栈
 
@@ -63,20 +63,9 @@ python -m src.gui_app
 
 ### 5. 麻将示意图（可选）
 
-使用「麻将示意图」功能前，需下载牌面资源：
+使用「麻将示意图」功能前，需将牌面素材放入 `assets/tile-assets/Regular/`（SVG 格式）。项目已预置来自 `E:\Cursor\SVGtoasset\assets` 的正放牌素材。
 
-```bash
-python download_tiles.py
-```
-
-脚本会下载 **SVG 矢量图**（立体效果）和 PNG 备用。
-
-**立体效果**：安装 `cairosvg` 可高质量渲染 Inkscape SVG：
-```bash
-pip install cairosvg
-```
-
-牌面素材来源：[FluffyStuff/riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)（公共领域 CC0）。
+**立体效果**：安装 `cairosvg` 可高质量渲染 Inkscape SVG；未安装时使用 Qt 渲染。
 
 ## 使用说明
 
@@ -95,7 +84,7 @@ python -m src.gui_app
 - 目标牌：`6s`
 - 巡目范围：2 - 10
 - 宝牌约束：宝牌为 `6s`
-- 场况约束：`8s` 可见 `2-3` 枚
+- 场上可见枚数：`8s` 可见 `2-3` 枚
 
 **输出**（示例）：
 ```
@@ -118,8 +107,8 @@ python -m src.gui_app
 - **宝牌无关**：仅匹配宝牌指示物与舍牌序列花色不同的对局
 - **宝牌为X**：匹配宝牌为指定值的对局（如 `6s`）
 
-#### 场况约束
-- 指定某张牌的可见枚数范围（其他3家舍牌河 + 副露 + 宝牌指示物）
+#### 场上可见枚数
+- 指定某张牌在场上可见枚数范围（其他3家舍牌河 + 副露 + 宝牌指示物）
 - 支持多个约束同时生效
 
 ## 项目结构
@@ -187,15 +176,6 @@ tenhou_handreading/
 - [ ] 概率计算引擎
 - [ ] GUI界面开发
 - [ ] 单元测试
-
-## 麻将示意图 3D 牌面
-
-示意图默认使用 2D 绘制。若需 3D 牌面效果：
-
-1. 将 `3d_tile.glb` 置于项目根目录
-2. 安装依赖：`pip install trimesh pyrender Pillow`
-3. 运行预烘焙脚本：`python bake_3d_tiles.py`（需 OpenGL，部分环境可试 `set PYOPENGL_PLATFORM=osmesa`）
-4. 烘焙结果输出到 `assets/3d-tile/`，示意图将自动使用
 
 ## 参考资源
 

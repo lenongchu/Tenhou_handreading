@@ -59,6 +59,9 @@ data/*.sqlite
 *.log
 logs/
 
+# Large archive files (do not commit)
+houou-logs/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
