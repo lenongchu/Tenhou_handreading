@@ -409,8 +409,9 @@ class DiscreteRangeSlider(QWidget):
         self._handle_radius = 5
         self._track_height = 3
         self.setMinimumHeight(36)
-        self.setMinimumWidth(100)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumWidth(85)
+        self.setMaximumWidth(118)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setCursor(Qt.PointingHandCursor)
 
     def getRange(self):
@@ -681,7 +682,7 @@ class SampleThread(QThread):
     finished = pyqtSignal(bool, object)  # success, samples list
 
     def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter,
-                 sample_pool=None, target_tile_filter=None):
+                 sample_pool=None, target_tile_filter=None, outcome_filter=None):
         super().__init__()
         self.analyzer = analyzer
         self.params = params
@@ -689,6 +690,7 @@ class SampleThread(QThread):
         self.target_count_filter = target_count_filter
         self.sample_pool = sample_pool  # 主统计时预收集的样本池，有则无需二次遍历
         self.target_tile_filter = target_tile_filter  # 多目标时指定按哪个目标筛选
+        self.outcome_filter = outcome_filter  # "win"|"deal_in"|"neither" 和铳率模式下的结局筛选
         self._should_cancel = False
 
     def cancel(self):
@@ -713,6 +715,7 @@ class SampleThread(QThread):
                 progress_callback=progress_cb,
                 should_cancel=lambda: self._should_cancel,
                 sample_pool=self.sample_pool,
+                outcome_filter=self.outcome_filter,
             )
             self.progress.emit(f"收集完成，共 {len(samples)} 条")
             self.finished.emit(True, samples)
@@ -1527,10 +1530,10 @@ class BatchChartDialog(QDialog):
         prior_excl_row.addStretch()
         cg_layout.addLayout(prior_excl_row)
 
-        # 场况约束
+        # 场上可见枚数
         vc_row = QHBoxLayout()
-        vc_row.addWidget(QLabel("场况约束:"))
-        self.batch_use_main_constraints = QCheckBox("使用主界面场况约束")
+        vc_row.addWidget(QLabel("场上可见枚数:"))
+        self.batch_use_main_constraints = QCheckBox("使用主界面场上可见枚数")
         self.batch_use_main_constraints.setChecked(True)
         vc_row.addWidget(self.batch_use_main_constraints)
         vc_row.addStretch()
@@ -1656,10 +1659,7 @@ class BatchChartDialog(QDialog):
             call_area = [le.text().strip() for le in self.batch_call_area_inputs if le.text().strip()][:4]
             visible = {}
             if self.batch_use_main_constraints.isChecked():
-                for i in range(mw.constraint_list.count()):
-                    item = mw.constraint_list.item(i)
-                    tile, min_c, max_c = item.data(Qt.UserRole)
-                    visible[tile] = (min_c, max_c)
+                visible = mw._get_visible_constraints_from_ui() or {}
             base.update(dora_constraint=dora, riichi_constraint=riichi, call_constraint=call,
                 call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
         else:
@@ -1667,11 +1667,7 @@ class BatchChartDialog(QDialog):
             riichi = "any" if mw.riichi_any_radio.isChecked() else ("has_riichi" if mw.riichi_has_radio.isChecked() else "no_riichi")
             call = "any" if mw.call_any_radio.isChecked() else ("has_call" if mw.call_has_radio.isChecked() else "no_call")
             call_area = [le.text().strip() for le in mw.call_area_inputs if le.text().strip()][:4]
-            visible = {}
-            for i in range(mw.constraint_list.count()):
-                item = mw.constraint_list.item(i)
-                tile, min_c, max_c = item.data(Qt.UserRole)
-                visible[tile] = (min_c, max_c)
+            visible = mw._get_visible_constraints_from_ui() or {}
             base.update(dora_constraint=dora, riichi_constraint=riichi, call_constraint=call,
                 call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
         return base
@@ -2048,8 +2044,8 @@ class MainWindow(QMainWindow):
         
         # ========== 右列：开始分析相关（巡目、约束、样本、执行） ==========
         right_widget = QWidget()
-        right_widget.setMinimumWidth(380)
-        right_widget.setMaximumWidth(520)
+        right_widget.setMinimumWidth(400)
+        right_widget.setMaximumWidth(620)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -2179,34 +2175,34 @@ class MainWindow(QMainWindow):
         call_area_row.addStretch()
         right_layout.addLayout(call_area_row)
         
-        # 场况约束（两行：输入行 + 按钮与列表）
+        # 场上可见枚数（可添加多行，每行可并排两个条目）
         right_layout.addSpacing(4)
-        add_constraint_row = QHBoxLayout()
-        add_constraint_row.setSpacing(8)
-        add_constraint_row.addWidget(QLabel("场况约束"))
-        self.constraint_tile_input = QLineEdit()
-        self.constraint_tile_input.setPlaceholderText("牌，如 8s")
-        self.constraint_tile_input.setMinimumWidth(52)
-        self.constraint_tile_input.setMaximumWidth(72)
-        add_constraint_row.addWidget(self.constraint_tile_input)
-        add_constraint_row.addWidget(QLabel("可见"))
-        self.constraint_range_slider = DiscreteRangeSlider()
-        self.constraint_range_slider.setMinimumWidth(100)
-        self.constraint_range_slider.setMaximumWidth(140)
-        add_constraint_row.addWidget(self.constraint_range_slider)
-        add_constraint_row.addWidget(QLabel("枚"))
-        add_constraint_row.addStretch()
-        right_layout.addLayout(add_constraint_row)
-        add_btn_row_constraint = QHBoxLayout()
-        self.add_constraint_btn = QPushButton("添加场况约束")
-        self.add_constraint_btn.clicked.connect(self.add_constraint)
-        add_btn_row_constraint.addWidget(self.add_constraint_btn)
-        add_btn_row_constraint.addStretch()
-        right_layout.addLayout(add_btn_row_constraint)
-        self.constraint_list = QListWidget()
-        self.constraint_list.setMinimumHeight(52)
-        self.constraint_list.setMaximumHeight(88)
-        right_layout.addWidget(self.constraint_list)
+        vc_header = QHBoxLayout()
+        vc_header.addWidget(QLabel("场上可见枚数"))
+        self.add_visible_constraint_btn = QPushButton("+ 添加")
+        self.add_visible_constraint_btn.setFixedWidth(72)
+        self.add_visible_constraint_btn.clicked.connect(self._add_visible_constraint_row)
+        vc_header.addWidget(self.add_visible_constraint_btn)
+        vc_header.addStretch()
+        right_layout.addLayout(vc_header)
+        self.visible_constraint_scroll = QScrollArea()
+        self.visible_constraint_scroll.setWidgetResizable(True)
+        self.visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.visible_constraint_scroll.setMinimumHeight(52)
+        self.visible_constraint_scroll.setMaximumHeight(100)
+        self.visible_constraint_rows_widget = QWidget()
+        self.visible_constraint_rows_widget.setMinimumWidth(596)
+        self.visible_constraint_rows_layout = QGridLayout(self.visible_constraint_rows_widget)
+        self.visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.visible_constraint_rows_layout.setSpacing(2)
+        self.visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.visible_constraint_scroll.setWidget(self.visible_constraint_rows_widget)
+        self.visible_constraint_row_refs = []
+        right_layout.addWidget(self.visible_constraint_scroll)
+        self._add_visible_constraint_row()
         
         # 分析目标 + 样本上限 + 匹配状态保留条数
         opts_row = QHBoxLayout()
@@ -3082,28 +3078,59 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "下载失败", message)
     
-    def add_constraint(self):
-        """添加场况约束"""
-        tile = self.constraint_tile_input.text().strip()
-        min_count, max_count = self.constraint_range_slider.getRange()
-        
-        if not tile:
-            QMessageBox.warning(self, "输入错误", "请输入牌")
-            return
-        
-        if min_count > max_count:
-            QMessageBox.warning(self, "输入错误", "最小值不能大于最大值")
-            return
-        
-        # 添加到列表
-        item_text = f"{tile} 可见 {min_count}-{max_count} 枚"
-        item = QListWidgetItem(item_text)
-        item.setData(Qt.UserRole, (tile, min_count, max_count))
-        self.constraint_list.addItem(item)
-        
-        # 清空输入
-        self.constraint_tile_input.clear()
-    
+    def _rebuild_visible_constraint_grid(self):
+        """将场上可见枚数条目按 2 列重新排列"""
+        layout = self.visible_constraint_rows_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if item and item.widget():
+                item.widget().setParent(None)
+        for i, (_, _, row_widget) in enumerate(self.visible_constraint_row_refs):
+            layout.addWidget(row_widget, i // 2, i % 2)
+
+    def _add_visible_constraint_row(self):
+        """添加一行场上可见枚数输入（牌 + 范围滑块），每行可并排两个条目，每个条目固定宽度"""
+        row_widget = QWidget()
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 8s")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("可见"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        self._rebuild_visible_constraint_grid()
+
+        def do_remove():
+            self.visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.visible_constraint_row_refs.remove((tile_edit, range_slider, row_widget))
+            self._rebuild_visible_constraint_grid()
+        remove_btn.clicked.connect(do_remove)
+
+    def _get_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        """从场上可见枚数行收集约束，空牌名跳过"""
+        visible_constraints = {}
+        for tile_edit, range_slider, _ in self.visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            visible_constraints[tile] = (min_count, max_count)
+        return visible_constraints
+
     def execute_query(self):
         """执行查询"""
         analysis_target = self.analysis_target_combo.currentData() or "target_count"
@@ -3153,12 +3180,8 @@ class MainWindow(QMainWindow):
             if le.text().strip()
         ][:4]
         
-        # 场况约束
-        visible_constraints = {}
-        for i in range(self.constraint_list.count()):
-            item = self.constraint_list.item(i)
-            tile, min_count, max_count = item.data(Qt.UserRole)
-            visible_constraints[tile] = (min_count, max_count)
+        # 场上可见枚数
+        visible_constraints = self._get_visible_constraints_from_ui()
         
         # 样本上限
         sample_limit = self.sample_limit_input.value()
@@ -3242,10 +3265,15 @@ class MainWindow(QMainWindow):
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
-        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张
+        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
         use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
+        use_outcome = self.last_query_params.get("analysis_target") == "outcome"
         is_combo = self.last_query_params.get("is_combo", False)
-        if use_tenpai:
+        if use_outcome:
+            if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "和牌":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
+        elif use_tenpai:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "未听牌":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
@@ -3259,7 +3287,12 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
         count = self.sample_count_spin.value()
         idx = self.sample_target_combo.currentIndex()
-        target_count_filter = None if idx == 0 else idx - 1
+        if use_outcome:
+            outcome_filter = None if idx == 0 else ["win", "deal_in", "neither"][idx - 1]
+            target_count_filter = None
+        else:
+            outcome_filter = None
+            target_count_filter = None if idx == 0 else idx - 1
         target_tile_filter = None
         if self.sample_target_tile_combo.isVisible() and self.sample_target_tile_combo.currentIndex() > 0:
             target_tile_filter = self.sample_target_tile_combo.currentText()
@@ -3300,6 +3333,7 @@ class MainWindow(QMainWindow):
             target_count_filter,
             sample_pool=sample_pool,
             target_tile_filter=target_tile_filter,
+            outcome_filter=outcome_filter,
         )
         self.sample_thread.progress.connect(lambda s: self.result_text.append(s))
         self.sample_thread.progress_num.connect(self.on_sample_progress_num)
@@ -3325,6 +3359,8 @@ class MainWindow(QMainWindow):
             target_tile = getattr(self, "_last_sample_target_tile", None) or self.last_query_params.get("target_tile", "")
             if self.last_query_params.get("analysis_target") == "tenpai":
                 target_tile = "听牌"  # 样本展示用
+            elif self.last_query_params.get("analysis_target") == "outcome":
+                target_tile = "和铳率"  # 样本展示用
             text = format_samples_for_display(
                 samples,
                 query_str,
@@ -3381,12 +3417,26 @@ class MainWindow(QMainWindow):
 耗时: {result.get('elapsed_seconds', 0):.1f} 秒"""
                 self.result_text.setText(outcome_text)
                 self.last_query_result = result
-                self.last_query_params = {"analysis_target": "outcome"}
-                self.gen_sample_btn.setEnabled(False)
+                qp = result.get("query_pattern", [])
+                qt = result.get("target_tile", "5z")
+                self.last_query_params = {
+                    "analysis_target": "outcome",
+                    "query_pattern": qp,
+                    "query_pattern_str": pattern_str,
+                    "target_tile": qt,
+                    "query_items": [(qp, qt)] if qp else [],
+                }
+                self.gen_sample_btn.setEnabled(True)
                 self.copy_excel_btn.setEnabled(True)
                 self.save_archive_btn.setEnabled(True)
                 self.matrix_display_btn.setEnabled(False)
                 self.multi_merge_widget.setVisible(False)
+                # 和铳率模式：样本按结局筛选
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
+                self.sample_pattern_combo.clear()
+                self.sample_pattern_combo.addItem(f"{pattern_str} → 和铳率")
+                self.sample_target_tile_combo.setVisible(False)
                 return
 
             # 矩阵结果（M>1 巡目）
@@ -3450,11 +3500,7 @@ class MainWindow(QMainWindow):
             else:
                 call_constraint = "no_call"
             call_area_constraints = [le.text().strip() for le in self.call_area_inputs if le.text().strip()][:4]
-            visible_constraints = {}
-            for i in range(self.constraint_list.count()):
-                item = self.constraint_list.item(i)
-                tile, min_count, max_count = item.data(Qt.UserRole)
-                visible_constraints[tile] = (min_count, max_count)
+            visible_constraints = self._get_visible_constraints_from_ui()
             turn_min, turn_max = self.turn_range_slider.getRange()
             turn_range = None
             if turn_min <= turn_max and not (turn_min == 1 and turn_max == 18):

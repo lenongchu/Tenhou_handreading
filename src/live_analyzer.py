@@ -859,7 +859,7 @@ class LiveAnalyzer:
         exclude_south3: bool = False,  # True 时跳过南三局，可与 exclude_south4 同选
         prior_discard_exclusion: Optional[str] = None,  # 鍓嶆涓嶅彲鎵擄紝濡?NOTm銆?mOR2m锛屼笌鑸嶇墝妯″紡鍚屾绛変环鍙樻崲
         max_workers: Optional[int] = None,
-        gc_interval_batches: Optional[int] = None,  # >1 鏃跺惎鐢?per-log 骞惰锛? 鎴?None 涓轰覆琛?
+        gc_interval_batches: Optional[int] = None,
     ) -> Dict:
         """
         鍒嗘瀽鑸嶇墝妯″紡锛岃绠楃洰鏍囩墝鍦ㄦ墜鐗屼腑鐨勬鐜囥€?
@@ -1657,7 +1657,7 @@ class LiveAnalyzer:
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
         max_workers: Optional[int] = None,
-        gc_interval_batches: Optional[int] = None,  # >1 鏃跺惎鐢?per-log 骞惰锛? 鎴?None 涓轰覆琛?
+        gc_interval_batches: Optional[int] = None,
     ) -> Dict:
         """
         鍗曟鎵弿鎵归噺鍒嗘瀽锛氳垗鐗屾ā寮?脳 宸＄洰鑼冨洿 缃戞牸锛屼竴娆￠亶鍘嗘暟鎹簱寰楀埌鎵€鏈夊崟鍏冩牸鐨勫悎骞舵鐜囥€?
@@ -2059,7 +2059,8 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
-        gc_interval_batches: Optional[int] = None,  # 鍓嶆涓嶅彲鎵擄紝涓庤垗鐗屾ā寮忓悓姝ョ瓑浠峰彉鎹?
+        gc_interval_batches: Optional[int] = None,
+        outcome_filter: Optional[str] = None,  # 鍓嶆涓嶅彲鎵擄紝涓庤垗鐗屾ā寮忓悓姝ョ瓑浠峰彉鎹?
     ) -> List[Dict]:
         """
         鏀堕泦楠岃瘉鏍锋湰锛岀敤浜庝汉宸ュ鐩樻牳瀵广€?
@@ -2073,6 +2074,13 @@ class LiveAnalyzer:
         if sample_pool and len(sample_pool) > 0:
             # 浠庨鏀堕泦鐨勬牱鏈睜涓瓫閫夊苟鍙栧墠 N 涓紝鏃犻渶閬嶅巻鐗岃氨锛堜富鍒嗘瀽宸叉帓闄ゅ崡鍥涘眬鍒欐棤闇€鍐嶈繃婊わ級
             candidates = sample_pool
+            if outcome_filter is not None:
+                if outcome_filter == "win":
+                    candidates = [s for s in candidates if s.get("outcome_won")]
+                elif outcome_filter == "deal_in":
+                    candidates = [s for s in candidates if s.get("outcome_deal_in")]
+                elif outcome_filter == "neither":
+                    candidates = [s for s in candidates if not s.get("outcome_won") and not s.get("outcome_deal_in")]
             if target_count_filter is not None:
                 if target_tile_filter and any("target_counts" in s for s in sample_pool):
                     candidates = [s for s in sample_pool if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
@@ -2455,15 +2463,25 @@ def _target_counts_display_set(tc: dict) -> set:
     return out
 
 
+def _outcome_label(s: dict) -> str:
+    """和铳率模式下样本的结局标签"""
+    if s.get("outcome_won"):
+        return "和牌"
+    if s.get("outcome_deal_in"):
+        return "放铳"
+    return "两者皆无"
+
+
 def format_samples_for_display(samples: List[Dict], query_pattern_str: str, target_tile: str,
                                analysis_target: str = "target_count") -> str:
     """Format verification samples for readable display."""
     use_tenpai = (analysis_target == "tenpai")
+    use_outcome = (analysis_target == "outcome")
     is_combo = False if use_tenpai else (samples[0].get("is_combo", False) if samples else False)
     has_multi = bool(samples and samples[0].get("target_counts"))
-    target_label = target_tile if use_tenpai else (
+    target_label = "和铳率" if use_outcome else (target_tile if use_tenpai else (
         f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
-    )
+    ))
     lines = [
         "=" * 80,
         f"Verification Samples: {query_pattern_str} -> {target_label}",
@@ -2471,11 +2489,13 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         "",
     ]
     for i, s in enumerate(samples, 1):
-        mt = s["mapped_target"]
-        if has_multi and s.get("target_counts"):
+        mt = s.get("mapped_target")
+        if use_outcome:
+            mt_set = set()
+        elif has_multi and s.get("target_counts"):
             mt_set = _target_counts_display_set(s["target_counts"])
         else:
-            mt_set = _target_display_set(mt) if not use_tenpai else set()
+            mt_set = _target_display_set(mt) if not use_tenpai and mt else set()
         hand_parts = []
         for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
             ts = MjlogParser.tile_to_string(t)
@@ -2483,7 +2503,9 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         hand_str = " ".join(hand_parts)
         round_display = MjlogParser.format_round_display(s["round_num"], s["honba"])
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
-        if use_tenpai:
+        if use_outcome:
+            target_line = f"  结局:        {_outcome_label(s)}"
+        elif use_tenpai:
             target_line = f"  Tenpai:      {_target_desc(s, use_tenpai)}"
         elif has_multi and s.get("target_counts"):
             target_line = f"  Target cnts: {_target_desc(s, use_tenpai)}"
@@ -2501,7 +2523,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             target_line,
             f"  Hand({len(s['hand_tiles'])}): {hand_str}",
         ]
-        if not use_tenpai:
+        if not use_tenpai and not use_outcome:
             if has_multi and s.get("target_counts"):
                 block.append(f"  Visible targets: {s['visible_target']}")
             else:
