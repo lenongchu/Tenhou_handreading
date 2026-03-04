@@ -2075,7 +2075,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(turn_ranges_header)
         turn_ranges_row = QHBoxLayout()
         turn_ranges_row.setSpacing(6)
-        self._turn_range_pairs: List[Tuple[QLineEdit, QLineEdit]] = []
+        self._turn_range_edits: List[QLineEdit] = []
         for _ in range(5):
             self._add_turn_range_pair(turn_ranges_row, None)
         add_tr_btn = QPushButton("+")
@@ -2187,7 +2187,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(vc_header)
         self.visible_constraint_scroll = QScrollArea()
         self.visible_constraint_scroll.setWidgetResizable(True)
-        self.visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.visible_constraint_scroll.setMinimumHeight(52)
         self.visible_constraint_scroll.setMaximumHeight(100)
         self.visible_constraint_rows_widget = QWidget()
@@ -2258,48 +2258,31 @@ class MainWindow(QMainWindow):
         return group
 
     def _add_turn_range_pair(self, layout: QHBoxLayout, add_btn: Optional[QPushButton] = None):
-        """添加一组巡目范围输入框（最小-最大），默认留空，留空时用上方滑块"""
-        min_edit = QLineEdit()
-        min_edit.setPlaceholderText("最小")
-        min_edit.setAlignment(Qt.AlignCenter)
-        min_edit.setFixedWidth(36)
-        min_edit.setMaxLength(2)
-        min_edit.setValidator(_turn_range_validator())
-        max_edit = QLineEdit()
-        max_edit.setPlaceholderText("最大")
-        max_edit.setAlignment(Qt.AlignCenter)
-        max_edit.setFixedWidth(36)
-        max_edit.setMaxLength(2)
-        max_edit.setValidator(_turn_range_validator())
-        sep = QLabel("-")
-        sep.setStyleSheet("color: #8b949e; font-size: 11px;")
+        """添加一个巡目范围输入框，支持 1-12 格式，默认留空时用上方滑块"""
+        edit = QLineEdit()
+        edit.setPlaceholderText("1-12")
+        edit.setFixedWidth(56)
+        edit.setMaxLength(6)
+        edit.setToolTip("输入 最小-最大，如 1-6、4-9")
         if add_btn is not None:
             idx = layout.indexOf(add_btn)
-            layout.insertWidget(idx, min_edit)
-            layout.insertWidget(idx + 1, sep)
-            layout.insertWidget(idx + 2, max_edit)
+            layout.insertWidget(idx, edit)
         else:
-            layout.addWidget(min_edit)
-            layout.addWidget(sep)
-            layout.addWidget(max_edit)
-        self._turn_range_pairs.append((min_edit, max_edit))
+            layout.addWidget(edit)
+        self._turn_range_edits.append(edit)
 
     def _get_turn_ranges_from_ui(self) -> List[Tuple[int, int]]:
-        """从巡目范围输入框读取有效范围列表（去重保留顺序）。留空则跳过该组，全部留空时由滑块决定"""
+        """从巡目范围输入框读取有效范围列表（去重保留顺序）。留空则跳过，全部留空时由滑块决定"""
         seen = set()
         turn_ranges = []
-        for min_edit, max_edit in self._turn_range_pairs:
-            ms, mx = min_edit.text().strip(), max_edit.text().strip()
-            if not ms or not mx:
+        for edit in self._turn_range_edits:
+            line = edit.text().strip()
+            if not line:
                 continue
-            try:
-                a, b = int(ms), int(mx)
-            except ValueError:
-                continue
-            a, b = max(1, min(18, a)), max(1, min(18, b))
-            if a <= b and (a, b) not in seen:
-                seen.add((a, b))
-                turn_ranges.append((a, b))
+            tr = _parse_turn_range(line)
+            if tr and tr not in seen:
+                seen.add(tr)
+                turn_ranges.append(tr)
         return turn_ranges
 
     def _add_pattern_row(self):
@@ -2317,8 +2300,9 @@ class MainWindow(QMainWindow):
         target_help_btn.setToolTip("目标牌说明")
         target_help_btn.setFixedWidth(24)
         target_help_btn.clicked.connect(self._show_target_help)
-        del_btn = QPushButton("删除")
-        del_btn.setMaximumWidth(50)
+        del_btn = QPushButton("×")
+        del_btn.setFixedWidth(28)
+        del_btn.setToolTip("删除此行")
         row.addWidget(QLabel("模式:"))
         row.addWidget(pattern_edit, 1)
         row.addWidget(arrow_label)

@@ -164,6 +164,18 @@ def parse_call_area_constraint(s: str) -> Optional[Tuple[str, Optional[List[str]
     return None
 
 
+def player_could_satisfy_any_call_area_constraints(
+    player_state, oya: int, constraint_sets: List[List[str]]
+) -> bool:
+    """检查该玩家是否可能满足任一 constraint set（用于等价变体预过滤）"""
+    if not constraint_sets:
+        return True
+    return any(
+        player_could_satisfy_call_area_constraints(player_state, oya, cs)
+        for cs in constraint_sets
+    )
+
+
 def player_could_satisfy_call_area_constraints(player_state, oya: int, constraints: List[str]) -> bool:
     """
     粗略检查该玩家是否可能满足 call_area_constraints（不按巡目过滤）。
@@ -222,12 +234,14 @@ def round_could_satisfy_call_constraints(
     call_constraint: Optional[str],
     call_area_constraints: Optional[List[str]],
     oya: int,
+    call_area_constraint_sets: Optional[List[List[str]]] = None,
 ) -> bool:
     """
     局级预过滤：call_constraint 与 call_area_constraints 是否有任何玩家可能满足。
     - call_constraint "has_call": 至少一人有副露
     - call_constraint "no_call": 至少一人无副露
-    - call_area_constraints: 至少一人可能满足（总量足够，不按巡目）
+    - call_area_constraints: 单组约束，至少一人可能满足
+    - call_area_constraint_sets: 多组约束（等价变体），至少一人可能满足任一组
     """
     if call_constraint and call_constraint != "any":
         any_has_call = any(
@@ -239,7 +253,13 @@ def round_could_satisfy_call_constraints(
             len(getattr(p, "calls", []) or []) > 0 for p in round_players
         ):
             return False
-    if call_area_constraints:
+    if call_area_constraint_sets:
+        if not any(
+            player_could_satisfy_call_area_constraints(p, oya, cs)
+            for p in round_players for cs in call_area_constraint_sets
+        ):
+            return False
+    elif call_area_constraints:
         if not any(
             player_could_satisfy_call_area_constraints(p, oya, call_area_constraints)
             for p in round_players
@@ -1196,6 +1216,7 @@ def generate_equivalent_variants(
     target_tile: str,
     visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
     prior_discard_exclusion: Optional[str] = None,
+    call_area_constraints: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
@@ -1230,13 +1251,14 @@ def generate_equivalent_variants(
     if has_riichi and (has_chi or has_pon):
         raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
 
-    # 纯字牌模式
+    # 纯字牌模式（无花色映射，副露区域约束原样传入）
     if not has_number:
         honor_variants = _expand_pure_honor_pattern(parsed_pattern)
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
+        call_area = list(call_area_constraints) if call_area_constraints else None
         return [
-            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior}
+            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "call_area_constraints": call_area}
             for p in honor_variants
         ]
 
@@ -1253,12 +1275,14 @@ def generate_equivalent_variants(
         target_new = target_new[0] if len(target_new) == 1 else target_new
         visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
         prior_mapped = _apply_suit_mapping_to_string(prior_discard_exclusion.strip(), mapping) if prior_discard_exclusion else None
+        call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in call_area_constraints] if call_area_constraints else None
         variants.append({
             "discard": discard_new,
             "target": target_new,
             "visible_constraints": visible_new,
             "is_combo": is_combo,
             "prior_discard_exclusion": prior_mapped,
+            "call_area_constraints": call_area_new,
         })
     return variants
 
