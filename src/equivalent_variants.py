@@ -709,13 +709,21 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
         return (s, False)
     if s in RED_FIVES:
         return (s, False)
-    # r 后缀：立直宣言牌（该牌为打出时宣告立直，必为摸切；与 c/p 不可同时出现）
+    # r 后缀：立直宣言牌（该牌为打出时宣告立直；与 c/p 不可同时出现）
     if s.endswith("r") and len(s) >= 2:
+        is_tsumo = False # 默认为手切立直 (r)
         base = s[:-1]
+        if base.endswith("t"):
+            is_tsumo = True # 摸切立直 (tr)
+            base = base[:-1]
+        elif base.endswith("f"):
+            is_tsumo = None # 手摸皆可立直 (fr)
+            base = base[:-1]
+            
         if base in RED_FIVES or (len(base) >= 2 and base[-1] in "mps" and (base[0].isdigit() or base in RED_FIVES)):
-            return (f"{CALL_PREFIX}r:{base}", True)  # 立直宣言牌必为摸切
+            return (f"{CALL_PREFIX}r:{base}", is_tsumo)
         if base in HONOR_PLACEHOLDERS:
-            return (f"{CALL_PREFIX}r:{base}", True)
+            return (f"{CALL_PREFIX}r:{base}", is_tsumo)
     if s.endswith("f") and len(s) >= 2:
         base = s[:-1]
         if base in HONOR_PLACEHOLDERS or base in SUIT_WILDCARDS:
@@ -1479,13 +1487,16 @@ def _match_pattern_at_end(
         tile_str, is_tsumogiri = full_discards[d_idx]
         pat_tile, pat_want_tsumogiri = pattern[p_idx]
 
-        # 立直宣言牌 @r:：消耗一张舍牌，须为摸切且该舍牌为立直宣言
+        # 立直宣言牌 @r:：消耗一张舍牌，该舍牌须为立直宣言
         if pat_tile.startswith("@r:"):
             want_tile = pat_tile[3:]
             riichi_flags = ctx.get("discard_riichi_flags") or []
             if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
                 return False
-            if tile_str != want_tile or not is_tsumogiri:
+            if tile_str != want_tile:
+                return False
+            # 摸切要求须一致（pat_want_tsumogiri 为 None 时手摸切皆可）
+            if pat_want_tsumogiri is not None and is_tsumogiri != pat_want_tsumogiri:
                 return False
             consumed_any_discard = True
             if out_position_to_tile is not None:

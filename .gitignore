@@ -48,6 +48,9 @@ htmlcov/
 *.cover
 .hypothesis/
 
+# Local config (database path etc.)
+config.ini
+
 # Database
 *.db
 *.sqlite

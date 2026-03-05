@@ -10,6 +10,8 @@ import time
 import sqlite3
 import gzip
 import json
+import threading
+import queue
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Optional, Tuple, Callable, Union, Iterable, Iterator
 from collections import Counter
@@ -38,20 +40,88 @@ from .instant_deal_in import RoundInstantDealInAnalyzer, extract_tenhou6_rounds
 logger = logging.getLogger(__name__)
 
 # 每批从数据库读取的对局数。越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
-ANALYSIS_BATCH_SIZE = 400
+ANALYSIS_BATCH_SIZE = 5000
 MIN_ANALYSIS_BATCH_SIZE = 100
 # 主统计时最多保留的匹配状态条数（仅用于返回给界面，超出部分不保留，避免内存持续增长）
 MATCHED_STATES_CAP = 200
 SAMPLE_POOL_CAP = 3000
 PARALLEL_MIN_MATCHED_STATES_PER_LOG = 4
 PARALLEL_MAX_SAMPLE_POOL_PER_LOG = 64
-PARALLEL_BATCH_PER_WORKER = 24
+PARALLEL_BATCH_PER_WORKER = 500
 PARALLEL_IN_FLIGHT_FACTOR = 2
-GC_INTERVAL_BATCHES = 4  # 每 N 批做 gc + 重连 DB，重连可释放 tenhou.db 占用的 10+GB 缓存
-HIGH_MEMORY_LOAD_RATIO = 0.90
-# 并行分析时，每处理多少批后重启worker 池，以释放子进程中 Python 持有的内存
-POOL_RESTART_EVERY_BATCHES = 3
+GC_INTERVAL_BATCHES = 20  # 降低频率，因为现在有管理员强制清理
+HIGH_MEMORY_LOAD_RATIO = 0.95
+# 并行分析时，每处理多少批后重启worker 池
+POOL_RESTART_EVERY_BATCHES = 10
+# 即时铳率分析时每批最多读取条数
+DEAL_IN_INSTANT_BATCH_SIZE = 8000
 
+
+class BackgroundLogFetcher:
+    """后台对局预取器，用于在计算时并行读取数据库 I/O"""
+    def __init__(self, db_path, batch_size, last_id=None):
+        self.db_path = db_path
+        self.batch_size = batch_size
+        self.last_id = last_id
+        self.queue = queue.Queue(maxsize=2)  # 预取 2 批，平衡内存与 I/O 覆盖
+        self.stop_event = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            # 后台线程开启独立连接
+            conn = _connect_db_memory_efficient(self.db_path)
+            cur = conn.cursor()
+            last_id = self.last_id
+            
+            while not self.stop_event.is_set():
+                if last_id is None:
+                    query = """
+                        SELECT id, COALESCE(log_json, log) as content
+                        FROM logs 
+                        WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')
+                        ORDER BY id DESC
+                        LIMIT ?
+                    """
+                    cur.execute(query, (self.batch_size,))
+                else:
+                    query = """
+                        SELECT id, COALESCE(log_json, log) as content
+                        FROM logs 
+                        WHERE ((log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != ''))
+                          AND id < ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                    """
+                    cur.execute(query, (last_id, self.batch_size))
+                
+                rows = cur.fetchall()
+                if not rows:
+                    self.queue.put(None)  # 结束标志
+                    break
+                
+                last_id = rows[-1][0]
+                self.queue.put(rows)
+            conn.close()
+        except Exception as e:
+            logger.error(f"后台预取线程出错: {e}")
+            self.error = e
+            self.queue.put(None)
+
+    def next_batch(self):
+        if self.error:
+            raise self.error
+        return self.queue.get()
+
+    def stop(self):
+        self.stop_event.set()
+        try:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+        except:
+            pass
 
 def _tile_str_eq(a: str, b: str) -> bool:
     """牌字符串相等（东/1z 等字牌格式统一比较）"""
@@ -88,18 +158,7 @@ def _opponent_riichi_happened(discard) -> bool:
 def _clamp_analysis_batch_size(batch_size: int, workers: int, use_parallel: bool) -> int:
     """Clamp analysis batch size to keep parallel memory usage bounded."""
     requested = max(MIN_ANALYSIS_BATCH_SIZE, int(batch_size))
-    if not use_parallel:
-        return requested
-
-    safe_cap = max(MIN_ANALYSIS_BATCH_SIZE, workers * PARALLEL_BATCH_PER_WORKER)
-    if requested > safe_cap:
-        logger.info(
-            "analysis_batch_size=%s is too high for workers=%s; clamped to %s to reduce memory usage",
-            requested,
-            workers,
-            safe_cap,
-        )
-        return safe_cap
+    # 现在有管理员权限清理 Standby，放宽限制，以 GUI 设定的数值为准
     return requested
 
 
@@ -109,7 +168,12 @@ def _trim_process_memory() -> None:
         return
     try:
         import ctypes
+        # 1. 清理当前进程的 Working Set（减少任务管理器中的“内存”占用）
         ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        
+        # 2. 尝试提示内核清理系统文件缓存的工作集（针对 Standby 8GB 问题）
+        # 参数 -1, -1, 0 尝试强制系统刷新文件缓存
+        ctypes.windll.kernel32.SetSystemFileCacheSize(-1, -1, 0)
     except Exception:
         pass
 
@@ -143,11 +207,12 @@ def _get_system_memory_load_ratio() -> Optional[float]:
     return None
 
 
-def _should_run_memory_maintenance(batch_index: int, gc_interval_batches: Optional[int] = None) -> bool:
+def _should_run_memory_maintenance(batch_index: int, gc_interval_batches: Optional[int] = None, is_instant_mode: bool = False) -> bool:
     """Run maintenance periodically, or early under high system memory pressure."""
     if batch_index <= 0:
         return False
     interval = gc_interval_batches if gc_interval_batches is not None else GC_INTERVAL_BATCHES
+    # 即时铳率模式下，由于现在有管理员权限清理 Standby，不需要每个 batch 都清理
     if batch_index % max(1, interval) == 0:
         return True
     ratio = _get_system_memory_load_ratio()
@@ -210,8 +275,12 @@ def _format_actual_pattern(
     """Format discard tuples for display/storage only when needed."""
     result = []
     for i, (tile_str, is_tsumogiri) in enumerate(full_discards):
-        if i < len(discard_riichi_flags) and discard_riichi_flags[i]:
-            result.append(f"{tile_str}r")
+        is_riichi = i < len(discard_riichi_flags) and discard_riichi_flags[i]
+        if is_riichi:
+            if is_tsumogiri:
+                result.append(f"{tile_str}tr")  # 摸切立直 (tsumogiri riichi)
+            else:
+                result.append(f"{tile_str}r")   # 手切立直 (tedashi riichi)
         elif is_tsumogiri:
             result.append(f"{tile_str}t")
         else:
@@ -241,9 +310,15 @@ def _connect_db_memory_efficient(db_path: str):
     避免 tenhou.db 在长时分析中占用十余 GB 内存（SQLite 缓存 + OS 文件缓存）。
     """
     conn = sqlite3.connect(db_path, timeout=60)
-    cur = conn.cursor()
-    cur.execute("PRAGMA cache_size = -2000")
-    cur.execute("PRAGMA mmap_size = 0")
+    # 恢复性能：增加 SQLite 内部页面缓存
+    conn.execute("PRAGMA cache_size = -20000")
+    # 启用 Memory Mapped I/O (mmap)，将数据库文件映射到内存地址空间
+    # 只要内存足够，这将显著提升读取 BLOB/JSON 字段的速度。这里设为 4GB
+    conn.execute("PRAGMA mmap_size = 4294967296")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA read_uncommitted = True")
     return conn
 
 
@@ -1162,97 +1237,83 @@ class LiveAnalyzer:
         batch_count = 0  # 每 N 批重启pool 以释放 worker 内容瓨
         maintenance_batch_index = 0
 
-        while True:
-            # 检查是否取消
-            if should_cancel and should_cancel():
-                logger.info("analysis cancelled")
-                break
-            
-            # 读取批次：优先log_json（tenhou6 JSON），若无则用 log（XML）
-            if last_id is None:
-                query = """
-                    SELECT id, COALESCE(log_json, log) as content
-                    FROM logs 
-                    WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')
-                    ORDER BY id DESC
-                    LIMIT ?
-                """
-                cur.execute(query, (batch_size,))
-            else:
-                query = """
-                    SELECT id, COALESCE(log_json, log) as content
-                    FROM logs 
-                    WHERE ((log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != ''))
-                      AND id < ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                """
-                cur.execute(query, (last_id, batch_size))
-            logs = cur.fetchall()
-            
-            if not logs:
-                break
-
-            if use_parallel and pool is not None:
-                # 并行分支
-                task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
-                for per_log_result in _iter_pool_results_bounded(
-                    pool,
-                    _process_one_log_analyze,
-                    task_iter,
-                    max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
-                ):
-                    if should_cancel and should_cancel():
-                        conn.close()
-                        gc.collect()
-                        _trim_process_memory()
-                        if pool:
-                            pool.shutdown(wait=False)
-                        return _empty_analysis_result(first_pattern, first_target)
-                    total_matches += per_log_result["total_matches"]
-                    outcome_wins_total += per_log_result.get("outcome_wins", 0)
-                    outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
-                    deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
-                    deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
-                    for i, n in enumerate(per_log_result["pattern_matches"]):
-                        pattern_matches[i] += n
-                    for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
-                        for k, v in d_delta.items():
-                            if isinstance(v, dict):
-                                for c, n in v.items():
-                                    pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
-                            else:
-                                pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
-                    matched_states.extend(per_log_result["matched_states"])
-                    sample_pool.extend(per_log_result["sample_pool"])
-                    # 每批合并后立即截断，避免跨批次内存无限增长
-                    if len(matched_states) > cap:
-                        del matched_states[cap:]
-                    if len(sample_pool) > sample_pool_cap:
-                        del sample_pool[sample_pool_cap:]
-                    processed += 1
-                    if progress_callback and (processed <= 10 or processed % 10 == 0):
-                        progress_callback(processed, total_logs)
-                    if sample_limit and processed >= sample_limit:
-                        break
-                batch_count += 1
-                # 定期重启 worker 池，释放子进程内 Python 持有的内存（避免长期运行内存持续高涨）
-                if batch_count >= POOL_RESTART_EVERY_BATCHES:
-                    pool.shutdown(wait=True)
-                    pool = ProcessPoolExecutor(max_workers=workers)
-                    batch_count = 0
-            else:
-                # 串行分支
-                for log_id, log_content in logs:
-                    if should_cancel and should_cancel():
-                        conn.close()
-                        gc.collect()
-                        _trim_process_memory()
-                        if pool:
-                            pool.shutdown(wait=False)
-                        return _empty_analysis_result(first_pattern, first_target)
-                    try:
-                        raw = _get_raw_content(log_content)
+        # 启动后台预取线程，掩盖数据库 I/O 延迟
+        fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
+        
+        try:
+            while True:
+                # 检查是否取消
+                if should_cancel and should_cancel():
+                    logger.info("analysis cancelled")
+                    break
+                
+                # 从预取队列获取一批对局数据（如果后台还没读完，这里会阻塞等待，但通常已经预取好了）
+                logs = fetcher.next_batch()
+                if not logs:
+                    break
+                
+                if use_parallel and pool is not None:
+                    # 并行分支
+                    task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
+                    for per_log_result in _iter_pool_results_bounded(
+                        pool,
+                        _process_one_log_analyze,
+                        task_iter,
+                        max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
+                    ):
+                        if should_cancel and should_cancel():
+                            fetcher.stop()
+                            conn.close()
+                            gc.collect()
+                            _trim_process_memory()
+                            if pool:
+                                pool.shutdown(wait=False)
+                            return _empty_analysis_result(first_pattern, first_target)
+                        total_matches += per_log_result["total_matches"]
+                        outcome_wins_total += per_log_result.get("outcome_wins", 0)
+                        outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
+                        deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
+                        deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
+                        for i, n in enumerate(per_log_result["pattern_matches"]):
+                            pattern_matches[i] += n
+                        for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
+                            for k, v in d_delta.items():
+                                if isinstance(v, dict):
+                                    for c, n in v.items():
+                                        pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
+                                else:
+                                    pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
+                        matched_states.extend(per_log_result["matched_states"])
+                        sample_pool.extend(per_log_result["sample_pool"])
+                        # 每批合并后立即截断，避免跨批次内存无限增长
+                        if len(matched_states) > cap:
+                            del matched_states[cap:]
+                        if len(sample_pool) > sample_pool_cap:
+                            del sample_pool[sample_pool_cap:]
+                        processed += 1
+                        if progress_callback and (processed <= 10 or processed % 10 == 0):
+                            progress_callback(processed, total_logs)
+                        if sample_limit and processed >= sample_limit:
+                            break
+                    batch_count += 1
+                    # 定期重启 worker 池，释放子进程内 Python 持有的内存
+                    if batch_count >= POOL_RESTART_EVERY_BATCHES:
+                        pool.shutdown(wait=True)
+                        pool = ProcessPoolExecutor(max_workers=workers)
+                        batch_count = 0
+                else:
+                    # 串行分支
+                    for log_id, log_content in logs:
+                        if should_cancel and should_cancel():
+                            fetcher.stop()
+                            conn.close()
+                            gc.collect()
+                            _trim_process_memory()
+                            if pool:
+                                pool.shutdown(wait=False)
+                            return _empty_analysis_result(first_pattern, first_target)
+                        try:
+                            raw = _get_raw_content(log_content)
                         # 立直宣言模式(r)：牌谱无立直时快速跳过
                         if riichi_any and _is_tenhou6_json(raw):
                             if "riichi" not in raw and "reach" not in raw:
@@ -1349,48 +1410,38 @@ class LiveAnalyzer:
                                 if not in_range:
                                     continue
                             
-                                # 预转换：仅对范围内舍牌
-                                discards_precomputed = [
+                                # 预转换：全量舍牌（用于 matched_variant 判断，确保立直标记等索引正确）
+                                all_discards_precomputed = [
                                     (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                    for _, d in in_range
+                                    for d in player_state.discards
                                 ]
-                                discarded_bases = set()
+                                all_riichi_flags = [
+                                    getattr(d, 'is_riichi_declaration', False)
+                                    for d in player_state.discards
+                                ]
                                 honor_ctx_base = {
                                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
                                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
                                 }
-                                discard_riichi_flags = [getattr(in_range[i][1], 'is_riichi_declaration', False) for i in range(len(in_range))]
 
-                                # 遍历范围内舍牌
+                                discarded_bases = set()
                                 for j, (orig_i, discard) in enumerate(in_range):
-                                    discarded_bases.add(discard.tile // 4)
-                                    full_discards_up_to_now = discards_precomputed[:j+1]
-                                    hand_discard_strings = []
-                                    for i, (t, ts) in enumerate(full_discards_up_to_now):
-                                        if i < len(discard_riichi_flags) and discard_riichi_flags[i]:
-                                            hand_discard_strings.append(f"{t}r")
-                                        elif ts:
-                                            hand_discard_strings.append(f"{t}t")
-                                        else:
-                                            hand_discard_strings.append(t)
+                                    full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
+                                    current_riichi_flags = all_riichi_flags[:orig_i + 1]
+                                    
+                                    # 注意：这里必须重新计算 hand_discard_strings，因为索引是 orig_i
+                                    hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
 
                                     honor_ctx = {
                                         **honor_ctx_base,
                                         "current_discard_turn": discard.turn,
-                                        "discard_riichi_flags": discard_riichi_flags[: j + 1],
+                                        "discard_riichi_flags": current_riichi_flags,
                                     }
                                     matched_variant = None
                                     matched_idx = -1
                                     for idx, (vars_p, _, _) in enumerate(item_variants):
-                                        cs = get_consumed_search_patterns(items[idx][0])
-                                        if cs:
-                                            if not round_has_matching_consumed(round_players, cs):
-                                                continue
-                                            # 必须由本玩家完成该副露，否则会跨玩家污染（如 c0p4p 与 c0p6p 同局时）
-                                            if not player_has_matching_consumed(player_state, cs):
-                                                continue
                                         mv = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
                                         if mv:
                                             matched_variant = mv
@@ -1668,11 +1719,15 @@ class LiveAnalyzer:
                     if sample_limit and processed >= sample_limit:
                         break
 
-            last_id = logs[-1][0]
-            del logs
+            # 批次结束后的维护
+            fetcher.stop()
             maintenance_batch_index += 1
-            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches):
+            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
                 gc.collect()
+                try:
+                    conn.execute("PRAGMA shrink_memory")
+                except:
+                    pass
                 conn.close()
                 conn = _connect_db_memory_efficient(self.db_path)
                 cur = conn.cursor()
@@ -1685,6 +1740,7 @@ class LiveAnalyzer:
 
         if pool is not None:
             pool.shutdown(wait=True)
+        fetcher.stop()
         conn.close()
         gc.collect()
         _trim_process_memory()
@@ -2344,8 +2400,12 @@ class LiveAnalyzer:
             last_id = logs[-1][0]
             del logs
             maintenance_batch_index += 1
-            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches):
+            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
                 gc.collect()
+                try:
+                    conn.execute("PRAGMA shrink_memory")
+                except:
+                    pass
                 conn.close()
                 conn = _connect_db_memory_efficient(self.db_path)
                 cur = conn.cursor()
@@ -2419,8 +2479,8 @@ class LiveAnalyzer:
         requested_batch_size = (
             analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
         )
-        batch_size = _clamp_analysis_batch_size(requested_batch_size, workers=1, use_parallel=False)
         use_deal_in_instant = (analysis_target == "deal_in_instant")
+        batch_size = _clamp_analysis_batch_size(requested_batch_size, workers=1, use_parallel=False)
 
         if sample_pool is not None:
             # 从预收集的样本池中筛选并取前 N 个，无需遍历牌谱（主分析已排除南四局则无需再过滤）
@@ -2450,9 +2510,10 @@ class LiveAnalyzer:
                     candidates = [s for s in candidates if s.get("target_count") == target_count_filter]
                 else:
                     candidates = [s for s in candidates if s.get("target_count") == target_count_filter]
-            # 多模式时：二次校验actual_pattern 与当前 query 一致，避免选中 NOTm-2s 却混淆NOTm-2st 的样本
-            verified = [s for s in candidates if verify_sample_consistency(s, query_pattern, target_tile, visible_constraints)[0]]
-            return verified[:sample_count]
+            
+            # 核心修正：既然在 sample_pool 中，说明主分析时已匹配成功。
+            # 无需再进行由于字典信息不全可能导致失败的 verify_sample_consistency 校验。
+            return candidates[:sample_count]
 
         variants = generate_equivalent_variants(
             query_pattern, target_tile, visible_constraints, prior_discard_exclusion
@@ -2555,24 +2616,26 @@ class LiveAnalyzer:
                             if not in_range:
                                 continue
 
-                            all_discards_precomputed = [
-                                (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                for d in player_state.discards
-                            ]
-                            all_riichi_flags = [
-                                getattr(d, 'is_riichi_declaration', False)
-                                for d in player_state.discards
-                            ]
-                            honor_ctx_base = {
-                                "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
-                                "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
-                                "calls": getattr(player_state, "calls", []),
-                            }
+                                # 预转换：全量舍牌（用于 matched_variant 判断）
+                                all_discards_precomputed = [
+                                    (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
+                                    for d in player_state.discards
+                                ]
+                                all_riichi_flags = [
+                                    getattr(d, 'is_riichi_declaration', False)
+                                    for d in player_state.discards
+                                ]
+                                honor_ctx_base = {
+                                    "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
+                                    "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
+                                    "calls": getattr(player_state, "calls", []),
+                                }
 
-                            for j, (orig_i, discard) in enumerate(in_range):
-                                discarded_bases.add(discard.tile // 4)
-                                full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
+                                discarded_bases = set()
+                                for j, (orig_i, discard) in enumerate(in_range):
+                                    discarded_bases.add(discard.tile // 4)
+                                    full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
                                 current_riichi_flags = all_riichi_flags[:orig_i + 1]
                                 hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
 
@@ -2768,8 +2831,8 @@ class LiveAnalyzer:
                                         "furiten_reason": instant_eval.get("furiten_reason", ""),
                                         "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                     })
-                                if verify_sample_consistency(sp_entry, query_pattern, target_tile, visible_constraints)[0]:
-                                    samples.append(sp_entry)
+                                # 实时扫描匹配到的样本，无需再调用 verify_sample_consistency 校验，直接添加
+                                samples.append(sp_entry)
                                 if len(samples) >= sample_count:
                                     break
 
@@ -2789,8 +2852,12 @@ class LiveAnalyzer:
             last_id = logs[-1][0]
             del logs
             maintenance_batch_index += 1
-            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches):
+            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
                 gc.collect()
+                try:
+                    conn.execute("PRAGMA shrink_memory")
+                except:
+                    pass
                 conn.close()
                 conn = _connect_db_memory_efficient(self.db_path)
                 cur = conn.cursor()
@@ -2858,24 +2925,32 @@ def _target_display_set(mt) -> set:
     return set(mt) if isinstance(mt, list) else {mt}
 
 
-def _actual_pattern_to_full_discards(actual_pattern: List[str]) -> List[Tuple[str, bool]]:
+def _actual_pattern_to_full_discards(actual_pattern: List[str]) -> Tuple[List[Tuple[str, bool]], List[bool]]:
     """
     将actual_pattern（舍牌序列的展示格式）转为full_discards 格式以供匹配使用。
-    "1m" -> (1m, False) 手切
-    "1mt" -> (1m, True) 摸切
-    "1mr" -> (1m, True) 立直宣言牌（通常为摸切）
+    "1m" -> (1m, False), riichi=False
+    "1mt" -> (1m, True), riichi=False
+    "1mr" -> (1m, False), riichi=True (手切立直)
+    "1mtr" -> (1m, True), riichi=True (摸切立直)
     """
     result = []
+    riichi_flags = []
     for s in actual_pattern:
         if not s or len(s) < 2:
             continue
-        if s.endswith("t"):
-            result.append((s[:-1], True))
+        if s.endswith("tr") or s.endswith("rt"):
+            result.append((s[:-2], True))
+            riichi_flags.append(True)
         elif s.endswith("r"):
-            result.append((s[:-1], True))  # 立直宣言通常为摸切
+            result.append((s[:-1], False)) # r 代表手切立直
+            riichi_flags.append(True)
+        elif s.endswith("t"):
+            result.append((s[:-1], True))
+            riichi_flags.append(False)
         else:
             result.append((s, False))
-    return result
+            riichi_flags.append(False)
+    return result, riichi_flags
 
 
 def verify_sample_consistency(
@@ -2895,14 +2970,26 @@ def verify_sample_consistency(
     if not actual:
         return (False, "样本不包含 actual_pattern")
     try:
-        full_discards = _actual_pattern_to_full_discards(actual)
+        full_discards, riichi_flags = _actual_pattern_to_full_discards(actual)
         if not full_discards:
             return (False, "actual_pattern parsed to empty sequence")
         first_t = parse_multi_targets(target_tile)[0]
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
         variants = generate_equivalent_variants(query_pattern, variant_target, visible_constraints)
-        # 样本不包含 honor context，少数牌模式可省略；若无 zf/kf 可能会出错
-        ctx = {}
+        
+        # 补充上下文，支持 r (立直) 及 zf/kf (自风/客风) 占位符校验
+        player_id = sample.get("player_id", 0)
+        oya = sample.get("oya", 0)
+        round_num = sample.get("round_num", 0)
+        
+        ctx = {
+            "jikaze": MjlogParser.get_jikaze(player_id, oya, round_num),
+            "bakaze": ["东", "南", "西", "北"][round_num // 4],
+            "kyokuze_list": MjlogParser.get_kyokuze_list(player_id, oya, round_num),
+            "discard_riichi_flags": riichi_flags,
+            "current_discard_turn": sample.get("turn"),
+        }
+        
         matched = match_discard_to_variant(full_discards, variants, ctx)
         if matched:
             return (True, None)

@@ -14,7 +14,7 @@
 |--------|------|
 | **无图形界面** | 无法启动 PyQt5 GUI（`run.py` / `gui_app`）。优先使用 CLI 脚本、批处理脚本，或 headless 模式。 |
 | **路径风格** | 云 VM 通常为 Linux：使用 `/`，工作目录可能为 `/workspace` 或项目根。避免依赖 `C:` 等 Windows 路径。 |
-| **数据与配置** | `data/tenhou.db`、`config.ini` 需确保存在且可写。数据可来自挂载或克隆，配置需从 `config.example.ini` 复制并填写。 |
+| **数据与配置** | 数据库路径由 `config.ini` 的 `[Database] path` 指定（默认可为项目外，如 `E:\Cursor\Tenhou data\data\tenhou.db`）。配置需从 `config.example.ini` 复制并填写。 |
 | **外部工具** | `houou-logs` 需在 PATH 或项目内可执行；`tenhou-paifu-to-json` 需可用。云 VM 上需事先安装或拉取。 |
 | **适合任务** | 批量处理（`process_all_logs*.py`）、转换（`convert_xml_to_tenhou6.py`）、数据库操作、分析逻辑开发、单元测试。 |
 | **不适合任务** | 直接运行 `run.py` 启动 GUI、依赖本地显示/桌面的操作。 |
@@ -26,32 +26,32 @@
 ### 1.1 顶层入口与三大功能
 
 ```
-                         run.py / gui_app（入口）
-                                    │
-          ┌─────────────────────────┼─────────────────────────┐
-          ▼                         ▼                         ▼
-   ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-   │DataDownloader│          │ LiveAnalyzer │          │tile_illustration│
-   │ 牌谱下载     │          │ 实时分析查询  │          │ 舍牌示意图    │
-   └──────────────┘          └──────────────┘          └──────────────┘
+ run.py / gui_app（入口）
+ │
+ ┌─────────────────────────┼─────────────────────────┐
+ ▼ ▼ ▼
+ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+ │DataDownloader│ │ LiveAnalyzer │ │tile_illustration│
+ │ 牌谱下载 │ │ 实时分析查询 │ │ 舍牌示意图 │
+ └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
 ### 1.2 牌谱下载与入库流程
 
 ```
-   DataDownloader
-         │ 调用 houou-logs（外部子进程）
-         ▼
-   ┌─────────────┐     fetch：获取 log ID     ┌─────────────┐
-   │ houou-logs  │ ──────────────────────────►│  logs 表    │
-   │ (外部工具)   │     download：下载 mjlog   │  (log GZIP)  │
-   └─────────────┘ ◄─────────────────────────┘ └──────┬──────┘
-         │ 调用 convert_xml_to_tenhou6                  │ 读 log 列
-         ▼                                              ▼
-   tenhou6_adapter.xml_to_tenhou6_json()      tenhou-paifu-to-json
-          │ 写入 log_json 列                        (XML→JSON)
-          ▼
-   logs 表（含 log_json）  ◄── 牌谱 tenhou6 JSON 就绪
+ DataDownloader
+ │ 调用 houou-logs（外部子进程）
+ ▼
+ ┌─────────────┐ fetch：获取 log ID ┌─────────────┐
+ │ houou-logs │ ──────────────────────────►│ logs 表 │
+ │ (外部工具) │ download：下载 mjlog │ (log GZIP) │
+ └─────────────┘ ◄─────────────────────────┘ └──────┬──────┘
+ │ 调用 convert_xml_to_tenhou6 │ 读 log 列
+ ▼ ▼
+ tenhou6_adapter.xml_to_tenhou6_json() tenhou-paifu-to-json
+ │ 写入 log_json 列 (XML→JSON)
+ ▼
+ logs 表（含 log_json） ◄── 牌谱 tenhou6 JSON 就绪
 ```
 
 简记：houou-logs(fetch→download) → logs.log(GZIP) → convert_xml_to_tenhou6 → tenhou6_adapter.xml_to_tenhou6_json → logs.log_json
@@ -59,37 +59,37 @@
 ### 1.3 实时分析与查询流程（LiveAnalyzer）
 
 ```
-   LiveAnalyzer.analyze(舍牌模式, 目标牌)
-         │
-         ├── 1. equivalent_variants.generate_equivalent_variants()  生成等价变体
-         ├── 2. 从 database 读 logs 表 log_json
-         ├── 3. tenhou6_adapter.parse_tenhou6_json()  → GameState 列表
-         ├── 4. 逐巡：equivalent_variants.match_discard_to_variant() 匹配
-         ├── 5. tenpai_utils.is_tenpai()  听牌判断
-         ├── 6. instant_deal_in.RoundInstantDealInAnalyzer()（analysis_target="deal_in_instant" 时）
-         └── 7. 写入 game_states / visible_tile_stats，返回概率
-         │
-         ▼
-   database (tenhou.db): logs | game_states | visible_tile_stats
+ LiveAnalyzer.analyze(舍牌模式, 目标牌)
+ │
+ ├── 1. equivalent_variants.generate_equivalent_variants() 生成等价变体
+ ├── 2. 从 database 读 logs 表 log_json
+ ├── 3. tenhou6_adapter.parse_tenhou6_json() → GameState 列表
+ ├── 4. 逐巡：equivalent_variants.match_discard_to_variant() 匹配
+ ├── 5. tenpai_utils.is_tenpai() 听牌判断
+ ├── 6. instant_deal_in.RoundInstantDealInAnalyzer()（analysis_target="deal_in_instant" 时）
+ └── 7. 写入 game_states / visible_tile_stats，返回概率
+ │
+ ▼
+ database (tenhou.db): logs | game_states | visible_tile_stats
 ```
 
 ### 1.4 舍牌示意图（tile_illustration）
 
 ```
-   tile_illustration.render_illustration_to_qimage()
-         └── equivalent_variants.split_discard_pattern()  拆分模式
+ tile_illustration.render_illustration_to_qimage()
+ └── equivalent_variants.split_discard_pattern() 拆分模式
 ```
 
 ### 1.5 底层模块依赖
 
 ```
-   mjlog_parser（GameState, Discard, CallInfo, TileUtils）
-         ▲
-         │ 被以下模块使用
-   ┌─────┴─────┬──────────────┬──────────────┐
-   │ tenhou6_   │ equivalent_  │ database     │
-   │ adapter    │ variants     │              │
-   └────────────┴──────────────┴──────────────┘
+ mjlog_parser（GameState, Discard, CallInfo, TileUtils）
+ ▲
+ │ 被以下模块使用
+ ┌─────┴─────┬──────────────┬──────────────┐
+ │ tenhou6_ │ equivalent_ │ database │
+ │ adapter │ variants │ │
+ └────────────┴──────────────┴──────────────┘
 ```
 
 ### 1.6 模块依赖表（import 方向）
@@ -148,7 +148,10 @@
 | **修饰符** | (无) | 默认手切 | `3m` |
 | | `t` | 必须摸切 | `3mt` |
 | | `f` | 手切或摸切皆可 | `3mf` |
-| | `r` | 立直宣言牌（必为摸切） | `3mr` |
+| | `r` | 立直宣言牌 | `3mr` (手切), `3mtr` (摸切) |
+| **立直细分** | `r` | **手切**立直宣言 (Tedashi Riichi) | `3mr` |
+| | `tr` 或 `rt` | **摸切**立直宣言 (Tsumogiri Riichi) | `3mtr` |
+| | `fr` | **手/摸皆可**立直宣言 | `3mfr` |
 | **序列与逻辑** | `-` 或 `AND` | 顺序分隔 | `3s-1s`, `3sAND1s` |
 | | `*` | 任意数量摸切 | `3s-*-1s` |
 | | `$` | 任意一张手切 | `c0p6p-$` |
@@ -194,15 +197,6 @@
 | 副露区域约束 | `_apply_suit_mapping_to_string` | 4sc3s5s → 4mc3m5m |
 | 前段禁打 | `_apply_suit_mapping_to_string` | NOTs → NOTm |
 
-### 3.4 副露与字牌
-
-- **含副露也应用全局映射**：`4mc3m5m` → `4pc3p5p`、`4sc3s5s` 等
-- **字牌不参与映射**：1z-7z 无花色概念，不参与 m/p/s 映射；不影响变体数量
-
-### 3.5 宝牌约束
-
-不传入 `generate_equivalent_variants`，在 `live_analyzer` 用 `_dora_matches_constraint` 实现：数牌同数字等价；赤五 0m/0p/0s 等价；字牌需完全匹配。详见 `docs/dora_constraint_equivalence.md`。
-
 ---
 
 ## 四、核心模块
@@ -234,94 +228,6 @@
 | `README.md`, `QUICKSTART.md`, `CHANGELOG.md`, `PROJECT_SUMMARY.md` | 文档 |
 | `Riichi-rules-2016-EN.pdf` | EMA 立直规则参考 |
 
-### 根目录脚本
-
-| 文件 | 说明 |
-|------|------|
-| `download_historical_data.py` | 下载天凤凤凰桌历史牌谱 |
-| `download_tiles.py` | 下载牌面素材（SVG/PNG） |
-| `convert_xml_to_tenhou6.py` | XML → tenhou6 JSON |
-| `process_all_logs.py` / `process_all_logs_optimized.py` | 批量处理牌谱 |
-| `clean_new_logs.py` | 清理新导入低质量对局 |
-| `clean_bye_logs.py` | 清理掉线未重连对局 |
-| `compact_database.py`, `clear_game_states.py`, `rebuild_game_states.py` | 数据库操作 |
-| `query_logs.py`, `decode_player_names.py`, `migrate_add_unique_constraint.py` | 查询与迁移 |
-| `verify_single_vs_multi.py`, `cleanup_db_lock.py` | 校验与维护 |
-| `启动应用.bat`, `启动应用_Python3.12.bat`, `后台下载数据.bat` | 批处理（本地 Windows 用） |
-| `tenhou_handreading.log` | 应用日志 |
-
-### `.cursor`
-
-| 子目录/文件 | 说明 |
-|------------|------|
-| `rules/tenhou-handreading-project.mdc` | 本项目手册（.cursor 规则文件），与根目录 `AGENTS.md` 保持同步 |
-| `plans/` | 开发计划 |
-| `skills/riichi-mahjong-rules/` | 立直规则技能 |
-
-### `assets`
-
-| 路径 | 说明 |
-|------|------|
-| `assets/tile-assets/Regular/` | SVG 牌面素材 |
-| `assets/tile-assets/Export/Regular/` | PNG 备选 |
-| `assets/3d-tile/` | 3D 渲染用 PNG |
-
-### `data`
-
-| 文件 | 说明 |
-|------|------|
-| `tenhou.db` | 主数据库（SQLite） |
-| `tenhou.db.stats_cache` | 统计缓存 |
-| `query_archive.json` | 查询归档 |
-| `archives/` | 归档目录 |
-
-### `docs`
-
-| 文件 | 说明 |
-|------|------|
-| `data_quality.md` | 数据质量管理 |
-| `dora_constraint_equivalence.md` | 宝牌约束等价性 |
-| `honor_tile_variants_design.md` | 字牌变体设计 |
-| `tenhou6_migration.md`, `tenhou6_to_gamestate_example.md` | tenhou6 迁移 |
-| `tile_glyph_assets.md` | 牌面符号说明 |
-| `项目文件夹结构说明.md` | 已并入本手册，现为轻量索引 |
-
-### `scripts`
-
-| 文件 | 说明 |
-|------|------|
-| `debug_sample_match.py` | 样本匹配调试 |
-
-### `src`
-
-| 文件 | 说明 |
-|------|------|
-| `gui_app.py` | PyQt5 GUI 主程序 |
-| `live_analyzer.py` | 实时舍牌分析 |
-| `database.py` | 数据库操作 |
-| `data_downloader.py` | 牌谱下载 |
-| `mjlog_parser.py` | 牌谱解析（数据结构） |
-| `tenhou6_adapter.py` | tenhou6 JSON 适配 |
-| `equivalent_variants.py` | 等价变体、约束匹配 |
-| `instant_deal_in.py` | 即时铳率（当巡可荣和/振听/理论点） |
-| `pattern_matcher.py` | 旧模式匹配（现用 equivalent_variants） |
-| `tenpai_utils.py` | 听牌判断 |
-| `log_quality.py` | 牌谱质量检查 |
-| `tile_illustration.py` | 舍牌示意图渲染 |
-
-### `tests`
-
-| 文件 | 说明 |
-|------|------|
-| `test_parser.py` | 牌谱解析测试 |
-
-### 外部/子模块
-
-| 目录 | 说明 |
-|------|------|
-| `houou-logs` | 天凤数据下载工具（可为空） |
-| `tenhou-paifu-to-json-main` | tenhou-paifu-to-json 拷贝，XML→JSON 转换 |
-
 ---
 
 ## 六、数据流
@@ -347,3 +253,28 @@
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处
 - **编码与乱码**：编辑含中文的源文件时，**禁止**经终端输出/管道写回；务必使用编辑器级写入并保证 UTF-8。详见 `docs/mojibake_root_cause.md`
 - **乱码根因（已确认）**：Windows 下经 PowerShell 终端链路（管道/重定向/不安全替换）写回 UTF-8 文件，会触发双重编码并可能破坏引号、注入私有区字符；禁止使用该链路编辑源码
+
+---
+
+## 八、样本生成与验证逻辑
+
+### 8.1 样本收集流 (Sample Collection)
+
+1.  **主分析打标 (Pre-tagging)**：在 `LiveAnalyzer.analyze_discard_pattern` 扫描期间，实时匹配成功的样本会附带业务标记：
+    *   `outcome_won` / `outcome_deal_in`：和牌/放铳标记。
+    *   `deal_in_hit` / `deal_in_point`：即时铳率判定及其理论点。
+    *   `target_count` / `target_counts`：目标牌在手牌中的实际枚数。
+2.  **样本池缓存 (sample_pool)**：前 N 条（由 `sample_pool_cap` 控制）符合条件的完整数据会被存入 `sample_pool` 字典列表。
+
+### 8.2 生成验证样本 (Sample Extraction)
+
+*   **极速提取**：当用户点击「生成样本」且存在 `sample_pool` 时，直接按**标记位**（如 `deal_in_hit == True`）进行过滤。
+*   **零冗余校验**：从 `sample_pool` 提取样本时**不再调用** `verify_sample_consistency`。因为该样本在存入时已通过主分析器的严耕校验，避免因字典上下文丢失导致的二次判错。
+*   **离线扫描**：若无 `sample_pool`（如二次打开历史存档或内存不足），则启动 `collect_verification_samples` 遍历数据库。此时会调用 `verify_sample_consistency` 确保离线还原的逻辑一致性。
+
+### 8.3 格式化规范 (Display Format)
+
+*   **手切立直**：在 `actual_pattern` 中显示为 `r` 后缀（如 `3pr`）。
+*   **摸切立直**：在 `actual_pattern` 中显示为 `tr` 后缀（如 `3ptr`）。
+*   **摸切**：普通摸切显示为 `t`（如 `3pt`）。
+*   **手切**：普通手切无后缀。

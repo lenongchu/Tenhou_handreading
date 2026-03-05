@@ -1,7 +1,7 @@
 # Exclude entire data directory (contains 200GB+ tenhou.db)
 # Agent/codebase index must not scan or watch this
 data/
-
+tenhou.db
 # Exclude all SQLite DB files anywhere in the project
 *.db
 *.db-shm

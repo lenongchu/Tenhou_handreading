@@ -9,6 +9,7 @@ import re
 import html
 import json
 import logging
+import configparser
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
@@ -30,6 +31,27 @@ from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_
 from .equivalent_variants import split_discard_pattern, parse_multi_targets
 from .tile_illustration import render_illustration_to_qimage
 logger = logging.getLogger(__name__)
+
+# 数据库默认路径（可被 config.ini 覆盖，便于将大库移出项目目录）
+_DEFAULT_DB_PATH = r"E:\Cursor\Tenhou data\data\tenhou.db"
+
+
+def _get_database_path() -> str:
+    """从 config.ini 读取 [Database] path，若无则使用默认路径。"""
+    root = Path(__file__).resolve().parent.parent
+    config_file = root / "config.ini"
+    if config_file.exists():
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(config_file, encoding="utf-8")
+            path = cfg.get("Database", "path", fallback=None)
+            if path:
+                path = path.strip()
+                if path:
+                    return path
+        except Exception as e:
+            logger.warning("读取 config.ini 失败，使用默认数据库路径: %s", e)
+    return _DEFAULT_DB_PATH
 
 
 def _fmt_int(n) -> str:
@@ -1868,7 +1890,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.db_path = "data/tenhou.db"
+        self.db_path = _get_database_path()
         self.downloader = DataDownloader(self.db_path)
         self.analyzer = LiveAnalyzer(self.db_path)
         self.query_thread = None
@@ -1953,11 +1975,11 @@ class MainWindow(QMainWindow):
         batch_row = QHBoxLayout()
         batch_row.addWidget(QLabel("分析批次大小:"))
         self.analysis_batch_size_spin = QSpinBox()
-        self.analysis_batch_size_spin.setRange(100, 5000)
+        self.analysis_batch_size_spin.setRange(100, 20000)
         self.analysis_batch_size_spin.setSingleStep(100)
         saved_batch = QSettings().value("analysis_batch_size", 400, type=int)
         self.analysis_batch_size_spin.blockSignals(True)
-        self.analysis_batch_size_spin.setValue(max(100, min(5000, saved_batch or 400)))
+        self.analysis_batch_size_spin.setValue(max(100, min(20000, saved_batch or 400)))
         self.analysis_batch_size_spin.blockSignals(False)
         self.analysis_batch_size_spin.setToolTip(
             "每批从数据库读取的对局数。请根据本机内存选择：\n"
@@ -1982,10 +2004,10 @@ class MainWindow(QMainWindow):
         batch_row.addWidget(self.max_workers_spin)
         batch_row.addWidget(QLabel("内存维护:"))
         self.gc_interval_batches_spin = QSpinBox()
-        self.gc_interval_batches_spin.setRange(1, 20)
+        self.gc_interval_batches_spin.setRange(1, 100)
         saved_gc = QSettings().value("gc_interval_batches", 4, type=int) or 4
         self.gc_interval_batches_spin.blockSignals(True)
-        self.gc_interval_batches_spin.setValue(max(1, min(20, saved_gc)))
+        self.gc_interval_batches_spin.setValue(max(1, min(100, saved_gc)))
         self.gc_interval_batches_spin.blockSignals(False)
         self.gc_interval_batches_spin.setToolTip("每 N 批执行 gc + DB 重连，释放 tenhou.db 缓存。可自行调整找到最合适数值。")
         self.gc_interval_batches_spin.valueChanged.connect(self._save_gc_interval_batches)
