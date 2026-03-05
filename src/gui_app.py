@@ -27,7 +27,7 @@ from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QFont, QIntValidator
 
 from .data_downloader import DataDownloader
 from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_display
-from .equivalent_variants import split_discard_pattern
+from .equivalent_variants import split_discard_pattern, parse_multi_targets
 from .tile_illustration import render_illustration_to_qimage
 logger = logging.getLogger(__name__)
 
@@ -682,7 +682,7 @@ class SampleThread(QThread):
     finished = pyqtSignal(bool, object)  # success, samples list
 
     def __init__(self, analyzer: LiveAnalyzer, params: dict, sample_count: int, target_count_filter,
-                 sample_pool=None, target_tile_filter=None, outcome_filter=None):
+                 sample_pool=None, target_tile_filter=None, outcome_filter=None, deal_in_filter=None):
         super().__init__()
         self.analyzer = analyzer
         self.params = params
@@ -691,6 +691,7 @@ class SampleThread(QThread):
         self.sample_pool = sample_pool  # 主统计时预收集的样本池，有则无需二次遍历
         self.target_tile_filter = target_tile_filter  # 多目标时指定按哪个目标筛选
         self.outcome_filter = outcome_filter  # "win"|"deal_in"|"neither" 和铳率模式下的结局筛选
+        self.deal_in_filter = deal_in_filter  # "hit"|"miss"|"furiten" 即时铳率模式筛选
         self._should_cancel = False
 
     def cancel(self):
@@ -716,6 +717,7 @@ class SampleThread(QThread):
                 should_cancel=lambda: self._should_cancel,
                 sample_pool=self.sample_pool,
                 outcome_filter=self.outcome_filter,
+                deal_in_filter=self.deal_in_filter,
             )
             self.progress.emit(f"收集完成，共 {len(samples)} 条")
             self.finished.emit(True, samples)
@@ -1911,6 +1913,7 @@ class MainWindow(QMainWindow):
         # 2. 查询输入区 + 3. 结果显示区 -> 放入标签页
         query_group = self._create_query_input_group()
         result_group = self._create_result_display_group()
+        instant_group = self._create_instant_deal_in_group()
         
         self.main_tab = QTabWidget()
         # 使用独立 TabBar 便于放到数据管理区标题旁
@@ -1918,6 +1921,7 @@ class MainWindow(QMainWindow):
         self.main_tab.setTabBar(tab_bar)
         self.main_tab.addTab(query_group, "查询条件")
         self.main_tab.addTab(result_group, "查询结果")
+        self.main_tab.addTab(instant_group, "铳率分析")
         illustration_group = QWidget()
         ill_layout = QVBoxLayout(illustration_group)
         ill_layout.addWidget(TileIllustrationWidget(self))
@@ -2229,11 +2233,13 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo = QComboBox()
         self.analysis_target_combo.addItem("目标牌存量", "target_count")
         self.analysis_target_combo.addItem("是否听牌", "tenpai")
+        self.analysis_target_combo.addItem("即时铳率", "deal_in_instant")
         self.analysis_target_combo.addItem("和铳率", "outcome")
         self.analysis_target_combo.setMinimumWidth(100)
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
+            "即时铳率：统计命中当巡时点可对目标牌荣和的概率与理论点；"
             "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
@@ -2427,6 +2433,372 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先完成矩阵分析（巡目范围列表输入多行）")
             return
         MatrixDisplayDialog(self, self.last_query_result).exec_()
+
+    def _create_instant_deal_in_group(self) -> QWidget:
+        """独立即时铳率入口页（完整约束，执行时复用主查询链路）。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        hint = QLabel(
+            "该页用于“即时铳率/铳点/铳度”分析。\n"
+            "约束能力与主分析页一致；点击开始后会自动同步到主分析执行链路。"
+        )
+        hint.setStyleSheet("color: #8b949e;")
+        layout.addWidget(hint)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("舍牌模式:"))
+        self.instant_pattern_input = QLineEdit()
+        self.instant_pattern_input.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
+        row1.addWidget(self.instant_pattern_input, 1)
+        row1.addWidget(QLabel("目标牌:"))
+        self.instant_target_input = QLineEdit()
+        self.instant_target_input.setPlaceholderText("例: 6s（仅单张）")
+        self.instant_target_input.setMaximumWidth(80)
+        row1.addWidget(self.instant_target_input)
+        layout.addLayout(row1)
+
+        # 约束区
+        constraints_group = QGroupBox("约束条件")
+        c_layout = QVBoxLayout()
+
+        dora_row = QHBoxLayout()
+        dora_row.setSpacing(8)
+        self.instant_dora_group = QButtonGroup(self)
+        self.instant_dora_irrelevant_radio = QRadioButton("宝牌无关")
+        self.instant_dora_irrelevant_radio.setChecked(True)
+        self.instant_dora_group.addButton(self.instant_dora_irrelevant_radio, 0)
+        self.instant_dora_specific_radio = QRadioButton("宝牌为")
+        self.instant_dora_group.addButton(self.instant_dora_specific_radio, 1)
+        self.instant_dora_matches_position_radio = QRadioButton("宝牌=模式第")
+        self.instant_dora_group.addButton(self.instant_dora_matches_position_radio, 2)
+        self.instant_dora_tile_input = QLineEdit()
+        self.instant_dora_tile_input.setPlaceholderText("例: 6s")
+        self.instant_dora_tile_input.setMinimumWidth(50)
+        self.instant_dora_tile_input.setMaximumWidth(70)
+        self.instant_dora_position_input = QLineEdit()
+        self.instant_dora_position_input.setPlaceholderText("例: 1 或 1,3")
+        self.instant_dora_position_input.setMinimumWidth(50)
+        self.instant_dora_position_input.setMaximumWidth(70)
+        self.instant_dora_position_input.setToolTip("1-based，如 1 表示第1张，1,3 表示第1、3张必须为宝牌")
+        dora_row.addWidget(self.instant_dora_irrelevant_radio)
+        dora_row.addWidget(self.instant_dora_specific_radio)
+        dora_row.addWidget(self.instant_dora_tile_input)
+        dora_row.addWidget(self.instant_dora_matches_position_radio)
+        dora_row.addWidget(self.instant_dora_position_input)
+        dora_row.addWidget(QLabel("张"))
+        dora_row.addStretch()
+        c_layout.addLayout(dora_row)
+
+        riichi_row = QHBoxLayout()
+        riichi_row.setSpacing(8)
+        self.instant_riichi_group = QButtonGroup(self)
+        self.instant_riichi_any_radio = QRadioButton("立直: 任意")
+        self.instant_riichi_any_radio.setChecked(True)
+        self.instant_riichi_group.addButton(self.instant_riichi_any_radio, 0)
+        self.instant_riichi_has_radio = QRadioButton("有人立直")
+        self.instant_riichi_group.addButton(self.instant_riichi_has_radio, 1)
+        self.instant_riichi_no_radio = QRadioButton("无人立直")
+        self.instant_riichi_group.addButton(self.instant_riichi_no_radio, 2)
+        riichi_row.addWidget(self.instant_riichi_any_radio)
+        riichi_row.addWidget(self.instant_riichi_has_radio)
+        riichi_row.addWidget(self.instant_riichi_no_radio)
+        riichi_row.addStretch()
+        c_layout.addLayout(riichi_row)
+
+        call_row = QHBoxLayout()
+        call_row.setSpacing(8)
+        self.instant_call_group = QButtonGroup(self)
+        self.instant_call_any_radio = QRadioButton("副露: 任意")
+        self.instant_call_any_radio.setChecked(True)
+        self.instant_call_group.addButton(self.instant_call_any_radio, 0)
+        self.instant_call_has_radio = QRadioButton("有人副露")
+        self.instant_call_group.addButton(self.instant_call_has_radio, 1)
+        self.instant_call_no_radio = QRadioButton("无人副露")
+        self.instant_call_group.addButton(self.instant_call_no_radio, 2)
+        call_row.addWidget(self.instant_call_any_radio)
+        call_row.addWidget(self.instant_call_has_radio)
+        call_row.addWidget(self.instant_call_no_radio)
+        call_row.addStretch()
+        c_layout.addLayout(call_row)
+
+        exclude_south_row = QHBoxLayout()
+        self.instant_exclude_south4_check = QCheckBox("禁止南四局")
+        self.instant_exclude_south4_check.setToolTip("南四局打法会根据点数状况有极大改变，勾选时跳过南四局")
+        exclude_south_row.addWidget(self.instant_exclude_south4_check)
+        self.instant_exclude_south3_check = QCheckBox("禁止南三局")
+        self.instant_exclude_south3_check.setToolTip("勾选时跳过南三局，可与南四局同时勾选")
+        exclude_south_row.addWidget(self.instant_exclude_south3_check)
+        exclude_south_row.addStretch()
+        c_layout.addLayout(exclude_south_row)
+
+        prior_excl_row = QHBoxLayout()
+        prior_excl_row.addWidget(QLabel("前段禁打:"))
+        self.instant_prior_discard_exclusion_input = QLineEdit()
+        self.instant_prior_discard_exclusion_input.setPlaceholderText("例: NOTm 或 4mOR2m")
+        self.instant_prior_discard_exclusion_input.setToolTip(
+            "巡目范围开始前，该玩家不能打出这些牌。支持 NOTm/p/s、[25]m、4mOR2m 等，与舍牌模式同步等价变换"
+        )
+        self.instant_prior_discard_exclusion_input.setMinimumWidth(140)
+        self.instant_prior_discard_exclusion_input.setMaximumWidth(200)
+        prior_excl_row.addWidget(self.instant_prior_discard_exclusion_input)
+        prior_excl_row.addStretch()
+        c_layout.addLayout(prior_excl_row)
+
+        call_area_row = QHBoxLayout()
+        call_area_row.addWidget(QLabel("副露区域:"))
+        self.instant_call_area_inputs = []
+        for _ in range(4):
+            le = QLineEdit()
+            le.setPlaceholderText("例: pzfzf 4mc3m5m")
+            le.setMinimumWidth(90)
+            le.setMaximumWidth(120)
+            self.instant_call_area_inputs.append(le)
+            call_area_row.addWidget(le)
+        call_area_help = QPushButton("?")
+        call_area_help.setFixedWidth(24)
+        call_area_help.setToolTip("pzfzf=碰自风, pypyp=碰役牌, 4mc3m5m=吃4m用3m5m")
+        call_area_help.clicked.connect(self._show_call_area_help)
+        call_area_row.addWidget(call_area_help)
+        call_area_row.addStretch()
+        c_layout.addLayout(call_area_row)
+
+        c_layout.addSpacing(4)
+        vc_header = QHBoxLayout()
+        vc_header.addWidget(QLabel("场上可见枚数"))
+        self.instant_add_visible_constraint_btn = QPushButton("+ 添加")
+        self.instant_add_visible_constraint_btn.setFixedWidth(72)
+        self.instant_add_visible_constraint_btn.clicked.connect(self._instant_add_visible_constraint_row)
+        vc_header.addWidget(self.instant_add_visible_constraint_btn)
+        vc_header.addStretch()
+        c_layout.addLayout(vc_header)
+
+        self.instant_visible_constraint_scroll = QScrollArea()
+        self.instant_visible_constraint_scroll.setWidgetResizable(True)
+        self.instant_visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.instant_visible_constraint_scroll.setMinimumHeight(52)
+        self.instant_visible_constraint_scroll.setMaximumHeight(100)
+        self.instant_visible_constraint_rows_widget = QWidget()
+        self.instant_visible_constraint_rows_widget.setMinimumWidth(596)
+        self.instant_visible_constraint_rows_layout = QGridLayout(self.instant_visible_constraint_rows_widget)
+        self.instant_visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.instant_visible_constraint_rows_layout.setSpacing(2)
+        self.instant_visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.instant_visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.instant_visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.instant_visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.instant_visible_constraint_scroll.setWidget(self.instant_visible_constraint_rows_widget)
+        self.instant_visible_constraint_row_refs = []
+        c_layout.addWidget(self.instant_visible_constraint_scroll)
+        self._instant_add_visible_constraint_row()
+
+        constraints_group.setLayout(c_layout)
+        layout.addWidget(constraints_group)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("巡目范围:"))
+        self.instant_turn_min = QSpinBox()
+        self.instant_turn_min.setRange(1, 18)
+        self.instant_turn_min.setValue(1)
+        self.instant_turn_max = QSpinBox()
+        self.instant_turn_max.setRange(1, 18)
+        self.instant_turn_max.setValue(18)
+        row2.addWidget(self.instant_turn_min)
+        row2.addWidget(QLabel("~"))
+        row2.addWidget(self.instant_turn_max)
+        row2.addSpacing(12)
+        row2.addWidget(QLabel("样本上限:"))
+        self.instant_sample_limit_input = QSpinBox()
+        self.instant_sample_limit_input.setRange(100, 10000000)
+        self.instant_sample_limit_input.setSingleStep(10000)
+        self.instant_sample_limit_input.setSuffix(" 半庄")
+        saved_limit = QSettings().value("sample_limit", 10000, type=int) or 10000
+        self.instant_sample_limit_input.setValue(max(100, min(10000000, saved_limit)))
+        self.instant_sample_limit_input.setMinimumWidth(100)
+        row2.addWidget(self.instant_sample_limit_input)
+        row2.addSpacing(8)
+        row2.addWidget(QLabel("匹配保留:"))
+        self.instant_matched_states_cap_spin = QSpinBox()
+        self.instant_matched_states_cap_spin.setRange(1, 500)
+        saved_cap = QSettings().value("matched_states_cap", 200, type=int) or 200
+        self.instant_matched_states_cap_spin.setValue(max(1, min(500, saved_cap)))
+        self.instant_matched_states_cap_spin.setMinimumWidth(56)
+        row2.addWidget(self.instant_matched_states_cap_spin)
+        row2.addStretch()
+        self.instant_start_btn = QPushButton("开始即时铳率分析")
+        self.instant_start_btn.clicked.connect(self._start_instant_deal_in_analysis)
+        row2.addWidget(self.instant_start_btn)
+        layout.addLayout(row2)
+
+        self.instant_status_label = QLabel("")
+        layout.addWidget(self.instant_status_label)
+        layout.addStretch()
+        return widget
+
+    def _instant_rebuild_visible_constraint_grid(self):
+        """将即时铳率页的场上可见枚数条目按 2 列重新排列。"""
+        layout = self.instant_visible_constraint_rows_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if item and item.widget():
+                item.widget().setParent(None)
+        for i, (_, _, row_widget) in enumerate(self.instant_visible_constraint_row_refs):
+            layout.addWidget(row_widget, i // 2, i % 2)
+
+    def _instant_add_visible_constraint_row(self):
+        """即时铳率页：添加一行场上可见枚数输入。"""
+        row_widget = QWidget()
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 8s")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("可见"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.instant_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        self._instant_rebuild_visible_constraint_grid()
+
+        def do_remove():
+            self.instant_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.instant_visible_constraint_row_refs.remove((tile_edit, range_slider, row_widget))
+            self._instant_rebuild_visible_constraint_grid()
+
+        remove_btn.clicked.connect(do_remove)
+
+    def _instant_get_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        """即时铳率页：读取场上可见枚数约束。"""
+        visible_constraints = {}
+        for tile_edit, range_slider, _ in self.instant_visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            visible_constraints[tile] = (min_count, max_count)
+        return visible_constraints
+
+    def _sync_instant_constraints_to_main(self):
+        """将即时铳率页的约束与参数同步到主分析页控件。"""
+        # 宝牌约束
+        self.dora_irrelevant_radio.setChecked(self.instant_dora_irrelevant_radio.isChecked())
+        self.dora_specific_radio.setChecked(self.instant_dora_specific_radio.isChecked())
+        self.dora_matches_position_radio.setChecked(self.instant_dora_matches_position_radio.isChecked())
+        self.dora_tile_input.setText(self.instant_dora_tile_input.text().strip())
+        self.dora_position_input.setText(self.instant_dora_position_input.text().strip())
+
+        # 立直/副露约束
+        self.riichi_any_radio.setChecked(self.instant_riichi_any_radio.isChecked())
+        self.riichi_has_radio.setChecked(self.instant_riichi_has_radio.isChecked())
+        self.riichi_no_radio.setChecked(self.instant_riichi_no_radio.isChecked())
+        self.call_any_radio.setChecked(self.instant_call_any_radio.isChecked())
+        self.call_has_radio.setChecked(self.instant_call_has_radio.isChecked())
+        self.call_no_radio.setChecked(self.instant_call_no_radio.isChecked())
+
+        # 南三/南四
+        self.exclude_south4_check.setChecked(self.instant_exclude_south4_check.isChecked())
+        self.exclude_south3_check.setChecked(self.instant_exclude_south3_check.isChecked())
+
+        # 前段禁打
+        self.prior_discard_exclusion_input.setText(
+            self.instant_prior_discard_exclusion_input.text().strip()
+        )
+
+        # 副露区域
+        for i, le in enumerate(self.call_area_inputs):
+            text = self.instant_call_area_inputs[i].text().strip() if i < len(self.instant_call_area_inputs) else ""
+            le.setText(text)
+
+        # 场上可见枚数（先清空主分析条目，再按即时页重建）
+        instant_constraints = list(self._instant_get_visible_constraints_from_ui().items())
+        for _, _, row_widget in list(self.visible_constraint_row_refs):
+            self.visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+        self.visible_constraint_row_refs.clear()
+        if not instant_constraints:
+            self._add_visible_constraint_row()
+        else:
+            for tile, (min_count, max_count) in instant_constraints:
+                self._add_visible_constraint_row()
+                tile_edit, range_slider, _ = self.visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(min_count, max_count)
+
+        # 样本上限、匹配保留
+        self.sample_limit_input.setValue(self.instant_sample_limit_input.value())
+        self.matched_states_cap_spin.setValue(self.instant_matched_states_cap_spin.value())
+
+    def _start_instant_deal_in_analysis(self):
+        pattern = self.instant_pattern_input.text().strip()
+        target = self.instant_target_input.text().strip()
+        tmin = self.instant_turn_min.value()
+        tmax = self.instant_turn_max.value()
+
+        if not pattern or not target:
+            QMessageBox.warning(self, "输入错误", "请填写舍牌模式与目标牌（单张）")
+            return
+        if tmin > tmax:
+            QMessageBox.warning(self, "输入错误", "巡目范围最小值不能大于最大值")
+            return
+
+        # 即时铳率仅支持单目标单张
+        try:
+            mt = parse_multi_targets(target)
+            if len(mt) != 1 or mt[0][1] or len(mt[0][0]) != 1:
+                QMessageBox.warning(self, "输入错误", "即时铳率仅支持单张目标牌（不支持 multi-target / combo）")
+                return
+        except Exception:
+            QMessageBox.warning(self, "输入错误", "目标牌格式无效")
+            return
+
+        # 宝牌输入校验
+        if self.instant_dora_specific_radio.isChecked() and not self.instant_dora_tile_input.text().strip():
+            QMessageBox.warning(self, "输入错误", "请选择“宝牌为”时，请填写宝牌（例: 6s）")
+            return
+        if self.instant_dora_matches_position_radio.isChecked() and not self.instant_dora_position_input.text().strip():
+            QMessageBox.warning(self, "输入错误", "请选择“宝牌=模式第”时，请填写位置（例: 1 或 1,3）")
+            return
+
+        # 先验证模式是否可解析，避免复制后才失败
+        try:
+            split_discard_pattern(pattern)
+        except Exception:
+            QMessageBox.warning(self, "输入错误", "舍牌模式格式无效")
+            return
+
+        # 复用主查询页控件，确保约束/采样/线程管理逻辑一致
+        if not getattr(self, "_pattern_row_widgets", None):
+            self._add_pattern_row()
+        for idx, (pattern_edit, target_edit, _, _, _, _) in enumerate(self._pattern_row_widgets):
+            if idx == 0:
+                pattern_edit.setText(pattern)
+                target_edit.setText(target)
+            else:
+                pattern_edit.clear()
+                target_edit.clear()
+
+        self._sync_instant_constraints_to_main()
+        self.analysis_target_combo.setCurrentIndex(
+            max(0, self.analysis_target_combo.findData("deal_in_instant"))
+        )
+        self.turn_range_slider.setRange(tmin, tmax)
+        for edit in getattr(self, "_turn_range_edits", []):
+            edit.clear()
+
+        self.instant_status_label.setText("已提交分析，进度与结果请查看“查询结果”页。")
+        self.main_tab.setCurrentIndex(1)
+        self.execute_query()
 
     def _create_result_display_group(self) -> QGroupBox:
         """创建结果显示区"""
@@ -3151,6 +3523,7 @@ class MainWindow(QMainWindow):
         """执行查询"""
         analysis_target = self.analysis_target_combo.currentData() or "target_count"
         use_tenpai = (analysis_target == "tenpai")
+        use_instant = (analysis_target == "deal_in_instant")
         use_outcome = (analysis_target == "outcome")
         require_target = not (use_tenpai or use_outcome)
         query_items = self._get_pattern_items(require_target=require_target)
@@ -3224,8 +3597,8 @@ class MainWindow(QMainWindow):
             turn_min, turn_max = self.turn_range_slider.getRange()
             if turn_min <= turn_max:
                 turn_ranges = [(turn_min, turn_max)]
-        use_grid = len(turn_ranges) > 1 and not use_outcome  # 和铳率不支持矩阵分析
-        if use_outcome and turn_ranges:
+        use_grid = len(turn_ranges) > 1 and not (use_outcome or use_instant)  # 和铳率/即时铳率不支持矩阵分析
+        if (use_outcome or use_instant) and turn_ranges:
             t_min = min(r[0] for r in turn_ranges)
             t_max = max(r[1] for r in turn_ranges)
             turn_range = None if (t_min == 1 and t_max == 18) else (t_min, t_max)
@@ -3300,9 +3673,14 @@ class MainWindow(QMainWindow):
             return
         # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
         use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
+        use_instant = self.last_query_params.get("analysis_target") == "deal_in_instant"
         use_outcome = self.last_query_params.get("analysis_target") == "outcome"
         is_combo = self.last_query_params.get("is_combo", False)
-        if use_outcome:
+        if use_instant:
+            if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "可铳":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "可铳", "不可铳", "振听过滤掉"])
+        elif use_outcome:
             if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "和牌":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "和牌", "放铳", "两者皆没有"])
@@ -3320,10 +3698,16 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "有0张", "有1张", "有2张", "有3张"])
         count = self.sample_count_spin.value()
         idx = self.sample_target_combo.currentIndex()
-        if use_outcome:
+        if use_instant:
+            deal_in_filter = None if idx == 0 else ["hit", "miss", "furiten"][idx - 1]
+            outcome_filter = None
+            target_count_filter = None
+        elif use_outcome:
+            deal_in_filter = None
             outcome_filter = None if idx == 0 else ["win", "deal_in", "neither"][idx - 1]
             target_count_filter = None
         else:
+            deal_in_filter = None
             outcome_filter = None
             target_count_filter = None if idx == 0 else idx - 1
         target_tile_filter = None
@@ -3367,6 +3751,7 @@ class MainWindow(QMainWindow):
             sample_pool=sample_pool,
             target_tile_filter=target_tile_filter,
             outcome_filter=outcome_filter,
+            deal_in_filter=deal_in_filter,
         )
         self.sample_thread.progress.connect(lambda s: self.result_text.append(s))
         self.sample_thread.progress_num.connect(self.on_sample_progress_num)
@@ -3431,7 +3816,7 @@ class MainWindow(QMainWindow):
 
         if success:
             # 和铳率统计结果
-            if isinstance(result, dict) and "win_rate" in result:
+            if isinstance(result, dict) and {"total", "wins", "deal_ins"}.issubset(result.keys()):
                 self.main_tab.setCurrentIndex(1)
                 n = result.get("total", 0)
                 wins = result.get("wins", 0)
@@ -3567,6 +3952,7 @@ class MainWindow(QMainWindow):
             self.sample_pattern_combo.clear()
             pr_list = result.get("pattern_results", []) if result.get("multi_pattern") else []
             use_tenpai = (result.get("analysis_target") == "tenpai")
+            use_instant = (result.get("analysis_target") == "deal_in_instant")
             if result.get("multi_pattern") and pr_list:
                 for pr in pr_list:
                     lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
@@ -3586,7 +3972,9 @@ class MainWindow(QMainWindow):
                 self.sample_target_tile_combo.setVisible(False)
             # 搭子模式：全部/没有/有；听牌模式：全部/未听牌/听牌；单张模式：全部/有0张~有3张
             self.sample_target_combo.clear()
-            if use_tenpai:
+            if use_instant:
+                self.sample_target_combo.addItems(["全部", "可铳", "不可铳", "振听过滤掉"])
+            elif use_tenpai:
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
             else:
                 any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
@@ -3603,12 +3991,15 @@ class MainWindow(QMainWindow):
 
             if multi and pr_list:
                 use_tenpai = (result.get("analysis_target") == "tenpai")
+                use_instant = (result.get("analysis_target") == "deal_in_instant")
                 lines = ["查询完成！\n", f"总匹配数: {_fmt_int(result['total_matches'])}\n"]
                 for pr in pr_list:
                     pr_label = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
                     tcd = pr.get('target_count_distribution', {})
                     lines.append(f"  {pr_label}: {_fmt_int(pr['matches'])} 次")
-                    if use_tenpai:
+                    if use_instant:
+                        continue
+                    elif use_tenpai:
                         lines.append(
                             f"    未听牌: {pr['probability_distribution'][0]:.1f}% ({_fmt_int(tcd.get(0, 0))} 例)  "
                             f"听牌: {pr['probability_distribution'][1]:.1f}% ({_fmt_int(tcd.get(1, 0))} 例)"
@@ -3639,14 +4030,36 @@ class MainWindow(QMainWindow):
                     f"等价变体数: {result['variants_count']}",
                     f"分析耗时: {result.get('elapsed_seconds', 0):.1f} 秒",
                 ])
+                if use_instant:
+                    lines.extend([
+                        "",
+                        f"即时铳率: {result.get('deal_in_rate', 0.0):.2%}",
+                        f"可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}",
+                        f"平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}",
+                        f"铳度: {result.get('deal_in_intensity', 0.0):.2f}",
+                    ])
                 result_text = "\n".join(lines)
 
                 # 多模式：勾选与合并（_setup_multi_pattern_merge 内 _update_merged_result 已设置 _excel_clipboard_text 为合并结果）
-                self._setup_multi_pattern_merge(result, pr_list)
+                if use_instant:
+                    self.multi_merge_widget.setVisible(False)
+                    self._excel_clipboard_text = self._build_excel_text(result, None, multi=False)
+                else:
+                    self._setup_multi_pattern_merge(result, pr_list)
             else:
                 use_tenpai = (result.get("analysis_target") == "tenpai")
+                use_instant = (result.get("analysis_target") == "deal_in_instant")
                 multi_target = result.get("multi_target", False)
-                if use_tenpai:
+                if use_instant:
+                    dist_text = (
+                        f"  总样本: {_fmt_int(result.get('total_matches', 0))}\n"
+                        f"  可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}\n"
+                        f"  即时铳率: {result.get('deal_in_rate', 0.0):.2%}\n"
+                        f"  平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}\n"
+                        f"  铳度: {result.get('deal_in_intensity', 0.0):.2f}"
+                    )
+                    target_label = f"目标: {result['target_tile']} (即时铳率)"
+                elif use_tenpai:
                     dist_text = (
                         f"  未听牌: {result['probability_distribution'][0]:.2f}% ({_fmt_int(result['target_count_distribution'][0])} 例)\n"
                         f"  听牌: {result['probability_distribution'][1]:.2f}% ({_fmt_int(result['target_count_distribution'][1])} 例)"

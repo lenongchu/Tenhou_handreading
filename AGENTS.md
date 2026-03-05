@@ -66,7 +66,8 @@
          ├── 3. tenhou6_adapter.parse_tenhou6_json()  → GameState 列表
          ├── 4. 逐巡：equivalent_variants.match_discard_to_variant() 匹配
          ├── 5. tenpai_utils.is_tenpai()  听牌判断
-         └── 6. 写入 game_states / visible_tile_stats，返回概率
+         ├── 6. instant_deal_in.RoundInstantDealInAnalyzer()（analysis_target="deal_in_instant" 时）
+         └── 7. 写入 game_states / visible_tile_stats，返回概率
          │
          ▼
    database (tenhou.db): logs | game_states | visible_tile_stats
@@ -98,6 +99,7 @@
 | `mjlog_parser` | database, tenhou6_adapter, pattern_matcher, live_analyzer, equivalent_variants |
 | `equivalent_variants` | live_analyzer, tile_illustration |
 | `tenpai_utils` | live_analyzer |
+| `instant_deal_in` | live_analyzer（即时铳率/完整振听/理论 ron 点） |
 | `tenhou6_adapter` | live_analyzer（解析 tenhou6 JSON → GameState） |
 | `database` | live_analyzer, gui_app 间接 |
 | `pattern_matcher` | 旧路径，live_analyzer 现用 equivalent_variants |
@@ -211,6 +213,7 @@
 | `tenhou6_adapter` | tenhou6 JSON → GameState | _parse_round_from_tenhou6 |
 | `equivalent_variants` | 舍牌模式解析、等价变体、约束匹配 | generate_equivalent_variants, parse_target_tiles, match_discard_to_variant |
 | `live_analyzer` | 实时分析：模式匹配 + 概率计算 | LiveAnalyzer.analyze, get_database_stats |
+| `instant_deal_in` | 即时铳率引擎：事件重放、完整振听、理论点 | RoundInstantDealInAnalyzer, extract_tenhou6_rounds |
 | `database` | SQLite：logs, game_states, visible_tile_stats | Database.create_tables, insert_game_state |
 | `tenpai_utils` | 听牌判断 | is_tenpai (mahjong 库) |
 | `gui_app` | PyQt5 桌面界面 | 入口 |
@@ -300,6 +303,7 @@
 | `mjlog_parser.py` | 牌谱解析（数据结构） |
 | `tenhou6_adapter.py` | tenhou6 JSON 适配 |
 | `equivalent_variants.py` | 等价变体、约束匹配 |
+| `instant_deal_in.py` | 即时铳率（当巡可荣和/振听/理论点） |
 | `pattern_matcher.py` | 旧模式匹配（现用 equivalent_variants） |
 | `tenpai_utils.py` | 听牌判断 |
 | `log_quality.py` | 牌谱质量检查 |
@@ -324,8 +328,9 @@
 
 1. **牌谱来源**：houou-logs 下载 XML → `data/` 或已转 tenhou6 JSON
 2. **入库**：convert_xml_to_tenhou6 / process_all_logs → `logs` 表
-3. **分析**：LiveAnalyzer 从 logs 读牌谱 → tenhou6_adapter 解析 → 逐巡生成 GameState → 匹配模式 → 写入 game_states
-4. **查询**：用户输入舍牌模式 → equivalent_variants 解析 → live_analyzer 查库 → 返回概率分布
+3. **分析（常规）**：LiveAnalyzer 从 logs 读牌谱 → tenhou6_adapter 解析 → 逐巡生成 GameState → 匹配模式 → 写入 game_states
+4. **分析（即时铳率）**：analysis_target=`deal_in_instant` 时，按 tenhou6 事件流重放 → instant_deal_in 判定当巡可荣和/振听/理论点
+5. **查询**：用户输入舍牌模式 → equivalent_variants 解析 → live_analyzer 查库 → 返回概率分布或即时铳率指标
 
 ---
 
@@ -335,7 +340,10 @@
 - **修改舍牌模式语法**：改 `equivalent_variants`，与 `docs/dora_constraint_equivalence.md`、`docs/honor_tile_variants_design.md` 一致
 - **修改等价/映射逻辑**：确保 `generate_equivalent_variants` 与 `_dora_matches_constraint` 语义一致
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
+- **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径
+- **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
 - **本手册维护**：新增重要目录/脚本/模块时，同步更新本文件；`docs/项目文件夹结构说明.md` 保持为轻量索引并指向本文件
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处
 - **编码与乱码**：编辑含中文的源文件时，**禁止**经终端输出/管道写回；务必使用编辑器级写入并保证 UTF-8。详见 `docs/mojibake_root_cause.md`
+- **乱码根因（已确认）**：Windows 下经 PowerShell 终端链路（管道/重定向/不安全替换）写回 UTF-8 文件，会触发双重编码并可能破坏引号、注入私有区字符；禁止使用该链路编辑源码

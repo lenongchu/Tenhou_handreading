@@ -33,6 +33,7 @@ from .equivalent_variants import (
     player_could_satisfy_any_call_area_constraints,
     pattern_has_riichi,
 )
+from .instant_deal_in import RoundInstantDealInAnalyzer, extract_tenhou6_rounds
 
 logger = logging.getLogger(__name__)
 
@@ -873,6 +874,11 @@ def _empty_analysis_result(query_pattern: List[str], target_tile: str, pattern_r
     r = {
         'total_logs_analyzed': 0,
         'total_matches': 0,
+        'deal_in_hits': 0,
+        'deal_in_rate': 0.0,
+        'deal_in_point_sum': 0,
+        'deal_in_point_avg': 0.0,
+        'deal_in_intensity': 0.0,
         'target_count_distribution': dist,
         'probability_distribution': {k: 0.0 for k in dist},
         'query_pattern': query_pattern,
@@ -973,6 +979,7 @@ class LiveAnalyzer:
         if not consumed_search_list:
             consumed_search_list = [consumed_search] if consumed_search else []
         riichi_any = any(pattern_has_riichi(p) for p, _ in items)
+        use_deal_in_instant = (analysis_target == "deal_in_instant")
 
         def _target_key(tiles: List[str], is_combo: bool) -> str:
             return "".join(sorted(tiles)) if is_combo else tiles[0]
@@ -984,6 +991,9 @@ class LiveAnalyzer:
         item_multi_targets: List[List[Tuple[List[str], bool]]] = []
         for p, t in items:
             multi_t = parse_multi_targets(t)
+            if use_deal_in_instant:
+                if len(multi_t) != 1 or multi_t[0][1]:
+                    raise ValueError("即时铳率分析仅支持单目标单张牌（不支持 multi-target / combo）")
             item_multi_targets.append(multi_t)
             first_t = multi_t[0]
             variant_target = _target_str_for_variant(first_t[0], first_t[1])
@@ -1012,6 +1022,8 @@ class LiveAnalyzer:
         sample_pool: List[Dict] = []
         sample_pool_cap = SAMPLE_POOL_CAP
         total_matches = 0
+        deal_in_hits_total = 0
+        deal_in_point_sum_total = 0
         outcome_wins_total = 0
         outcome_deal_ins_total = 0
         pattern_matches = [0] * len(items)
@@ -1028,7 +1040,9 @@ class LiveAnalyzer:
             ]
         target_count_distribution = pattern_distributions[0]
 
-        use_parallel = max_workers is not None and max_workers > 1
+        use_parallel = (max_workers is not None and max_workers > 1) and (not use_deal_in_instant)
+        if use_deal_in_instant and (max_workers or 1) > 1:
+            logger.info("即时铳率模式默认使用串行分析（完整事件重放+振听判定）")
         workers = min(max(1, max_workers or 1), os.cpu_count() or 4)
         batch_size = _clamp_analysis_batch_size(requested_batch_size, workers, use_parallel)
         analysis_params = None
@@ -1056,6 +1070,7 @@ class LiveAnalyzer:
                 "riichi_any": riichi_any,
                 "prior_discard_exclusion": prior_discard_exclusion,
                 "use_tenpai": use_tenpai,
+                "use_deal_in_instant": use_deal_in_instant,
                 "multi_target": multi_target,
                 "cap": cap,
                 "worker_matched_states_cap": worker_matched_states_cap,
@@ -1195,6 +1210,7 @@ class LiveAnalyzer:
                                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                                         progress_callback(processed, total_logs)
                                     continue
+                        round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
                         game_states = parse_log_to_game_states(raw)
                     
                         # 按小局分组（每局 4 个玩家）
@@ -1204,6 +1220,9 @@ class LiveAnalyzer:
                             round_players = game_states[round_start:round_start + round_size]
                             if len(round_players) < round_size:
                                 break
+                            round_idx = round_start // round_size
+                            round_payload = round_payloads[round_idx] if round_idx < len(round_payloads) else None
+                            round_instant_analyzer = None
                             rn = getattr(round_players[0], "round_num", 0)
                             if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
                                 continue
@@ -1385,7 +1404,7 @@ class LiveAnalyzer:
                                     # 排除：若未打出牌就是目标牌，不计入统计（与无副露情况一致）；听牌模式无此概率，跳过
                                     mapped_target = matched_variant["target"]
                                     mt_for_item = item_multi_targets[matched_idx]
-                                    if not use_tenpai:
+                                    if not use_tenpai and not use_deal_in_instant:
                                         target_equiv = set()
                                         if len(mt_for_item) == 1:
                                             if item_combo:
@@ -1460,6 +1479,32 @@ class LiveAnalyzer:
                                             pattern_distributions[matched_idx][k][cnt] = pattern_distributions[matched_idx][k].get(cnt, 0) + 1
                                     else:
                                         pattern_distributions[matched_idx][target_count] += 1
+
+                                    instant_eval = {
+                                        "deal_in_hit": False,
+                                        "deal_in_point": 0,
+                                        "furiten_state": "none",
+                                        "furiten_reason": "",
+                                        "waits_snapshot": [],
+                                    }
+                                    if use_deal_in_instant:
+                                        mapped_target_str = mapped_target if isinstance(mapped_target, str) else ""
+                                        if round_instant_analyzer is None and round_payload:
+                                            try:
+                                                rp_data, rp_events = round_payload
+                                                round_instant_analyzer = RoundInstantDealInAnalyzer(
+                                                    rp_data, rp_events, player_state.round_num, player_state.oya
+                                                )
+                                            except Exception as e:
+                                                logger.debug(f"即时铳率引擎初始化失败: {e}")
+                                                round_instant_analyzer = None
+                                        if round_instant_analyzer and mapped_target_str:
+                                            instant_eval = round_instant_analyzer.evaluate(
+                                                player_state.player_id, discard.turn, mapped_target_str
+                                            )
+                                        if instant_eval.get("deal_in_hit"):
+                                            deal_in_hits_total += 1
+                                            deal_in_point_sum_total += int(instant_eval.get("deal_in_point", 0))
                                 
                                     # 记录匹配状态（仅保留前 cap 条，避免内存持续增长）
                                     if len(matched_states) < cap:
@@ -1475,6 +1520,14 @@ class LiveAnalyzer:
                                             ms_entry['target_counts'] = target_counts
                                         else:
                                             ms_entry['target_count'] = target_count
+                                        if use_deal_in_instant:
+                                            ms_entry.update({
+                                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                                "furiten_state": instant_eval.get("furiten_state", "none"),
+                                                "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                                "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                                            })
                                         matched_states.append(ms_entry)
                                 
                                     # 主统计时顺带收集完整样本，供采样直接使用
@@ -1519,6 +1572,14 @@ class LiveAnalyzer:
                                             sp_entry["target_counts"] = target_counts
                                         else:
                                             sp_entry["target_count"] = target_count
+                                        if use_deal_in_instant:
+                                            sp_entry.update({
+                                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                                "furiten_state": instant_eval.get("furiten_state", "none"),
+                                                "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                                "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                                            })
                                         # 入库前校验：避免宣称拆搭/手切不符的样本（如NOTm-2s 要求 2s 手切；t 不应匹配）
                                         qp, tt = items[matched_idx]
                                         ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
@@ -1609,13 +1670,23 @@ class LiveAnalyzer:
             })
 
         n = max(1, total_matches)
+        instant_deal_in_rate = (deal_in_hits_total / n) if total_matches > 0 else 0.0
+        instant_deal_in_point_avg = (
+            deal_in_point_sum_total / max(1, deal_in_hits_total)
+            if deal_in_hits_total > 0 else 0.0
+        )
+        instant_deal_in_intensity = instant_deal_in_rate * instant_deal_in_point_avg
         result = {
             'total_logs_analyzed': processed,
             'total_matches': total_matches,
+            'deal_in_hits': deal_in_hits_total,
+            'deal_in_point_sum': deal_in_point_sum_total,
+            'deal_in_point_avg': instant_deal_in_point_avg,
+            'deal_in_intensity': instant_deal_in_intensity,
             'outcome_wins': outcome_wins_total,
             'outcome_deal_ins': outcome_deal_ins_total,
             'win_rate': outcome_wins_total / n,
-            'deal_in_rate': outcome_deal_ins_total / n,
+            'deal_in_rate': instant_deal_in_rate if use_deal_in_instant else (outcome_deal_ins_total / n),
             'target_count_distribution': target_count_distribution,
             'probability_distribution': probability_distribution,
             'query_pattern': first_pattern,
@@ -1657,6 +1728,15 @@ class LiveAnalyzer:
                 logger.info(
                     f"  {pr['pattern_str']} -> {pr['target']}: {pr['matches']:,} matches"
                 )
+        elif use_deal_in_instant:
+            logger.info(
+                "  即时铳率: %.2f%% (%s/%s)",
+                result.get("deal_in_rate", 0.0) * 100,
+                result.get("deal_in_hits", 0),
+                total_matches,
+            )
+            logger.info("  平均铳点: %.1f", result.get("deal_in_point_avg", 0.0))
+            logger.info("  铳度: %.2f", result.get("deal_in_intensity", 0.0))
         elif multi_target:
             for tk in target_tiles:
                 pd = probability_distribution.get(tk, {})
@@ -1734,6 +1814,67 @@ class LiveAnalyzer:
             "query_pattern": result.get("query_pattern", query_pattern or []),
             "query_pattern_str": result.get("query_pattern_str", ""),
             "target_tile": result.get("target_tile", target_tile),
+        }
+
+    def compute_instant_deal_in_metrics(
+        self,
+        query_pattern: List[str] = None,
+        target_tile: str = None,
+        query_items: Optional[List[Tuple[List[str], str]]] = None,
+        dora_constraint: Optional[str] = None,
+        dora_position_spec: Optional[List[int]] = None,
+        visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        riichi_constraint: Optional[str] = None,
+        call_constraint: Optional[str] = None,
+        call_area_constraints: Optional[List[str]] = None,
+        turn_range: Optional[Tuple[int, int]] = None,
+        sample_limit: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        exclude_south4: bool = False,
+        exclude_south3: bool = False,
+        prior_discard_exclusion: Optional[str] = None,
+        max_workers: Optional[int] = None,
+        gc_interval_batches: Optional[int] = None,
+    ) -> Dict:
+        """
+        即时铳率统计：仅看命中样本当巡时点，不看整局终局结果。
+        """
+        result = self.analyze_discard_pattern(
+            query_pattern=query_pattern,
+            target_tile=target_tile,
+            query_items=query_items,
+            dora_constraint=dora_constraint,
+            dora_position_spec=dora_position_spec,
+            visible_constraints=visible_constraints,
+            riichi_constraint=riichi_constraint,
+            call_constraint=call_constraint,
+            call_area_constraints=call_area_constraints,
+            analysis_target="deal_in_instant",
+            turn_range=turn_range,
+            sample_limit=sample_limit,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
+            exclude_south4=exclude_south4,
+            exclude_south3=exclude_south3,
+            prior_discard_exclusion=prior_discard_exclusion,
+            max_workers=max_workers,
+            gc_interval_batches=gc_interval_batches,
+        )
+        return {
+            "analysis_target": "deal_in_instant",
+            "total_matches": result.get("total_matches", 0),
+            "deal_in_hits": result.get("deal_in_hits", 0),
+            "deal_in_rate": result.get("deal_in_rate", 0.0),
+            "deal_in_point_sum": result.get("deal_in_point_sum", 0),
+            "deal_in_point_avg": result.get("deal_in_point_avg", 0.0),
+            "deal_in_intensity": result.get("deal_in_intensity", 0.0),
+            "total_logs_analyzed": result.get("total_logs_analyzed", 0),
+            "elapsed_seconds": result.get("elapsed_seconds", 0),
+            "query_pattern": result.get("query_pattern", query_pattern or []),
+            "query_pattern_str": result.get("query_pattern_str", ""),
+            "target_tile": result.get("target_tile", target_tile),
+            "sample_pool": result.get("sample_pool", []),
         }
 
     def analyze_discard_pattern_grid(
@@ -2193,6 +2334,7 @@ class LiveAnalyzer:
         prior_discard_exclusion: Optional[str] = None,
         gc_interval_batches: Optional[int] = None,
         outcome_filter: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
+        deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
     ) -> List[Dict]:
         """
         收集验证样本，用于人工复盘核验。
@@ -2213,6 +2355,16 @@ class LiveAnalyzer:
                     candidates = [s for s in candidates if s.get("outcome_deal_in")]
                 elif outcome_filter == "neither":
                     candidates = [s for s in candidates if not s.get("outcome_won") and not s.get("outcome_deal_in")]
+            if deal_in_filter is not None:
+                if deal_in_filter == "hit":
+                    candidates = [s for s in candidates if s.get("deal_in_hit")]
+                elif deal_in_filter == "miss":
+                    candidates = [s for s in candidates if not s.get("deal_in_hit")]
+                elif deal_in_filter == "furiten":
+                    candidates = [
+                        s for s in candidates
+                        if (not s.get("deal_in_hit")) and str(s.get("furiten_state", "none")) != "none"
+                    ]
             if target_count_filter is not None:
                 if target_tile_filter and any("target_counts" in s for s in sample_pool):
                     candidates = [s for s in sample_pool if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
@@ -2644,11 +2796,12 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     """Format verification samples for readable display."""
     use_tenpai = (analysis_target == "tenpai")
     use_outcome = (analysis_target == "outcome")
+    use_instant = (analysis_target == "deal_in_instant")
     is_combo = False if use_tenpai else (samples[0].get("is_combo", False) if samples else False)
     has_multi = bool(samples and samples[0].get("target_counts"))
-    target_label = "和铳率" if use_outcome else (target_tile if use_tenpai else (
+    target_label = "即时铳率" if use_instant else ("和铳率" if use_outcome else (target_tile if use_tenpai else (
         f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
-    ))
+    )))
     lines = [
         "=" * 80,
         f"Verification Samples: {query_pattern_str} -> {target_label}",
@@ -2657,7 +2810,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     ]
     for i, s in enumerate(samples, 1):
         mt = s.get("mapped_target")
-        if use_outcome:
+        if use_outcome or use_instant:
             mt_set = set()
         elif has_multi and s.get("target_counts"):
             mt_set = _target_counts_display_set(s["target_counts"])
@@ -2672,6 +2825,12 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
         if use_outcome:
             target_line = f"  结局:        {_outcome_label(s)}"
+        elif use_instant:
+            hit = bool(s.get("deal_in_hit"))
+            point = int(s.get("deal_in_point", 0))
+            target_line = f"  即时可铳:    {'是' if hit else '否'}"
+            if hit:
+                target_line += f" (理论点 {point})"
         elif use_tenpai:
             target_line = f"  Tenpai:      {_target_desc(s, use_tenpai)}"
         elif has_multi and s.get("target_counts"):
@@ -2692,10 +2851,15 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             target_line,
             f"  Hand({len(s['hand_tiles'])}): {hand_str}",
         ]
+        if use_instant:
+            block.append(f"  振听状态:    {s.get('furiten_state', 'none')}")
+            block.append(f"  振听原因:    {s.get('furiten_reason', '') or '(无)'}")
+            waits = s.get("waits_snapshot") or []
+            block.append(f"  当时待牌:    {' '.join(waits) if waits else '(无)'}")
         if not use_tenpai and not use_outcome:
             if has_multi and s.get("target_counts"):
                 block.append(f"  Visible targets: {s['visible_target']}")
-            else:
+            elif not use_instant:
                 block.append(
                     f"  Visible {_fmt_target(mt)}: {s['visible_target']}{'' if s.get('is_combo') else ' tiles'}"
                 )
