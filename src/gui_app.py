@@ -2135,7 +2135,7 @@ class MainWindow(QMainWindow):
         call_row.addStretch()
         right_layout.addLayout(call_row)
         exclude_south_row = QHBoxLayout()
-        self.exclude_south4_check = QCheckBox("不考虑南四局")
+        self.exclude_south4_check = QCheckBox("禁止南四局")
         self.exclude_south4_check.setToolTip("南四局打法会根据点数状况有极大改变，勾选时跳过南四局")
         exclude_south_row.addWidget(self.exclude_south4_check)
         self.exclude_south3_check = QCheckBox("禁止南三局")
