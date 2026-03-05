@@ -1,0 +1,15 @@
+# Exclude entire data directory (contains 200GB+ tenhou.db)
+# Agent/codebase index must not scan or watch this
+data/
+
+# Exclude all SQLite DB files anywhere in the project
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Large or binary assets that agent does not need
+houou-logs/
+*.zip
+*.log

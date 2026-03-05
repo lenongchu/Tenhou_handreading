@@ -32,15 +32,21 @@ class Database:
         self.cursor = None
     
     def connect(self):
-        """建立数据库连接"""
-        self.conn = sqlite3.connect(str(self.db_path))
+        """建立数据库连接。限制缓存与 mmap，减轻大库（如 tenhou.db）对内存的占用。"""
+        self.conn = sqlite3.connect(str(self.db_path), timeout=60)
         self.cursor = self.conn.cursor()
+        self.cursor.execute("PRAGMA cache_size = -2000")
+        self.cursor.execute("PRAGMA mmap_size = 0")
         logger.info(f"已连接到数据库: {self.db_path}")
     
     def close(self):
-        """关闭数据库连接"""
+        """关闭数据库连接并清空引用，便于 GC 回收与释放 OS 缓存。"""
         if self.conn:
-            self.conn.close()
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None
+                self.cursor = None
             logger.info("数据库连接已关闭")
     
     def create_tables(self):

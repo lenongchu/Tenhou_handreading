@@ -560,6 +560,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     riichi_any = params.get("riichi_any", False)
     prior_discard_exclusion = params.get("prior_discard_exclusion")
     use_tenpai = params.get("use_tenpai", False)
+    use_deal_in_instant = params.get("use_deal_in_instant", False)
     cap = params.get("cap", MATCHED_STATES_CAP)
     worker_matched_states_cap = max(
         1, min(cap, int(params.get("worker_matched_states_cap", cap)))
@@ -574,6 +575,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     total_matches = 0
     outcome_wins = 0
     outcome_deal_ins = 0
+    deal_in_hits = 0
+    deal_in_point_sum = 0
     pattern_matches = [0] * len(items)
     if params.get("multi_target"):
         pattern_distributions = [
@@ -594,19 +597,23 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         if riichi_any and _is_tenhou6_json(raw):
             if "riichi" not in raw and "reach" not in raw:
                 return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
+                        "deal_in_hits": 0, "deal_in_point_sum": 0,
                         "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                         "matched_states": [], "sample_pool": []}
         if consumed_search_list and _is_tenhou6_json(raw):
             if len(items) == 1:
                 if not log_contains_consumed(raw, consumed_search_list[0]):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
+                            "deal_in_hits": 0, "deal_in_point_sum": 0,
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": []}
             else:
                 if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
+                            "deal_in_hits": 0, "deal_in_point_sum": 0,
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": []}
+        round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
         game_states = parse_log_to_game_states(raw)
         round_size = 4
 
@@ -614,6 +621,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             round_players = game_states[round_start:round_start + round_size]
             if len(round_players) < round_size:
                 break
+            round_idx = round_start // round_size
+            round_payload = round_payloads[round_idx] if round_idx < len(round_payloads) else None
+            round_instant_analyzer = None
             rn = getattr(round_players[0], "round_num", 0)
             if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
                 continue
@@ -739,8 +749,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         if not match_visible:
                             continue
                     mapped_target = matched_variant["target"]
+                    mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
                     mt_for_item = item_multi_targets[matched_idx]
-                    if not use_tenpai:
+                    if not use_tenpai and not use_deal_in_instant:
                         target_equiv = set()
                         if len(mt_for_item) == 1:
                             if item_combo:
@@ -797,9 +808,29 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         ) else 0
                         target_counts = None
                     else:
-                        equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
+                        equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
                         target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                         target_counts = None
+
+                    instant_eval = {}
+                    if use_deal_in_instant:
+                        if round_instant_analyzer is None and round_payload:
+                            try:
+                                rp_data, rp_events = round_payload
+                                round_instant_analyzer = RoundInstantDealInAnalyzer(
+                                    rp_data, rp_events, player_state.round_num, player_state.oya
+                                )
+                            except Exception as e:
+                                logger.debug(f"即时铳率引擎初始化失败: {e}")
+                                round_instant_analyzer = None
+                        if round_instant_analyzer and mapped_target_str:
+                            instant_eval = round_instant_analyzer.evaluate(
+                                player_state.player_id, discard.turn, mapped_target_str
+                            )
+                        if instant_eval.get("deal_in_hit"):
+                            deal_in_hits += 1
+                            deal_in_point_sum += int(instant_eval.get("deal_in_point", 0))
+
                     if len(mt_item) > 1 and target_counts:
                         for k, cnt in target_counts.items():
                             pattern_distributions[matched_idx][k][cnt] = pattern_distributions[matched_idx][k].get(cnt, 0) + 1
@@ -822,6 +853,14 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             ms_entry['target_counts'] = target_counts
                         else:
                             ms_entry['target_count'] = target_count
+                        if use_deal_in_instant:
+                            ms_entry.update({
+                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                "furiten_state": instant_eval.get("furiten_state", "none"),
+                                "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                            })
                         matched_states.append(ms_entry)
 
                     if len(sample_pool) < worker_sample_pool_cap:
@@ -845,11 +884,21 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "hand_tiles": list(hand_at_turn), "visible_tiles": visible_tiles_dict,
                             "dora_readable": dora_readable, "visible_target": visible_target,
                             "call_area": call_area, "is_combo": item_combo, "matched_pattern_idx": matched_idx,
+                            "outcome_won": bool(rw and player_state.player_id in rw),
+                            "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
                         }
                         if target_counts is not None:
                             sp_entry["target_counts"] = target_counts
                         else:
                             sp_entry["target_count"] = target_count
+                        if use_deal_in_instant:
+                            sp_entry.update({
+                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                "furiten_state": instant_eval.get("furiten_state", "none"),
+                                "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                            })
                         qp, tt = items[matched_idx]
                         ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
                         if ok:
@@ -862,6 +911,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         "total_matches": total_matches,
         "outcome_wins": outcome_wins,
         "outcome_deal_ins": outcome_deal_ins,
+        "deal_in_hits": deal_in_hits,
+        "deal_in_point_sum": deal_in_point_sum,
         "pattern_matches": pattern_matches,
         "pattern_distributions": pattern_distributions,
         "matched_states": matched_states,
@@ -1045,10 +1096,12 @@ class LiveAnalyzer:
             ]
         target_count_distribution = pattern_distributions[0]
 
-        use_parallel = (max_workers is not None and max_workers > 1) and (not use_deal_in_instant)
-        if use_deal_in_instant and (max_workers or 1) > 1:
-            logger.info("即时铳率模式默认使用串行分析（完整事件重放+振听判定）")
+        use_parallel = (max_workers is not None and max_workers > 1)
         workers = min(max(1, max_workers or 1), os.cpu_count() or 4)
+        if use_deal_in_instant and (max_workers or 1) > 1:
+            logger.info(f"即时铳率模式启用并行分析（workers={workers}）")
+        elif use_deal_in_instant:
+            logger.info("即时铳率模式串行分析（完整事件重放+振听判定）")
         batch_size = _clamp_analysis_batch_size(requested_batch_size, workers, use_parallel)
         analysis_params = None
         if use_parallel:
@@ -1151,12 +1204,16 @@ class LiveAnalyzer:
                 ):
                     if should_cancel and should_cancel():
                         conn.close()
+                        gc.collect()
+                        _trim_process_memory()
                         if pool:
                             pool.shutdown(wait=False)
                         return _empty_analysis_result(first_pattern, first_target)
                     total_matches += per_log_result["total_matches"]
                     outcome_wins_total += per_log_result.get("outcome_wins", 0)
                     outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
+                    deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
+                    deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
                     for i, n in enumerate(per_log_result["pattern_matches"]):
                         pattern_matches[i] += n
                     for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
@@ -1189,6 +1246,8 @@ class LiveAnalyzer:
                 for log_id, log_content in logs:
                     if should_cancel and should_cancel():
                         conn.close()
+                        gc.collect()
+                        _trim_process_memory()
                         if pool:
                             pool.shutdown(wait=False)
                         return _empty_analysis_result(first_pattern, first_target)
@@ -1572,6 +1631,8 @@ class LiveAnalyzer:
                                             "call_area": call_area,
                                             "is_combo": item_combo,
                                             "matched_pattern_idx": matched_idx,
+                                            "outcome_won": bool(rw and player_state.player_id in rw),
+                                            "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
                                         }
                                         if target_counts is not None:
                                             sp_entry["target_counts"] = target_counts
@@ -1625,6 +1686,8 @@ class LiveAnalyzer:
         if pool is not None:
             pool.shutdown(wait=True)
         conn.close()
+        gc.collect()
+        _trim_process_memory()
 
         # 并行鏃跺彲鑳借秴鍑?cap锛屾埅鏂?
         matched_states = matched_states[:cap]
@@ -2038,6 +2101,8 @@ class LiveAnalyzer:
                     ):
                         if should_cancel and should_cancel():
                             conn.close()
+                            gc.collect()
+                            _trim_process_memory()
                             return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
                         for (tr_idx, pat_idx), delta in per_log_result.items():
                             k = (tr_idx, pat_idx)
@@ -2053,6 +2118,8 @@ class LiveAnalyzer:
                 for log_id, log_content in logs:
                     if should_cancel and should_cancel():
                         conn.close()
+                        gc.collect()
+                        _trim_process_memory()
                         return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
                     try:
                         raw = _get_raw_content(log_content)
@@ -2288,6 +2355,8 @@ class LiveAnalyzer:
                 break
 
         conn.close()
+        gc.collect()
+        _trim_process_memory()
 
         # 按格计算合并概率与完整分布
         cell_combo = {(tr_idx, pat_idx): is_combo for tr_idx, pat_idx, _, _, _, is_combo in grid_meta}
@@ -2340,17 +2409,20 @@ class LiveAnalyzer:
         gc_interval_batches: Optional[int] = None,
         outcome_filter: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
         deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
+        analysis_target: Optional[str] = None,
     ) -> List[Dict]:
         """
         收集验证样本，用于人工复盘核验。
         返回含 log_id、oya、局显示等完整信息的样本列表。
-        若传入 sample_pool锛堜富统计时预收集），则直接从池采样，无需二次分析。
+        若传入 sample_pool（主统计时预收集），则直接从池采样，无需二次分析。
         """
         requested_batch_size = (
             analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
         )
         batch_size = _clamp_analysis_batch_size(requested_batch_size, workers=1, use_parallel=False)
-        if sample_pool and len(sample_pool) > 0:
+        use_deal_in_instant = (analysis_target == "deal_in_instant")
+
+        if sample_pool is not None:
             # 从预收集的样本池中筛选并取前 N 个，无需遍历牌谱（主分析已排除南四局则无需再过滤）
             candidates = sample_pool
             if outcome_filter is not None:
@@ -2371,12 +2443,13 @@ class LiveAnalyzer:
                         if (not s.get("deal_in_hit")) and str(s.get("furiten_state", "none")) != "none"
                     ]
             if target_count_filter is not None:
-                if target_tile_filter and any("target_counts" in s for s in sample_pool):
-                    candidates = [s for s in sample_pool if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
-                elif any("target_counts" in s for s in sample_pool):
-                    candidates = sample_pool
+                if target_tile_filter and any("target_counts" in s for s in candidates):
+                    candidates = [s for s in candidates if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
+                elif any("target_counts" in s for s in candidates):
+                    # 多模式但未指定具体 target_tile_filter 时，按主模式统计
+                    candidates = [s for s in candidates if s.get("target_count") == target_count_filter]
                 else:
-                    candidates = [s for s in sample_pool if s.get("target_count") == target_count_filter]
+                    candidates = [s for s in candidates if s.get("target_count") == target_count_filter]
             # 多模式时：二次校验actual_pattern 与当前 query 一致，避免选中 NOTm-2s 却混淆NOTm-2st 的样本
             verified = [s for s in candidates if verify_sample_consistency(s, query_pattern, target_tile, visible_constraints)[0]]
             return verified[:sample_count]
@@ -2427,6 +2500,8 @@ class LiveAnalyzer:
             for log_id, log_content in logs:
                 if should_cancel and should_cancel():
                     conn.close()
+                    gc.collect()
+                    _trim_process_memory()
                     return samples
                 try:
                     raw = _get_raw_content(log_content)
@@ -2437,12 +2512,17 @@ class LiveAnalyzer:
                         if not log_contains_consumed(raw, consumed_search):
                             continue
                     game_states = parse_log_to_game_states(raw)
+                    round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
                     round_size = 4
 
                     for round_start in range(0, len(game_states), round_size):
                         round_players = game_states[round_start:round_start + round_size]
                         if len(round_players) < round_size:
                             break
+                        round_idx = round_start // round_size
+                        round_payload = round_payloads[round_idx] if round_idx < len(round_payloads) else None
+                        round_instant_analyzer = None
+                        
                         rn = getattr(round_players[0], "round_num", 0)
                         if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
                             continue
@@ -2475,39 +2555,81 @@ class LiveAnalyzer:
                             if not in_range:
                                 continue
 
-                            discards_precomputed = [
+                            all_discards_precomputed = [
                                 (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                for _, d in in_range
+                                for d in player_state.discards
                             ]
-                            discarded_bases = set()
+                            all_riichi_flags = [
+                                getattr(d, 'is_riichi_declaration', False)
+                                for d in player_state.discards
+                            ]
                             honor_ctx_base = {
                                 "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
                                 "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                             }
-                            discard_riichi_flags = [getattr(in_range[i][1], 'is_riichi_declaration', False) for i in range(len(in_range))]
 
                             for j, (orig_i, discard) in enumerate(in_range):
                                 discarded_bases.add(discard.tile // 4)
-                                full_discards_up_to_now = discards_precomputed[:j + 1]
-                                hand_discard_strings = []
-                                for i, (t, ts) in enumerate(full_discards_up_to_now):
-                                    if i < len(discard_riichi_flags) and discard_riichi_flags[i]:
-                                        hand_discard_strings.append(f"{t}r")
-                                    elif ts:
-                                        hand_discard_strings.append(f"{t}t")
-                                    else:
-                                        hand_discard_strings.append(t)
+                                full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
+                                current_riichi_flags = all_riichi_flags[:orig_i + 1]
+                                hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
 
                                 honor_ctx = {
                                     **honor_ctx_base,
                                     "current_discard_turn": discard.turn,
-                                    "discard_riichi_flags": discard_riichi_flags[: j + 1],
+                                    "discard_riichi_flags": current_riichi_flags,
                                 }
                                 matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
                                 if not matched_variant:
                                     continue
+                                
+                                # 排除：若未打出牌就是目标牌，不计入
+                                mapped_target = matched_variant["target"]
+                                mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
+                                sample_is_combo = matched_variant.get("is_combo", False)
+                                if sample_is_combo:
+                                    target_equiv = set()
+                                    for t in mapped_target:
+                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                    if discard.tile // 4 in target_equiv:
+                                        continue
+                                else:
+                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                        continue
+
+                                # 结局过滤
+                                rw = getattr(player_state, "round_winners", [])
+                                rdi = getattr(player_state, "round_deal_in", None)
+                                if outcome_filter:
+                                    if outcome_filter == "win" and player_state.player_id not in rw:
+                                        continue
+                                    if outcome_filter == "deal_in" and rdi != player_state.player_id:
+                                        continue
+                                    if outcome_filter == "neither" and (player_state.player_id in rw or rdi == player_state.player_id):
+                                        continue
+
+                                # 即时铳率分析
+                                instant_eval = {}
+                                if use_deal_in_instant:
+                                    if round_instant_analyzer is None and round_payload:
+                                        try:
+                                            rp_data, rp_events = round_payload
+                                            round_instant_analyzer = RoundInstantDealInAnalyzer(rp_data, rp_events, player_state.round_num, player_state.oya)
+                                        except:
+                                            pass
+                                    if round_instant_analyzer and mapped_target_str:
+                                        instant_eval = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, mapped_target_str)
+                                
+                                if deal_in_filter:
+                                    if deal_in_filter == "hit" and not instant_eval.get("deal_in_hit"):
+                                        continue
+                                    if deal_in_filter == "miss" and instant_eval.get("deal_in_hit"):
+                                        continue
+                                    if deal_in_filter == "furiten" and (instant_eval.get("deal_in_hit") or str(instant_eval.get("furiten_state", "none")) == "none"):
+                                        continue
+
                                 if prior_discard_exclusion and turn_range:
                                     prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
                                     excl_str = matched_variant.get("prior_discard_exclusion")
@@ -2635,7 +2757,17 @@ class LiveAnalyzer:
                                     "call_area": call_area,
                                     "target_count": target_count,
                                     "is_combo": sample_is_combo,
+                                    "outcome_won": bool(rw and player_state.player_id in rw),
+                                    "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
                                 }
+                                if use_deal_in_instant:
+                                    sp_entry.update({
+                                        "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                        "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                        "furiten_state": instant_eval.get("furiten_state", "none"),
+                                        "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                        "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                                    })
                                 if verify_sample_consistency(sp_entry, query_pattern, target_tile, visible_constraints)[0]:
                                     samples.append(sp_entry)
                                 if len(samples) >= sample_count:
@@ -2670,6 +2802,8 @@ class LiveAnalyzer:
                 break
 
         conn.close()
+        gc.collect()
+        _trim_process_memory()
         return samples
 
 
@@ -2880,30 +3014,21 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
 
 def get_database_stats(db_path: str) -> Dict:
     """
-    获取数据库统计信息
-    
-    Args:
-        db_path: 数据搴撹矾寰?
-        
-    Returns:
-        统计信息字典
+    获取数据库统计信息。
+    使用内存受限连接，用后立即关闭并触发 gc/trim，避免 tenhou.db 长期占用数 GB 缓存。
     """
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db_memory_efficient(db_path)
     cur = conn.cursor()
-    
     stats = {}
-    
-    # 对局总数
-    cur.execute("SELECT COUNT(*) FROM logs WHERE log IS NOT NULL AND log != ''")
-    stats['total_logs'] = cur.fetchone()[0]
-    
-    # 数据搴撳ぇ将
-    import os
-    if os.path.exists(db_path):
-        stats['db_size_mb'] = os.path.getsize(db_path) / (1024 * 1024)
-    
-    conn.close()
-    
+    try:
+        cur.execute("SELECT COUNT(*) FROM logs WHERE log IS NOT NULL AND log != ''")
+        stats['total_logs'] = cur.fetchone()[0]
+        if os.path.exists(db_path):
+            stats['db_size_mb'] = os.path.getsize(db_path) / (1024 * 1024)
+    finally:
+        conn.close()
+    gc.collect()
+    _trim_process_memory()
     return stats
 
 

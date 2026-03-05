@@ -99,19 +99,27 @@ class DiscardSnapshot:
     player_wind: int
 
 
-def extract_tenhou6_rounds(raw: str) -> List[Tuple[Dict, List[Dict]]]:
+def extract_tenhou6_rounds(raw: Union[str, Dict]) -> List[Tuple[Dict, List[Dict]]]:
     """
     从 tenhou6 原始 JSON 中提取小局（去重后一局一条）：
     返回 [(game_data, game_events), ...]
     """
     if not raw:
         return []
-    s = raw.strip()
-    if not (s.startswith("{") and "games" in raw):
-        return []
-    try:
-        data = json.loads(raw)
-    except Exception:
+    
+    data = None
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        s = raw.strip()
+        if not (s.startswith("{") and "games" in raw):
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+    
+    if not data:
         return []
     out: List[Tuple[Dict, List[Dict]]] = []
     seen = set()
@@ -408,11 +416,37 @@ class RoundInstantDealInAnalyzer:
             return cached
 
         waits: Set[int] = set()
+        # 性能优化：如果不听牌，则不可能荣和
+        if not self._is_tenpai_bases(snapshot.hand_bases):
+            self._waits_cache[sig] = waits
+            return waits
+
         for base in range(34):
             if self._get_ron_point_by_sig(snapshot, sig, base) > 0:
                 waits.add(base)
         self._waits_cache[sig] = waits
         return waits
+
+    def _is_tenpai_bases(self, hand_bases: Union[List[int], Tuple[int, ...]]) -> bool:
+        """判断手牌是否听牌（向听数=0）"""
+        try:
+            from mahjong.shanten import Shanten
+        except ImportError:
+            return False
+        
+        tiles_34 = [0] * 34
+        for b in hand_bases:
+            b = RED_TO_STANDARD.get(b, b)
+            if 0 <= b < 34:
+                tiles_34[b] += 1
+        
+        # 自动推断已副露的面子数：(13 - hand_len) // 3
+        # mahjong 库的 calculate_shanten 在 13 张牌以下时会自动处理面子
+        try:
+            shanten = Shanten().calculate_shanten(tiles_34, use_chiitoitsu=True, use_kokushi=True)
+            return shanten == 0
+        except Exception:
+            return False
 
     def _get_ron_point(self, snapshot: DiscardSnapshot, target_base: int) -> int:
         sig = self._snapshot_signature(snapshot)

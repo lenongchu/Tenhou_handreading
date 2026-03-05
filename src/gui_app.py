@@ -707,7 +707,7 @@ class SampleThread(QThread):
                 self.progress_num.emit(cur, total)
                 self.progress.emit(f"已扫描: {_fmt_int(cur)} 场" + (f"/{_fmt_int(total)}" if total > 0 else ""))
             params = {k: v for k, v in self.params.items()
-                      if k not in ("query_pattern_str", "is_combo", "query_items", "matched_states_cap", "call_area_constraints", "analysis_target")}
+                      if k not in ("query_pattern_str", "is_combo", "query_items", "matched_states_cap", "call_area_constraints")}
             samples = self.analyzer.collect_verification_samples(
                 **params,
                 sample_count=self.sample_count,
