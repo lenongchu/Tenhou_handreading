@@ -12,25 +12,25 @@ class TestMjlogParser:
     """MjlogParser 测试类"""
     
     def test_tile_to_string(self):
-        """测试牌编码转换为字符串"""
-        # 数牌
-        assert MjlogParser.tile_to_string(0) == "1m"
-        assert MjlogParser.tile_to_string(8) == "9m"
-        assert MjlogParser.tile_to_string(9) == "1p"
-        assert MjlogParser.tile_to_string(17) == "9p"
-        assert MjlogParser.tile_to_string(18) == "1s"
-        assert MjlogParser.tile_to_string(26) == "9s"
-        
-        # 风牌
-        assert MjlogParser.tile_to_string(27) == "东"
-        assert MjlogParser.tile_to_string(28) == "南"
-        assert MjlogParser.tile_to_string(29) == "西"
-        assert MjlogParser.tile_to_string(30) == "北"
-        
-        # 三元牌
-        assert MjlogParser.tile_to_string(31) == "白"
-        assert MjlogParser.tile_to_string(32) == "发"
-        assert MjlogParser.tile_to_string(33) == "中"
+        """测试牌编码（tile 0-147，base=tile//4）转换为字符串"""
+        # 数牌：tile = base*4（与 tenhou6 / live_analyzer 一致）
+        assert MjlogParser.tile_to_string(0) == "1m"   # base 0
+        assert MjlogParser.tile_to_string(32) == "9m"  # base 8
+        assert MjlogParser.tile_to_string(36) == "1p"  # base 9
+        assert MjlogParser.tile_to_string(68) == "9p"  # base 17
+        assert MjlogParser.tile_to_string(72) == "1s"   # base 18
+        assert MjlogParser.tile_to_string(104) == "9s"  # base 26
+
+        # 风牌：base 27-30
+        assert MjlogParser.tile_to_string(108) == "东"  # base 27
+        assert MjlogParser.tile_to_string(112) == "南"  # base 28
+        assert MjlogParser.tile_to_string(116) == "西"  # base 29
+        assert MjlogParser.tile_to_string(120) == "北"  # base 30
+
+        # 三元牌：base 31-33
+        assert MjlogParser.tile_to_string(124) == "白"  # base 31
+        assert MjlogParser.tile_to_string(128) == "发"  # base 32
+        assert MjlogParser.tile_to_string(132) == "中"  # base 33
     
     def test_string_to_tile(self):
         """测试字符串转换为牌编码"""

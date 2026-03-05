@@ -651,7 +651,7 @@ class OutcomeQueryThread(QThread):
 
             outcome_params = {
                 k: v for k, v in self.params.items()
-                if k in ("query_pattern", "target_tile", "query_items", "dora_constraint",
+                if k in ("query_pattern", "target_tile", "query_items", "dora_constraint", "dora_position_spec",
                          "visible_constraints", "riichi_constraint", "call_constraint",
                          "call_area_constraints", "turn_range", "sample_limit",
                          "exclude_south4", "exclude_south3", "prior_discard_exclusion",
@@ -1244,7 +1244,7 @@ class GridQueryThread(QThread):
         try:
             self.progress.emit(f"矩阵分析中：{len(self.patterns)} 模式 × {len(self.turn_ranges)} 巡目...")
             shared = {k: v for k, v in self.params.items()
-                      if k in ("dora_constraint", "riichi_constraint", "call_constraint",
+                      if k in ("dora_constraint", "dora_position_spec", "riichi_constraint", "call_constraint",
                                "call_area_constraints", "visible_constraints", "sample_limit",
                                "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
                                "prior_discard_exclusion", "max_workers")}
@@ -1395,7 +1395,7 @@ class BatchChartThread(QThread):
             total = len(self.patterns) * len(self.turn_ranges)
             shared = self.constraint_params
             shared_filtered = {k: v for k, v in shared.items()
-                              if k in ("dora_constraint", "riichi_constraint", "call_constraint",
+                              if k in ("dora_constraint", "dora_position_spec", "riichi_constraint", "call_constraint",
                                        "call_area_constraints", "visible_constraints", "sample_limit",
                                        "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
                                        "prior_discard_exclusion", "max_workers", "gc_interval_batches")}
@@ -1654,21 +1654,30 @@ class BatchChartDialog(QDialog):
         }
         if self.constraint_group.isChecked():
             dora = "dora_unrelated" if self.batch_dora_irrelevant.isChecked() else (self.batch_dora_input.text().strip() or "any")
+            dora_pos = []  # Batch dialog has no dora_matches_position UI
             riichi = "any" if self.batch_riichi_any.isChecked() else ("has_riichi" if self.batch_riichi_has.isChecked() else "no_riichi")
             call = "any" if self.batch_call_any.isChecked() else ("has_call" if self.batch_call_has.isChecked() else "no_call")
             call_area = [le.text().strip() for le in self.batch_call_area_inputs if le.text().strip()][:4]
             visible = {}
             if self.batch_use_main_constraints.isChecked():
                 visible = mw._get_visible_constraints_from_ui() or {}
-            base.update(dora_constraint=dora, riichi_constraint=riichi, call_constraint=call,
+            base.update(dora_constraint=dora, dora_position_spec=dora_pos, riichi_constraint=riichi, call_constraint=call,
                 call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
         else:
-            dora = "dora_unrelated" if mw.dora_irrelevant_radio.isChecked() else (mw.dora_tile_input.text().strip() or "any")
+            if mw.dora_irrelevant_radio.isChecked():
+                dora = "dora_unrelated"
+                dora_pos = []
+            elif getattr(mw, "dora_matches_position_radio", None) and mw.dora_matches_position_radio.isChecked():
+                dora = "dora_matches_position"
+                dora_pos = mw._parse_dora_position_spec()
+            else:
+                dora = mw.dora_tile_input.text().strip() or "any"
+                dora_pos = []
             riichi = "any" if mw.riichi_any_radio.isChecked() else ("has_riichi" if mw.riichi_has_radio.isChecked() else "no_riichi")
             call = "any" if mw.call_any_radio.isChecked() else ("has_call" if mw.call_has_radio.isChecked() else "no_call")
             call_area = [le.text().strip() for le in mw.call_area_inputs if le.text().strip()][:4]
             visible = mw._get_visible_constraints_from_ui() or {}
-            base.update(dora_constraint=dora, riichi_constraint=riichi, call_constraint=call,
+            base.update(dora_constraint=dora, dora_position_spec=dora_pos, riichi_constraint=riichi, call_constraint=call,
                 call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
         return base
 
@@ -2095,13 +2104,23 @@ class MainWindow(QMainWindow):
         self.dora_group.addButton(self.dora_irrelevant_radio, 0)
         self.dora_specific_radio = QRadioButton("宝牌为")
         self.dora_group.addButton(self.dora_specific_radio, 1)
+        self.dora_matches_position_radio = QRadioButton("宝牌=模式第")
+        self.dora_group.addButton(self.dora_matches_position_radio, 2)
         self.dora_tile_input = QLineEdit()
         self.dora_tile_input.setPlaceholderText("例: 6s")
         self.dora_tile_input.setMinimumWidth(50)
         self.dora_tile_input.setMaximumWidth(70)
+        self.dora_position_input = QLineEdit()
+        self.dora_position_input.setPlaceholderText("例: 1 或 1,3")
+        self.dora_position_input.setMinimumWidth(50)
+        self.dora_position_input.setMaximumWidth(70)
+        self.dora_position_input.setToolTip("1-based，如 1 表示第1张，1,3 表示第1、3张必须为宝牌")
         dora_row.addWidget(self.dora_irrelevant_radio)
         dora_row.addWidget(self.dora_specific_radio)
         dora_row.addWidget(self.dora_tile_input)
+        dora_row.addWidget(self.dora_matches_position_radio)
+        dora_row.addWidget(self.dora_position_input)
+        dora_row.addWidget(QLabel("张"))
         dora_row.addStretch()
         right_layout.addLayout(dora_row)
         riichi_row = QHBoxLayout()
@@ -2344,6 +2363,19 @@ class MainWindow(QMainWindow):
                 target_edit.setPlaceholderText("（和铳率无需）")
             else:
                 target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
+
+    def _parse_dora_position_spec(self) -> List[int]:
+        """解析「宝牌=模式第 N 张」的位置输入，返回 0-based 下标列表。如 1,3 -> [0, 2]"""
+        widget = getattr(self, "dora_position_input", None)
+        if widget is None:
+            return []
+        text = (widget.text() if hasattr(widget, "text") else "").strip()
+        if not text:
+            return []
+        try:
+            return [int(x.strip()) - 1 for x in text.replace("，", ",").split(",") if x.strip()]
+        except ValueError:
+            return []
 
     def _get_pattern_items(self, require_target: bool = True) -> List[Tuple[List[str], str]]:
         """从界面获取所有 (pattern, target) 对。require_target=False 时（听牌/和铳率模式）目标可为空，以 5z 占位"""
@@ -3135,12 +3167,28 @@ class MainWindow(QMainWindow):
         # 宝牌约束
         if self.dora_irrelevant_radio.isChecked():
             dora_constraint = "dora_unrelated"
+            dora_position_spec = []
+        elif self.dora_matches_position_radio.isChecked():
+            dora_constraint = "dora_matches_position"
+            pos_str = self.dora_position_input.text().strip()
+            if not pos_str:
+                QMessageBox.warning(self, "输入错误", "请输入模式位置（如 1 或 1,3）")
+                return
+            try:
+                dora_position_spec = [int(x.strip()) - 1 for x in pos_str.replace("，", ",").split(",") if x.strip()]
+            except ValueError:
+                QMessageBox.warning(self, "输入错误", "位置请输入数字，如 1 或 1,3")
+                return
+            if not dora_position_spec or any(p < 0 for p in dora_position_spec):
+                QMessageBox.warning(self, "输入错误", "位置须为正整数（1-based）")
+                return
         else:
             dora_tile = self.dora_tile_input.text().strip()
             if not dora_tile:
                 QMessageBox.warning(self, "输入错误", "请输入宝牌")
                 return
             dora_constraint = dora_tile
+            dora_position_spec = []
         
         # 立直约束
         if self.riichi_any_radio.isChecked():
@@ -3199,6 +3247,7 @@ class MainWindow(QMainWindow):
             "analysis_target": analysis_target,
             "visible_constraints": visible_constraints if visible_constraints else None,
             "dora_constraint": dora_constraint,
+            "dora_position_spec": dora_position_spec,
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
             "call_area_constraints": call_area_constraints if call_area_constraints else None,
@@ -3498,6 +3547,7 @@ class MainWindow(QMainWindow):
                 "target_tile": first_target,
                 "analysis_target": result.get("analysis_target", "target_count"),
                 "dora_constraint": dora_constraint,
+                "dora_position_spec": self._parse_dora_position_spec() if self.dora_matches_position_radio.isChecked() else [],
                 "visible_constraints": visible_constraints if visible_constraints else None,
                 "riichi_constraint": riichi_constraint,
                 "call_constraint": call_constraint,

@@ -46,7 +46,7 @@
 - 用户输入「宝牌为 4s」
 - 等价于接受：4s、4m、4p（同一数字、不同花色）
 
-### 3.2 实现方式
+### 3.2 「宝牌为 X」的实现方式
 
 宝牌约束**不**作为参数传入 `generate_equivalent_variants`，而是在 `src/live_analyzer.py` 中对每一局进行 round 级检查。
 
@@ -57,6 +57,14 @@
 - **字牌**：无花色等价，需完全匹配
 
 这样，对「宝牌为 4s」而言，实际宝牌为 4s、4m、4p 的局都会被接受，与「舍牌 1s-2s 的三个等价变体 1s-2s / 1m-2m / 1p-2p」在逻辑上一致。
+
+### 3.3 「宝牌=模式第 N 张」的等价 participation
+
+**宝牌=模式第 N 张**（`dora_matches_position`）天然参与等价变换，**无需额外映射**：
+
+1. **匹配时**：`match_discard_to_variant` 对每个变体分别尝试匹配。当变体 `1s-2s` 匹配成功时，`position_to_tile` 中的值来源于**本局实际舍牌**（如 `"1s"`, `"2s"`），即已处于该变体的花色空间。
+2. **检查时**：比较 `position_to_tile[pos]` 与 `dora_str`（本局实际宝牌）。二者均来自同一局，同一花色空间。
+3. **示例**：模式 `2m-3m`，指定第 1 张为宝牌。变体 `2s-3s` 仅在舍牌为 2s-3s 时匹配，`position_to_tile[0]="2s"`；此时仅当本局宝牌为 2s 时满足约束。变体 `2m-3m` 同理，要求宝牌为 2m。等价变换通过「先匹配变体 → 再取实际舍牌」自动完成。
 
 ---
 
@@ -98,7 +106,9 @@ generate_equivalent_variants()
 
 1. **映射来源**：由舍牌模式的花色集合决定，在 `generate_equivalent_variants` 中一次性生成，是该模式的全局映射集。
 2. **映射范围**：舍牌模式、目标牌、可见枚数约束、前段禁打，均按同一 mapping 做等价变换。
-3. **宝牌约束**：未传入 `generate_equivalent_variants`，但在 round 级通过 `_dora_matches_constraint` 实现与 mapping 等同的等价语义。
+3. **宝牌约束**：
+   - 「宝牌为 X」：未传入变体生成，round 级通过 `_dora_matches_constraint` 实现等价语义。
+   - 「宝牌=模式第 N 张」：通过 `position_to_tile`（由实际舍牌填充）自然参与等价，变体匹配即完成花色映射。
 4. **等价关系**：数牌同数字不同花色等价；赤五 0m/0p/0s 等价；字牌无花色等价。
 
 ---
@@ -114,3 +124,5 @@ generate_equivalent_variants()
 | 宝牌等价检查 | live_analyzer.py | `_dora_matches_constraint` |
 | 宝牌 round 过滤 | live_analyzer.py | 多处 `if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(...)` |
 | 宝牌无关（pattern_suit） | live_analyzer.py | 从 `matched_variant["discard"]` 提取花色后比较 |
+| 宝牌=模式第 N 张 | equivalent_variants.py | `_match_pattern_at_end` 填充 `out_position_to_tile` |
+| 宝牌=模式第 N 张 | live_analyzer.py | 匹配后检查 `position_to_tile[pos] == dora_str`（约 5 处） |

@@ -1438,6 +1438,7 @@ def _match_pattern_at_end(
     full_discards: List[Tuple[str, bool]],
     pattern: List[Tuple[str, bool]],
     context: Optional[Dict] = None,
+    out_position_to_tile: Optional[Dict[int, str]] = None,
 ) -> bool:
     """
     检查完整舍牌序列末尾是否匹配模式。
@@ -1452,6 +1453,7 @@ def _match_pattern_at_end(
         full_discards: [(牌字符串, 是否摸切), ...]，牌为中文或 1m 等
         pattern: [(牌或占位符, 是否要求摸切), ...]
         context: {"jikaze": str, "kyokuze_list": List[str]}，用于 zf/kf
+        out_position_to_tile: 若提供，成功匹配时填充 {pattern_idx: 匹配到的牌}（仅舍牌消耗位置）
     """
     if not full_discards or not pattern:
         return False
@@ -1486,6 +1488,8 @@ def _match_pattern_at_end(
             if tile_str != want_tile or not is_tsumogiri:
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1506,6 +1510,8 @@ def _match_pattern_at_end(
             if not _discard_is_chaida(full_discards, d_idx, require_suit, exclude_suit):
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1533,6 +1539,8 @@ def _match_pattern_at_end(
                     if tile_str[-1] != excl_suit:
                         return False
                 consumed_any_discard = True
+                if out_position_to_tile is not None:
+                    out_position_to_tile[p_idx] = tile_str
                 d_idx -= 1
                 p_idx -= 1
                 continue
@@ -1547,6 +1555,8 @@ def _match_pattern_at_end(
                 if tile_suit == excl_suit:
                     return False
                 consumed_any_discard = True
+                if out_position_to_tile is not None:
+                    out_position_to_tile[p_idx] = tile_str
                 d_idx -= 1
                 p_idx -= 1
                 continue
@@ -1562,6 +1572,8 @@ def _match_pattern_at_end(
                 if base == "kf" and (not kyokuze_list or tile_str not in kyokuze_list):
                     return False
                 consumed_any_discard = True
+                if out_position_to_tile is not None:
+                    out_position_to_tile[p_idx] = tile_str
                 d_idx -= 1
                 p_idx -= 1
                 continue
@@ -1619,6 +1631,8 @@ def _match_pattern_at_end(
             if matched_opt is None:
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1703,6 +1717,8 @@ def _match_pattern_at_end(
         if pat_tile == "*":
             if is_tsumogiri:
                 consumed_any_discard = True
+                if out_position_to_tile is not None:
+                    out_position_to_tile[p_idx] = tile_str
                 d_idx -= 1
                 continue
             else:
@@ -1714,6 +1730,8 @@ def _match_pattern_at_end(
             if is_tsumogiri:
                 return False  # 必须是手切
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1727,6 +1745,8 @@ def _match_pattern_at_end(
             if not _is_honor_tile(tile_str):
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1734,6 +1754,8 @@ def _match_pattern_at_end(
             if jikaze is None or _honor_tile_to_z(tile_str) != _honor_tile_to_z(jikaze):
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1741,6 +1763,8 @@ def _match_pattern_at_end(
             if not kyokuze_list or _honor_tile_to_z(tile_str) not in [_honor_tile_to_z(k) for k in kyokuze_list]:
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1748,6 +1772,8 @@ def _match_pattern_at_end(
             if _honor_tile_to_z(tile_str) not in yakuhai_set:
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1768,6 +1794,8 @@ def _match_pattern_at_end(
                     return False
                 matched_honors.add(tile_z)
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1779,6 +1807,8 @@ def _match_pattern_at_end(
             if tile_str[-1] != pat_tile:
                 return False
             consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
             d_idx -= 1
             p_idx -= 1
             continue
@@ -1787,6 +1817,8 @@ def _match_pattern_at_end(
         if tile_str != pat_tile:
             return False
         consumed_any_discard = True
+        if out_position_to_tile is not None:
+            out_position_to_tile[p_idx] = tile_str
         d_idx -= 1
         p_idx -= 1
 
@@ -1870,8 +1902,9 @@ def match_discard_to_variant(
         匹配到的变体，若都不匹配则返回 None
     """
     for v in variants:
-        if _match_pattern_at_end(full_discards, v["discard"], context):
-            return v
+        out_pt = {}
+        if _match_pattern_at_end(full_discards, v["discard"], context, out_position_to_tile=out_pt):
+            return {**v, "position_to_tile": out_pt}
     return None
 
 

@@ -52,6 +52,16 @@ HIGH_MEMORY_LOAD_RATIO = 0.90
 POOL_RESTART_EVERY_BATCHES = 3
 
 
+def _tile_str_eq(a: str, b: str) -> bool:
+    """牌字符串相等（东/1z 等字牌格式统一比较）"""
+    if a == b:
+        return True
+    try:
+        return MjlogParser.string_to_tile(a) == MjlogParser.string_to_tile(b)
+    except (ValueError, TypeError):
+        return False
+
+
 def _dora_matches_constraint(dora_str: str, dora_constraint: str) -> bool:
     """
     宝牌是否满足约束（支持花色等价：数牌 4s ≡ 4m ≡ 4p）。
@@ -295,6 +305,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
     patterns = params["patterns"]
     grid_meta = params["grid_meta"]
     dora_constraint = params.get("dora_constraint")
+    dora_position_spec = params.get("dora_position_spec") or []
     riichi_constraint = params.get("riichi_constraint")
     call_constraint = params.get("call_constraint")
     call_area_constraints = params.get("call_area_constraints")
@@ -334,7 +345,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
             dora_str = None
             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                     continue
             if consumed_search_list:
                 if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
@@ -434,6 +445,16 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                                     break
                             if pattern_suit and dora_str[-1] == pattern_suit:
                                 continue
+                        if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                            pos_to_tile = matched_variant.get("position_to_tile") or {}
+                            skip_match = False
+                            for pos in dora_position_spec:
+                                tile_at_pos = pos_to_tile.get(pos)
+                                if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                    skip_match = True
+                                    break
+                            if skip_match:
+                                continue
                         if riichi_constraint and riichi_constraint != "any":
                             if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                 continue
@@ -521,6 +542,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     item_multi_targets = params["item_multi_targets"]
     turn_range = params.get("turn_range")
     dora_constraint = params.get("dora_constraint")
+    dora_position_spec = params.get("dora_position_spec") or []
     visible_constraints = params.get("visible_constraints")
     riichi_constraint = params.get("riichi_constraint")
     call_constraint = params.get("call_constraint")
@@ -593,7 +615,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             dora_str = None
             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                     continue
             if consumed_search_list:
                 if len(items) == 1:
@@ -670,6 +692,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                 pattern_suit = t[-1]
                                 break
                         if pattern_suit and dora_str[-1] == pattern_suit:
+                            continue
+                    if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                        pos_to_tile = matched_variant.get("position_to_tile") or {}
+                        skip_match = False
+                        for pos in dora_position_spec:
+                            tile_at_pos = pos_to_tile.get(pos)
+                            if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                skip_match = True
+                                break
+                        if skip_match:
                             continue
                     if riichi_constraint and riichi_constraint != "any":
                         if riichi_constraint == "has_riichi" and not discard.riichi_happened:
@@ -876,6 +908,7 @@ class LiveAnalyzer:
         target_tile: str = None,
         query_items: Optional[List[Tuple[List[str], str]]] = None,
         dora_constraint: Optional[str] = None,
+        dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,  # "any" | "has_call" | "no_call"
@@ -1011,6 +1044,7 @@ class LiveAnalyzer:
                 "item_multi_targets": item_multi_targets,
                 "turn_range": turn_range,
                 "dora_constraint": dora_constraint,
+                "dora_position_spec": dora_position_spec or [],
                 "visible_constraints": visible_constraints,
                 "riichi_constraint": riichi_constraint,
                 "call_constraint": call_constraint,
@@ -1180,7 +1214,7 @@ class LiveAnalyzer:
                                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
                                 # 指定宝牌：局级判断，不满足则跳过整局
                                 # 当前测试，之后可能也做等价变体处
-                                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                                if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                                     continue
 
                             # 局级consumed 棰勮繃婊わ細单模寮忕敤鍗曚竴 consumed；多模式需至少一个模式的 consumed 存在
@@ -1300,7 +1334,16 @@ class LiveAnalyzer:
                                                 break
                                         if pattern_suit and dora_str[-1] == pattern_suit:
                                             continue
-                                
+                                    if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                        pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                        skip_match = False
+                                        for pos in dora_position_spec:
+                                            tile_at_pos = pos_to_tile.get(pos)
+                                            if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                                skip_match = True
+                                                break
+                                        if skip_match:
+                                            continue
                                     # 立直/副露约束：以匹配序列最后一张牌打出瞬间的状态为出
                                     if riichi_constraint and riichi_constraint != "any":
                                         if riichi_constraint == "has_riichi" and not discard.riichi_happened:
@@ -1639,6 +1682,7 @@ class LiveAnalyzer:
         target_tile: str = None,
         query_items: Optional[List[Tuple[List[str], str]]] = None,
         dora_constraint: Optional[str] = None,
+        dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
@@ -1664,6 +1708,7 @@ class LiveAnalyzer:
             target_tile=target_tile,
             query_items=query_items,
             dora_constraint=dora_constraint,
+            dora_position_spec=dora_position_spec,
             visible_constraints=visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
@@ -1698,6 +1743,7 @@ class LiveAnalyzer:
         merge_keys: List[int],
         analysis_target: str = "target_count",
         dora_constraint: Optional[str] = None,
+        dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
@@ -1793,6 +1839,7 @@ class LiveAnalyzer:
             "patterns": patterns,
             "grid_meta": grid_meta,
             "dora_constraint": dora_constraint,
+            "dora_position_spec": dora_position_spec or [],
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
             "call_area_constraints": call_area_constraints,
@@ -1889,7 +1936,7 @@ class LiveAnalyzer:
                             dora_str = None
                             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                                if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                                if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                                     continue
                             if consumed_search_list:
                                 if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
@@ -1988,6 +2035,16 @@ class LiveAnalyzer:
                                                     pattern_suit = t[-1]
                                                     break
                                             if pattern_suit and dora_str[-1] == pattern_suit:
+                                                continue
+                                        if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                            pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                            skip_match = False
+                                            for pos in dora_position_spec:
+                                                tile_at_pos = pos_to_tile.get(pos)
+                                                if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                                    skip_match = True
+                                                    break
+                                            if skip_match:
                                                 continue
                                         if riichi_constraint and riichi_constraint != "any":
                                             if riichi_constraint == "has_riichi" and not discard.riichi_happened:
@@ -2120,6 +2177,7 @@ class LiveAnalyzer:
         target_count_filter: Optional[int] = None,  # None=全部, 0/1/2/3=可收该数
         target_tile_filter: Optional[str] = None,  # 多目标时指定按哪一目标筛选，如"6s"
         dora_constraint: Optional[str] = None,
+        dora_position_spec: Optional[List[int]] = None,  # 宝牌=模式第N张时使用
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
@@ -2234,7 +2292,7 @@ class LiveAnalyzer:
                         dora_str = None
                         if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                             dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                            if dora_constraint != "dora_unrelated" and not _dora_matches_constraint(dora_str, dora_constraint):
+                            if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                                 continue
 
                         if consumed_search and not round_has_matching_consumed(round_players, consumed_search):
@@ -2310,7 +2368,16 @@ class LiveAnalyzer:
                                             break
                                     if pattern_suit and dora_str[-1] == pattern_suit:
                                         continue
-
+                                if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                    pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                    skip_match = False
+                                    for pos in dora_position_spec:
+                                        tile_at_pos = pos_to_tile.get(pos)
+                                        if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                            skip_match = True
+                                            break
+                                    if skip_match:
+                                        continue
                                 if riichi_constraint and riichi_constraint != "any":
                                     if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                         continue
