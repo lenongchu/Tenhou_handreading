@@ -274,14 +274,14 @@ def parse_log_to_game_states(content: Union[bytes, str]) -> List[GameState]:
             logger.warning(f"tenhou6 JSON 解析失败: {e}")
             return []
 
-    # XML锛氶通过 tenhou-paifu-to-json 转为 tenhou6 JSON 后解析
+    # XML：通过 tenhou-paifu-to-json 转为 tenhou6 JSON 后解析
     try:
         from .tenhou6_adapter import xml_to_tenhou6_json, load_tenhou6_json
         json_str = xml_to_tenhou6_json(raw)
         if json_str:
             return load_tenhou6_json(json_str)
     except Exception as e:
-        logger.warning(f"XML鈫抰enhou6 转换失败: {e}")
+        logger.warning(f"XML->tenhou6 转换失败: {e}")
 
     return []
 
@@ -289,7 +289,7 @@ def parse_log_to_game_states(content: Union[bytes, str]) -> List[GameState]:
 def _process_one_log_grid(task: Tuple) -> Dict:
     """
     Per-log 并行 worker：处理单条牌谱，返回该log 对各格的增量统计。
-    例 ProcessPoolExecutor 调用锛屽繀椤绘槸模块级函数以支持 pickle。
+    例 ProcessPoolExecutor 调用，必须是模块级函数以支持 pickle。
     """
     log_id, log_content, params = task
     patterns = params["patterns"]
@@ -890,13 +890,13 @@ class LiveAnalyzer:
         analysis_batch_size: Optional[int] = None,  # 每批从数据库读取的对局数，None 用默认ANALYSIS_BATCH_SIZE
         exclude_south4: bool = False,  # 南四局打法随点数变化大，True 时跳过
         exclude_south3: bool = False,  # True 时跳过南三局，可与 exclude_south4 同选
-        prior_discard_exclusion: Optional[str] = None,  # 前段不可打，如NOTm。mOR2m锛屼笌舍牌模式同步等价变换
+        prior_discard_exclusion: Optional[str] = None,  # 前段不可打，如NOTm。mOR2m，与舍牌模式同步等价变换
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
     ) -> Dict:
         """
         分析舍牌模式，计算目标牌在手牌中的概率。
-        支持多舍牌模式：query_items 中任一匹配即计入（A or B or C锛夈€?
+        支持多舍牌模式：query_items 中任一匹配即计入（A or B or C）。
 
         Args:
             query_pattern: 单模式时的舍牌序列（与 target_tile 配，兼容旧接口）
@@ -911,7 +911,7 @@ class LiveAnalyzer:
             progress_callback: 进度回调函数 (current, total)
             should_cancel: 取消检查函数
             total_logs_hint: 对局总数预计值
-            matched_states_cap: 最多保留的匹配状态条数（用于界面展示锛屽影响内存）
+            matched_states_cap: 最多保留的匹配状态条数（用于界面展示，影响内存）
             analysis_batch_size: 每批读取对局数（越大越省 SQL 次数，但单条内存线 1.2GB/1000 条）
 
         Returns:
@@ -1045,7 +1045,7 @@ class LiveAnalyzer:
         cur = conn.cursor()
         _ensure_log_json_column(conn)
 
-        # 避免 COUNT(*) 鍦ㄥぇ搴撲笂罚秒等燂紱使用 total_logs_hint 鎴?sample_limit
+        # 避免 COUNT(*) 在大库上罚秒等；使用 total_logs_hint 或 sample_limit
         total_logs = _total_logs
 
         # 批量读取并分析（用id 游标分页），避免OFFSET 越大越慢）
@@ -1221,7 +1221,7 @@ class LiveAnalyzer:
                                 elif call_area_constraints and not player_could_satisfy_call_area_constraints(player_state, oya, call_area_constraints):
                                     continue
 
-                                # 提取巡目范围鍐呯殑舍牌
+                                # 提取巡目范围内的舍牌
                                 if turn_range:
                                     min_turn, max_turn = turn_range
                                     in_range = [(i, d) for i, d in enumerate(player_state.discards)
@@ -1313,7 +1313,7 @@ class LiveAnalyzer:
                                         if call_constraint == "no_call" and discard.call_happened:
                                             continue
                                 
-                                    # 副露区域约束：目标玩家必须满足所有指定的副露锛圓ND锛夛紱仅统计此次舍牌前已完成的副露
+                                    # 副露区域约束：目标玩家必须满足所有指定的副露（AND）；仅统计此次舍牌前已完成的副露
                                     _ca = matched_variant.get("call_area_constraints") or call_area_constraints
                                     if _ca:
                                         if not player_satisfies_call_area_constraints(
@@ -1358,7 +1358,7 @@ class LiveAnalyzer:
                                         if discard.tile // 4 in target_equiv:
                                             continue
                                 
-                                    # 匹配鎴愬姛）
+                                    # 匹配成功）
                                     total_matches += 1
                                     pattern_matches[matched_idx] += 1
                                     rw = getattr(player_state, "round_winners", [])
@@ -1494,7 +1494,7 @@ class LiveAnalyzer:
                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                         progress_callback(processed, total_logs)
                 
-                    # 杈惧埌鏍锋湰闄愬埗
+                    # 达到样本限制
                     if sample_limit and processed >= sample_limit:
                         break
 
@@ -1509,7 +1509,7 @@ class LiveAnalyzer:
                 _ensure_log_json_column(conn)
                 _trim_process_memory()
 
-            # 杈惧埌鏍锋湰闄愬埗
+            # 达到样本限制
             if sample_limit and processed >= sample_limit:
                 break
 
@@ -1517,7 +1517,7 @@ class LiveAnalyzer:
             pool.shutdown(wait=True)
         conn.close()
 
-        # 并行鏃跺彲鑳借秴鍑?cap锛屾埅鏂?
+        # 并行时可能超出 cap，截断
         matched_states = matched_states[:cap]
         sample_pool = sample_pool[:sample_pool_cap]
 
@@ -1762,7 +1762,7 @@ class LiveAnalyzer:
             analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
         )
 
-        # 姣忔牸分布: (tr_idx, pat_idx) -> {0:n, 1:n, 2:n, 3:n} 鎴?tenpai 鏃?{0:n, 1:n}
+        # 每格分布: (tr_idx, pat_idx) -> {0:n, 1:n, 2:n, 3:n} 或 tenpai 时{0:n, 1:n}
         grid_dist = {}
         for tr_idx, pat_idx, _, _, multi_t, is_combo in grid_meta:
             k = (tr_idx, pat_idx)
@@ -1783,7 +1783,7 @@ class LiveAnalyzer:
         workers = min(max(1, max_workers or 1), os.cpu_count() or 4)
         batch_size = _clamp_analysis_batch_size(requested_batch_size, workers, use_parallel)
         if use_parallel:
-            logger.info(f"单次扫描批量分析锛堝苟琛?workers={workers}） {len(patterns)} 模式 脳 {len(turn_ranges)} 巡目")
+            logger.info(f"单次扫描批量分析（并行 workers={workers}） {len(patterns)} 模式 x {len(turn_ranges)} 巡目")
         else:
             logger.info(
                 f"single-scan grid analysis: {len(patterns)} patterns x {len(turn_ranges)} turn ranges = {len(grid_meta)} cells"
@@ -2139,7 +2139,7 @@ class LiveAnalyzer:
         """
         收集验证样本，用于人工复盘核验。
         返回含 log_id、oya、局显示等完整信息的样本列表。
-        若传入 sample_pool锛堜富统计时预收集），则直接从池采样，无需二次分析。
+        若传入 sample_pool（主统计时预收集），则直接从池采样，无需二次分析。
         """
         requested_batch_size = (
             analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
@@ -2484,7 +2484,7 @@ def _fmt_target(mt) -> str:
 
 
 def _target_desc(s: dict, use_tenpai: bool = False) -> str:
-    """目标牌描述：听牌模式=听牌/未听牌；搭子=未时无搭子；单张=应有X张在手牌锛涘目标=各目标枚数"""
+    """目标牌描述：听牌模式=听牌/未听牌；搭子=未时无搭子；单张=应有X张在手牌；目标=各目标枚数"""
     if use_tenpai:
         return "tenpai" if s["target_count"] else "noten"
     tc = s.get("target_counts")
@@ -2647,7 +2647,7 @@ def get_database_stats(db_path: str) -> Dict:
     获取数据库统计信息
     
     Args:
-        db_path: 数据搴撹矾寰?
+        db_path: 数据库路径
         
     Returns:
         统计信息字典
@@ -2661,7 +2661,7 @@ def get_database_stats(db_path: str) -> Dict:
     cur.execute("SELECT COUNT(*) FROM logs WHERE log IS NOT NULL AND log != ''")
     stats['total_logs'] = cur.fetchone()[0]
     
-    # 数据搴撳ぇ将
+    # 数据库大小
     import os
     if os.path.exists(db_path):
         stats['db_size_mb'] = os.path.getsize(db_path) / (1024 * 1024)
