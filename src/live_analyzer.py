@@ -80,6 +80,11 @@ def _dora_matches_constraint(dora_str: str, dora_constraint: str) -> bool:
     return False
 
 
+def _opponent_riichi_happened(discard) -> bool:
+    """Whether any non-self player has declared riichi by this discard timing."""
+    return bool(getattr(discard, "opponent_riichi_happened", getattr(discard, "riichi_happened", False)))
+
+
 def _clamp_analysis_batch_size(batch_size: int, workers: int, use_parallel: bool) -> int:
     """Clamp analysis batch size to keep parallel memory usage bounded."""
     requested = max(MIN_ANALYSIS_BATCH_SIZE, int(batch_size))
@@ -459,7 +464,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         if riichi_constraint and riichi_constraint != "any":
                             if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                 continue
-                            if riichi_constraint == "no_riichi" and discard.riichi_happened:
+                            if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                 continue
                         if call_constraint and call_constraint != "any":
                             if call_constraint == "has_call" and not discard.call_happened:
@@ -707,7 +712,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     if riichi_constraint and riichi_constraint != "any":
                         if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                             continue
-                        if riichi_constraint == "no_riichi" and discard.riichi_happened:
+                        if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                             continue
                     if call_constraint and call_constraint != "any":
                         if call_constraint == "has_call" and not discard.call_happened:
@@ -1367,7 +1372,7 @@ class LiveAnalyzer:
                                     if riichi_constraint and riichi_constraint != "any":
                                         if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                             continue
-                                        if riichi_constraint == "no_riichi" and discard.riichi_happened:
+                                        if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                             continue
                                     if call_constraint and call_constraint != "any":
                                         if call_constraint == "has_call" and not discard.call_happened:
@@ -2190,7 +2195,7 @@ class LiveAnalyzer:
                                         if riichi_constraint and riichi_constraint != "any":
                                             if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                                 continue
-                                            if riichi_constraint == "no_riichi" and discard.riichi_happened:
+                                            if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                                 continue
                                         if call_constraint and call_constraint != "any":
                                             if call_constraint == "has_call" and not discard.call_happened:
@@ -2533,7 +2538,7 @@ class LiveAnalyzer:
                                 if riichi_constraint and riichi_constraint != "any":
                                     if riichi_constraint == "has_riichi" and not discard.riichi_happened:
                                         continue
-                                    if riichi_constraint == "no_riichi" and discard.riichi_happened:
+                                    if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                         continue
                                 if call_constraint and call_constraint != "any":
                                     if call_constraint == "has_call" and not discard.call_happened:

@@ -104,6 +104,7 @@ def _parse_round_from_tenhou6(
     hands: List[List[int]] = [_tehai_to_hand_tiles(tehais_raw[i]) if i < len(tehais_raw) and tehais_raw[i] else [] for i in range(4)]
     turns_count = [0] * 4
     riichi_seen = False
+    riichi_declared = [False] * 4
     call_seen = False
     # 立直 step1（riichi/reach）：下一张该玩家的 dahai 即为立直宣言牌
     pending_riichi_actor: Optional[int] = None
@@ -142,6 +143,7 @@ def _parse_round_from_tenhou6(
                 tile=t,
                 is_tsumogiri=tsumogiri,
                 riichi_happened=riichi_seen,
+                opponent_riichi_happened=any(riichi_declared[i] for i in range(4) if i != actor),
                 call_happened=call_seen,
                 is_riichi_declaration=is_riichi_decl,
             )
@@ -162,6 +164,8 @@ def _parse_round_from_tenhou6(
             # tenhou-paifu-to-json 输出 "riichi"/"riichi_accepted"，部分数据为 "reach"/"reach_accepted"
             # 任一立直相关事件均标记 riichi_seen，确保同巡内后续舍牌正确获得 riichi_happened=True
             riichi_seen = True
+            if isinstance(actor, int) and 0 <= actor < 4:
+                riichi_declared[actor] = True
             # 仅 step1（riichi/reach，非 riichi_accepted）时，下一张该玩家的 dahai 为立直宣言牌
             if ev_type in ("reach", "riichi"):
                 pending_riichi_actor = actor

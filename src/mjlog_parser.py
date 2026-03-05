@@ -25,6 +25,7 @@ class Discard:
     tile: int           # 牌编码（0-147，含赤五 base 34-36）
     is_tsumogiri: bool  # 是否摸切
     riichi_happened: bool = False   # 打出此牌时，是否已有人立直
+    opponent_riichi_happened: bool = False  # 打出此牌时，是否已有其他三家立直
     call_happened: bool = False     # 打出此牌时，是否已有人副露（吃/碰/杠）
     is_riichi_declaration: bool = False  # 该舍牌是否为立直宣言牌（打出此牌宣告立直）
 

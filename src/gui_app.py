@@ -1875,6 +1875,7 @@ class MainWindow(QMainWindow):
         self.sample_thread = None
         self.last_query_params = None  # 上次查询参数，用于生成样本
         self.last_query_result = None  # 上次查询结果（含 sample_pool），用于快速采样
+        self._forced_analysis_target = None  # 由铳率分析页强制指定 analysis_target
         self._excel_clipboard_text = ""  # 当前结果的 Excel 格式文本
         self._pattern_checkboxes = []  # 多模式勾选框列表
         self._archive_entries: List[Dict[str, Any]] = []  # 存档条目列表
@@ -1919,9 +1920,9 @@ class MainWindow(QMainWindow):
         # 使用独立 TabBar 便于放到数据管理区标题旁
         tab_bar = QTabBar()
         self.main_tab.setTabBar(tab_bar)
-        self.main_tab.addTab(query_group, "查询条件")
-        self.main_tab.addTab(result_group, "查询结果")
+        self.main_tab.addTab(query_group, "一般分析")
         self.main_tab.addTab(instant_group, "铳率分析")
+        self.main_tab.addTab(result_group, "查询结果")
         illustration_group = QWidget()
         ill_layout = QVBoxLayout(illustration_group)
         ill_layout.addWidget(TileIllustrationWidget(self))
@@ -2017,7 +2018,7 @@ class MainWindow(QMainWindow):
     
     def _create_query_input_group(self) -> QGroupBox:
         """创建查询条件：左侧舍牌模式（主展示），右侧分析选项与约束（横向紧凑）"""
-        group = QGroupBox("查询条件")
+        group = QGroupBox("一般分析")
         main_row = QHBoxLayout()
         main_row.setSpacing(16)
         
@@ -2233,13 +2234,11 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo = QComboBox()
         self.analysis_target_combo.addItem("目标牌存量", "target_count")
         self.analysis_target_combo.addItem("是否听牌", "tenpai")
-        self.analysis_target_combo.addItem("即时铳率", "deal_in_instant")
         self.analysis_target_combo.addItem("和铳率", "outcome")
         self.analysis_target_combo.setMinimumWidth(100)
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
-            "即时铳率：统计命中当巡时点可对目标牌荣和的概率与理论点；"
             "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
@@ -2789,15 +2788,13 @@ class MainWindow(QMainWindow):
                 target_edit.clear()
 
         self._sync_instant_constraints_to_main()
-        self.analysis_target_combo.setCurrentIndex(
-            max(0, self.analysis_target_combo.findData("deal_in_instant"))
-        )
+        self._forced_analysis_target = "deal_in_instant"
         self.turn_range_slider.setRange(tmin, tmax)
         for edit in getattr(self, "_turn_range_edits", []):
             edit.clear()
 
         self.instant_status_label.setText("已提交分析，进度与结果请查看“查询结果”页。")
-        self.main_tab.setCurrentIndex(1)
+        self.main_tab.setCurrentIndex(2)
         self.execute_query()
 
     def _create_result_display_group(self) -> QGroupBox:
@@ -3521,7 +3518,9 @@ class MainWindow(QMainWindow):
 
     def execute_query(self):
         """执行查询"""
-        analysis_target = self.analysis_target_combo.currentData() or "target_count"
+        forced_target = self._forced_analysis_target
+        self._forced_analysis_target = None
+        analysis_target = forced_target or (self.analysis_target_combo.currentData() or "target_count")
         use_tenpai = (analysis_target == "tenpai")
         use_instant = (analysis_target == "deal_in_instant")
         use_outcome = (analysis_target == "outcome")
@@ -3817,7 +3816,7 @@ class MainWindow(QMainWindow):
         if success:
             # 和铳率统计结果
             if isinstance(result, dict) and {"total", "wins", "deal_ins"}.issubset(result.keys()):
-                self.main_tab.setCurrentIndex(1)
+                self.main_tab.setCurrentIndex(2)
                 n = result.get("total", 0)
                 wins = result.get("wins", 0)
                 deal_ins = result.get("deal_ins", 0)
@@ -3888,12 +3887,12 @@ class MainWindow(QMainWindow):
                 self._excel_clipboard_text = "\n".join(_rows)
                 self.copy_excel_btn.setEnabled(True)
                 self.save_archive_btn.setEnabled(True)
-                self.main_tab.setCurrentIndex(1)
+                self.main_tab.setCurrentIndex(2)
                 return
 
             self.last_query_result = result
             self.matrix_display_btn.setEnabled(False)
-            self.main_tab.setCurrentIndex(1)  # 自动切换到查询结果标签页
+            self.main_tab.setCurrentIndex(2)  # 自动切换到查询结果标签页
             if result.get("multi_pattern") and result.get("pattern_results"):
                 query_items = [(pr["pattern"], pr["target"]) for pr in result["pattern_results"]]
             else:
