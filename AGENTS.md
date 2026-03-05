@@ -338,3 +338,4 @@
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
 - **本手册维护**：新增重要目录/脚本/模块时，同步更新本文件；`docs/项目文件夹结构说明.md` 保持为轻量索引并指向本文件
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处
+- **编码与乱码**：编辑含中文的源文件时，**禁止**经终端输出/管道写回；务必使用编辑器级写入并保证 UTF-8。详见 `docs/mojibake_root_cause.md`
