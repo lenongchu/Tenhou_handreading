@@ -1493,7 +1493,23 @@ def _match_pattern_at_end(
             riichi_flags = ctx.get("discard_riichi_flags") or []
             if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
                 return False
-            if tile_str != want_tile:
+            # @r:ap = 立直宣言的安牌：须为字牌且满足安牌条件
+            if want_tile == "ap":
+                if not _is_honor_tile(tile_str):
+                    return False
+                visible_tiles = ctx.get("visible_tiles")
+                dora_indicators = ctx.get("dora_indicators")
+                if visible_tiles is None or dora_indicators is None:
+                    return False
+                tile_base = MjlogParser.string_to_tile(tile_str)
+                equiv = MjlogParser.get_count_equivalent_bases(tile_base)
+                count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
+                dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
+                is_dora = any(base == tile_base for base in dora_bases)
+                is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
+                if not is_ap:
+                    return False
+            elif tile_str != want_tile:
                 return False
             # 摸切要求须一致（pat_want_tsumogiri 为 None 时手摸切皆可）
             if pat_want_tsumogiri is not None and is_tsumogiri != pat_want_tsumogiri:

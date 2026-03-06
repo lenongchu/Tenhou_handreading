@@ -46,7 +46,7 @@ MIN_ANALYSIS_BATCH_SIZE = 100
 MATCHED_STATES_CAP = 200
 SAMPLE_POOL_CAP = 3000
 PARALLEL_MIN_MATCHED_STATES_PER_LOG = 4
-PARALLEL_MAX_SAMPLE_POOL_PER_LOG = 64
+PARALLEL_MAX_SAMPLE_POOL_PER_LOG = 512  # 提高以保留更多可铳样本，避免单局多匹配时样本池截断
 PARALLEL_BATCH_PER_WORKER = 500
 PARALLEL_IN_FLIGHT_FACTOR = 2
 GC_INTERVAL_BATCHES = 20  # 降低频率，因为现在有管理员强制清理
@@ -55,6 +55,16 @@ HIGH_MEMORY_LOAD_RATIO = 0.95
 POOL_RESTART_EVERY_BATCHES = 10
 # 即时铳率分析时每批最多读取条数
 DEAL_IN_INSTANT_BATCH_SIZE = 8000
+
+
+def _is_deal_in_hit_sample(sample: Dict) -> bool:
+    """判断样本是否为可铳样本（任一目标牌即时可铳）"""
+    if sample.get("deal_in_hit"):
+        return True
+    for ev in (sample.get("instant_eval_multi") or {}).values():
+        if ev.get("deal_in_hit"):
+            return True
+    return False
 
 
 class BackgroundLogFetcher:
@@ -638,6 +648,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     prior_discard_exclusion = params.get("prior_discard_exclusion")
     use_tenpai = params.get("use_tenpai", False)
     use_deal_in_instant = params.get("use_deal_in_instant", False)
+    multi_target = params.get("multi_target", False)
     cap = params.get("cap", MATCHED_STATES_CAP)
     worker_matched_states_cap = max(
         1, min(cap, int(params.get("worker_matched_states_cap", cap)))
@@ -668,6 +679,10 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         ]
     matched_states = []
     sample_pool = []
+    instant_deal_in_dist = {}
+    if use_deal_in_instant and multi_target:
+        for tk in [_target_key(t[0], t[1]) for t in item_multi_targets[0]]:
+            instant_deal_in_dist[tk] = {"hits": 0, "points": 0}
 
     try:
         raw = _get_raw_content(log_content)
@@ -676,20 +691,20 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                         "deal_in_hits": 0, "deal_in_point_sum": 0,
                         "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                        "matched_states": [], "sample_pool": []}
+                        "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
         if consumed_search_list and _is_tenhou6_json(raw):
             if len(items) == 1:
                 if not log_contains_consumed(raw, consumed_search_list[0]):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                             "deal_in_hits": 0, "deal_in_point_sum": 0,
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                            "matched_states": [], "sample_pool": []}
+                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
             else:
                 if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                             "deal_in_hits": 0, "deal_in_point_sum": 0,
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                            "matched_states": [], "sample_pool": []}
+                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
         round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
         game_states = parse_log_to_game_states(raw)
         round_size = 4
@@ -892,6 +907,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         target_counts = None
 
                     instant_eval = {}
+                    instant_eval_multi = {}
                     if use_deal_in_instant:
                         if round_instant_analyzer is None and round_payload:
                             try:
@@ -902,10 +918,34 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             except Exception as e:
                                 logger.debug(f"即时铳率引擎初始化失败: {e}")
                                 round_instant_analyzer = None
-                        if round_instant_analyzer and mapped_target_str:
-                            instant_eval = round_instant_analyzer.evaluate(
-                                player_state.player_id, discard.turn, mapped_target_str
-                            )
+                        if round_instant_analyzer:
+                            if multi_target:
+                                m_targets = matched_variant["target"]
+                                if isinstance(m_targets, list) and len(m_targets) == len(mt_item):
+                                    for tiles, is_combo in mt_item:
+                                        if is_combo:
+                                            continue
+                                        tk = _target_key(tiles, is_combo)
+                                        mapped_t = m_targets[mt_item.index((tiles, is_combo))]
+                                        ev = round_instant_analyzer.evaluate(
+                                            player_state.player_id, discard.turn, mapped_t
+                                        )
+                                        instant_eval_multi[tk] = ev
+                                        if ev.get("deal_in_hit"):
+                                            instant_deal_in_dist[tk]["hits"] += 1
+                                            instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
+                                    first_tk = _target_key(mt_item[0][0], mt_item[0][1])
+                                    instant_eval = instant_eval_multi.get(first_tk, {})
+                                else:
+                                    if mapped_target_str:
+                                        instant_eval = round_instant_analyzer.evaluate(
+                                            player_state.player_id, discard.turn, mapped_target_str
+                                        )
+                            else:
+                                if mapped_target_str:
+                                    instant_eval = round_instant_analyzer.evaluate(
+                                        player_state.player_id, discard.turn, mapped_target_str
+                                    )
                         if instant_eval.get("deal_in_hit"):
                             deal_in_hits += 1
                             deal_in_point_sum += int(instant_eval.get("deal_in_point", 0))
@@ -940,9 +980,15 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                             })
+                            if multi_target:
+                                ms_entry["instant_eval_multi"] = instant_eval_multi
                         matched_states.append(ms_entry)
 
-                    if len(sample_pool) < worker_sample_pool_cap:
+                    is_deal_in = use_deal_in_instant and (
+                        instant_eval.get("deal_in_hit")
+                        or any(ev.get("deal_in_hit") for ev in (instant_eval_multi or {}).values())
+                    )
+                    if len(sample_pool) < worker_sample_pool_cap or is_deal_in:
                         visible_tiles_dict = dict(player_state.visible_tiles)
                         dora_readable = "".join(
                             MjlogParser.tile_to_string(d) for d in round_players[0].dora_indicators[:5]
@@ -979,10 +1025,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                             })
-                        qp, tt = items[matched_idx]
-                        ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
-                        if ok:
+                            if multi_target:
+                                sp_entry["instant_eval_multi"] = instant_eval_multi
+                        # 主分析已匹配成功，直接入库；不再调用 verify_sample_consistency 避免误过滤
+                        if len(sample_pool) < worker_sample_pool_cap:
                             sample_pool.append(sp_entry)
+                        else:
+                            for i, s in enumerate(sample_pool):
+                                if not _is_deal_in_hit_sample(s):
+                                    sample_pool[i] = sp_entry
+                                    break
 
     except Exception as e:
         logger.error(f"解析对局 {log_id} 失败: {e}")
@@ -997,6 +1049,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         "pattern_distributions": pattern_distributions,
         "matched_states": matched_states,
         "sample_pool": sample_pool,
+        "instant_deal_in_dist": instant_deal_in_dist,
     }
 
 
@@ -1134,7 +1187,12 @@ class LiveAnalyzer:
                 pass
             item_multi_targets.append(multi_t)
             first_t = multi_t[0]
-            variant_target = _target_str_for_variant(first_t[0], first_t[1])
+            # 多目标时传入完整目标串（如 3p,4p），使变体 target 为列表，供即时铳率逐目标评估
+            variant_target = (
+                ",".join(t[0][0] for t in multi_t)
+                if len(multi_t) > 1
+                else _target_str_for_variant(first_t[0], first_t[1])
+            )
             vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints)
             combo = first_t[1] if len(multi_t) == 1 else False
             item_variants.append((vars_p, t, combo))
@@ -1285,6 +1343,12 @@ class LiveAnalyzer:
                     outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
                     deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
                     deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
+                    if use_deal_in_instant and multi_target:
+                        wid = per_log_result.get("instant_deal_in_dist", {})
+                        for tk, stats in wid.items():
+                            if tk in instant_deal_in_dist:
+                                instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
+                                instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
                     for i, n in enumerate(per_log_result["pattern_matches"]):
                         pattern_matches[i] += n
                     for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
@@ -1434,6 +1498,8 @@ class LiveAnalyzer:
                                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
+                                    "visible_tiles": player_state.visible_tiles,
+                                    "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
                                 }
 
                                 discarded_bases = set()
@@ -1696,7 +1762,12 @@ class LiveAnalyzer:
                                         matched_states.append(ms_entry)
                                 
                                     # 主统计时顺带收集完整样本，供采样直接使用
-                                    if len(sample_pool) < sample_pool_cap:
+                                    # 池未满时添加；池满且为可铳样本时，替换池中首个非可铳样本
+                                    is_deal_in = use_deal_in_instant and (
+                                        instant_eval.get("deal_in_hit")
+                                        or any(ev.get("deal_in_hit") for ev in (instant_eval_multi or {}).values())
+                                    )
+                                    if len(sample_pool) < sample_pool_cap or is_deal_in:
                                         visible_tiles_dict = dict(player_state.visible_tiles)
                                         dora_readable = "".join(
                                             MjlogParser.tile_to_string(d)
@@ -1750,13 +1821,15 @@ class LiveAnalyzer:
                                             })
                                             if multi_target:
                                                 sp_entry["instant_eval_multi"] = instant_eval_multi
-                                        # 入库前校验：避免宣称拆搭/手切不符的样本（如NOTm-2s 要求 2s 手切；t 不应匹配）
-                                        qp, tt = items[matched_idx]
-                                        ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
-                                        if ok:
+                                        # 主分析已匹配成功，直接入库；不再调用 verify_sample_consistency 避免误过滤
+                                        if len(sample_pool) < sample_pool_cap:
                                             sample_pool.append(sp_entry)
-                                        elif len(sample_pool) < 10:
-                                            logger.debug(f"样本入库校验未通过，跳过 {sp_entry.get('actual_pattern', [])} vs {qp}")
+                                        else:
+                                            # 池满且为可铳样本：替换池中首个非可铳样本
+                                            for i, s in enumerate(sample_pool):
+                                                if not _is_deal_in_hit_sample(s):
+                                                    sample_pool[i] = sp_entry
+                                                    break
                     
                     except Exception as e:
                         logger.error(f"解析对局 {log_id} 失败: {e}")
@@ -2323,6 +2396,8 @@ class LiveAnalyzer:
                                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
+                                    "visible_tiles": player_state.visible_tiles,
+                                    "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
                                 }
 
                                 for j, (orig_i, discard) in enumerate(all_discards):
@@ -2712,6 +2787,8 @@ class LiveAnalyzer:
                                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
+                                    "visible_tiles": player_state.visible_tiles,
+                                    "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
                                 }
 
                                 discarded_bases = set()
