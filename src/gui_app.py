@@ -2773,11 +2773,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "输入错误", "巡目范围最小值不能大于最大值")
             return
 
-        # 即时铳率仅支持单目标单张
+        # 即时铳率现在支持多张目标牌（逗号分隔），但仍不支持 combo（连号）
         try:
             mt = parse_multi_targets(target)
-            if len(mt) != 1 or mt[0][1] or len(mt[0][0]) != 1:
-                QMessageBox.warning(self, "输入错误", "即时铳率仅支持单张目标牌（不支持 multi-target / combo）")
+            if any(is_combo for tiles, is_combo in mt):
+                QMessageBox.warning(self, "输入错误", "即时铳率暂不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
                 return
         except Exception:
             QMessageBox.warning(self, "输入错误", "目标牌格式无效")
@@ -3227,37 +3227,58 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "删除失败", str(e))
 
     def _build_excel_text(self, result: dict, pr_list: Optional[list], multi: bool) -> str:
-        """生成 Tab 分隔的 Excel 友好格式，统一为：舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张（百分比）"""
+        """生成 Tab 分隔的 Excel 友好格式"""
         tr = result.get('turn_range')
         turn_str = f"{tr[0]}-{tr[1]}巡" if tr else "不限"
         use_tenpai = (result.get('analysis_target') == 'tenpai')
-        header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
-        rows = [header]
-
-        def _row(pattern: str, target: str, prob: dict) -> str:
-            """生成一行数据，prob 为 {0:%, 1:%, ...} 概率分布"""
-            p0 = prob.get(0, 0)
-            p1 = prob.get(1, 0)
-            p2 = prob.get(2, 0)
-            p3 = prob.get(3, 0)
-            return f"{pattern}\t{target}\t{turn_str}\t{p0:.2f}\t{p1:.2f}\t{p2:.2f}\t{p3:.2f}"
-
-        if multi and pr_list:
-            for pr in pr_list:
-                prob = pr.get('probability_distribution', {})
-                target = "听牌" if use_tenpai else pr.get('target', '')
-                rows.append(_row(pr['pattern_str'], target, prob))
-        else:
-            prob = result.get('probability_distribution', {})
+        use_instant = (result.get('analysis_target') == 'deal_in_instant')
+        
+        if use_instant:
+            header = "舍牌模式\t目标牌\t巡目范围\t铳率\t可铳样本\t平均铳点\t铳度"
+            rows = [header]
             pattern = result.get('query_pattern_str', '') or '-'.join(result.get('query_pattern', []))
-            target = "听牌" if use_tenpai else result.get('target_tile', '')
+            
+            def _instant_row(p, t, r):
+                rate = r.get('deal_in_rate', r.get('rate', 0.0))
+                hits = r.get('deal_in_hits', r.get('hits', 0))
+                p_avg = r.get('deal_in_point_avg', r.get('point_avg', 0.0))
+                intensity = r.get('deal_in_intensity', r.get('intensity', 0.0))
+                return f"{p}\t{t}\t{turn_str}\t{rate:.2%}\t{hits}\t{p_avg:.1f}\t{intensity:.2f}"
+
             multi_target = result.get('multi_target', False)
-            if multi_target:
-                for tk in result.get('target_tiles', []):
-                    pt = prob.get(tk, {})
-                    rows.append(_row(pattern, tk, pt))
+            if multi_target and result.get('multi_instant_stats'):
+                for tk, stats in result['multi_instant_stats'].items():
+                    rows.append(_instant_row(pattern, tk, stats))
             else:
-                rows.append(_row(pattern, target, prob))
+                rows.append(_instant_row(pattern, result.get('target_tile', ''), result))
+        else:
+            header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
+            rows = [header]
+
+            def _row(pattern: str, target: str, prob: dict) -> str:
+                """生成一行数据，prob 为 {0:%, 1:%, ...} 概率分布"""
+                p0 = prob.get(0, 0)
+                p1 = prob.get(1, 0)
+                p2 = prob.get(2, 0)
+                p3 = prob.get(3, 0)
+                return f"{pattern}\t{target}\t{turn_str}\t{p0:.2f}\t{p1:.2f}\t{p2:.2f}\t{p3:.2f}"
+
+            if multi and pr_list:
+                for pr in pr_list:
+                    prob = pr.get('probability_distribution', {})
+                    target = "听牌" if use_tenpai else pr.get('target', '')
+                    rows.append(_row(pr['pattern_str'], target, prob))
+            else:
+                prob = result.get('probability_distribution', {})
+                pattern = result.get('query_pattern_str', '') or '-'.join(result.get('query_pattern', []))
+                target = "听牌" if use_tenpai else result.get('target_tile', '')
+                multi_target = result.get('multi_target', False)
+                if multi_target:
+                    for tk in result.get('target_tiles', []):
+                        pt = prob.get(tk, {})
+                        rows.append(_row(pattern, tk, pt))
+                else:
+                    rows.append(_row(pattern, target, prob))
 
         rows.append("")
         rows.append(f"分析半庄数\t{result.get('total_logs_analyzed', 0)}")
@@ -4071,7 +4092,19 @@ class MainWindow(QMainWindow):
                 use_tenpai = (result.get("analysis_target") == "tenpai")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")
                 multi_target = result.get("multi_target", False)
-                if use_instant:
+                if use_instant and multi_target and result.get("multi_instant_stats"):
+                    stats = result["multi_instant_stats"]
+                    lines = [
+                        f"  总样本: {_fmt_int(result.get('total_matches', 0))}\n",
+                        "  各目标牌即时铳率:"
+                    ]
+                    for tk, s in stats.items():
+                        lines.append(
+                            f"    {tk}: 铳率 {s['rate']:.2%} ({_fmt_int(s['hits'])} 例) | 平均铳点 {s['point_avg']:.1f} | 铳度 {s['intensity']:.2f}"
+                        )
+                    dist_text = "\n".join(lines)
+                    target_label = f"目标: {result['target_tile']} (多目标即时铳率)"
+                elif use_instant:
                     dist_text = (
                         f"  总样本: {_fmt_int(result.get('total_matches', 0))}\n"
                         f"  可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}\n"

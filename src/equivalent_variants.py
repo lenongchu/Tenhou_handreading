@@ -22,8 +22,8 @@ from itertools import product, permutations
 from .mjlog_parser import MjlogParser
 
 
-# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
-HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "yp", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
+# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), ap=安牌(可见2-3枚或1枚非宝牌), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
+HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "yp", "ap", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
 HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
 # 1z-4z 风牌对应中文，用于 @p:kf 客风校验
 Z_TO_WIND = {"1z": "东", "2z": "南", "3z": "西", "4z": "北"}
@@ -1196,9 +1196,9 @@ def _expand_pure_honor_pattern(parsed: List[Tuple[str, bool]]) -> List[List[Tupl
     - zt-zt: 49 种 (7×7)
     - z1-z2: 42 种 (7×6)
     - z1-z2-z3: 210 种 (7×6×5)
-    - 含 zf/kf 的不展开，保留占位符（1 种）
+    - 含 zf/kf/ap 的不展开，保留占位符（1 种）
     """
-    if any(t in ("zf", "kf", "kf1", "kf2", "kf3") for t, _ in parsed):
+    if any(t in ("zf", "kf", "kf1", "kf2", "kf3", "ap") for t, _ in parsed):
         return [parsed]
 
     distinct_indices = [i for i, (t, _) in enumerate(parsed) if t in ("z1", "z2", "z3")]
@@ -1627,6 +1627,22 @@ def _match_pattern_at_end(
                         if _honor_tile_to_z(tile_str) in yakuhai_set:
                             matched_opt = opt
                             break
+                    elif tile_part == "ap":
+                        if not _is_honor_tile(tile_str):
+                            continue
+                        visible_tiles = ctx.get("visible_tiles")
+                        dora_indicators = ctx.get("dora_indicators")
+                        if visible_tiles is None or dora_indicators is None:
+                            continue
+                        tile_base = MjlogParser.string_to_tile(tile_str)
+                        equiv = MjlogParser.get_count_equivalent_bases(tile_base)
+                        count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
+                        dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
+                        is_dora = any(base == tile_base for base in dora_bases)
+                        is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
+                        if is_ap:
+                            matched_opt = opt
+                            break
                     elif tile_part in ("kf", "kf1", "kf2", "kf3"):
                         tile_z = _honor_tile_to_z(tile_str)
                         if kyokuze_list and tile_z in [_honor_tile_to_z(k) for k in kyokuze_list] and tile_z not in matched_honors:
@@ -1781,6 +1797,28 @@ def _match_pattern_at_end(
             continue
         if pat_tile == "yp":
             if _honor_tile_to_z(tile_str) not in yakuhai_set:
+                return False
+            consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
+            d_idx -= 1
+            p_idx -= 1
+            continue
+        if pat_tile == "ap":
+            # 安牌：字牌且满足：场上可见2-3枚；或场上可见1枚且非宝牌
+            if not _is_honor_tile(tile_str):
+                return False
+            visible_tiles = ctx.get("visible_tiles")
+            dora_indicators = ctx.get("dora_indicators")
+            if visible_tiles is None or dora_indicators is None:
+                return False
+            tile_base = MjlogParser.string_to_tile(tile_str)
+            equiv = MjlogParser.get_count_equivalent_bases(tile_base)
+            count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
+            dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
+            is_dora = any(base == tile_base for base in dora_bases)
+            is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
+            if not is_ap:
                 return False
             consumed_any_discard = True
             if out_position_to_tile is not None:

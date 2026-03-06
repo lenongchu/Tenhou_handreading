@@ -475,6 +475,8 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
+                    "visible_tiles": player_state.visible_tiles,
+                    "dora_indicators": player_state.dora_indicators,
                 }
 
                 for j, (orig_i, discard) in enumerate(all_discards):
@@ -744,6 +746,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
+                    "visible_tiles": player_state.visible_tiles,
+                    "dora_indicators": player_state.dora_indicators,
                 }
                 discard_riichi_flags = [getattr(in_range[i][1], 'is_riichi_declaration', False) for i in range(len(in_range))]
 
@@ -957,6 +961,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "oya": player_state.oya, "player_id": player_state.player_id, "turn": discard.turn,
                             "actual_pattern": hand_discard_strings.copy(), "mapped_target": mapped_target,
                             "hand_tiles": list(hand_at_turn), "visible_tiles": visible_tiles_dict,
+                            "dora_indicators": list(player_state.dora_indicators),
                             "dora_readable": dora_readable, "visible_target": visible_target,
                             "call_area": call_area, "is_combo": item_combo, "matched_pattern_idx": matched_idx,
                             "outcome_won": bool(rw and player_state.player_id in rw),
@@ -1123,8 +1128,10 @@ class LiveAnalyzer:
         for p, t in items:
             multi_t = parse_multi_targets(t)
             if use_deal_in_instant:
-                if len(multi_t) != 1 or multi_t[0][1]:
-                    raise ValueError("即时铳率分析仅支持单目标单张牌（不支持 multi-target / combo）")
+                if multi_t[0][1]:
+                    raise ValueError("即时铳率分析不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
+                # 现在允许 len(multi_t) > 1 了
+                pass
             item_multi_targets.append(multi_t)
             first_t = multi_t[0]
             variant_target = _target_str_for_variant(first_t[0], first_t[1])
@@ -1155,6 +1162,11 @@ class LiveAnalyzer:
         total_matches = 0
         deal_in_hits_total = 0
         deal_in_point_sum_total = 0
+        # 即时铳率多目标分布：target_key -> {"hits": n, "points": n}
+        instant_deal_in_dist = {}
+        if use_deal_in_instant and multi_target:
+            for tk in [_target_key(t[0], t[1]) for t in multi_targets]:
+                instant_deal_in_dist[tk] = {"hits": 0, "points": 0}
         outcome_wins_total = 0
         outcome_deal_ins_total = 0
         pattern_matches = [0] * len(items)
@@ -1599,8 +1611,8 @@ class LiveAnalyzer:
                                         "furiten_reason": "",
                                         "waits_snapshot": [],
                                     }
+                                    instant_eval_multi = {} # tk -> eval_dict
                                     if use_deal_in_instant:
-                                        mapped_target_str = mapped_target if isinstance(mapped_target, str) else ""
                                         if round_instant_analyzer is None and round_payload:
                                             try:
                                                 rp_data, rp_events = round_payload
@@ -1610,10 +1622,49 @@ class LiveAnalyzer:
                                             except Exception as e:
                                                 logger.debug(f"即时铳率引擎初始化失败: {e}")
                                                 round_instant_analyzer = None
-                                        if round_instant_analyzer and mapped_target_str:
-                                            instant_eval = round_instant_analyzer.evaluate(
-                                                player_state.player_id, discard.turn, mapped_target_str
-                                            )
+
+                                        if round_instant_analyzer:
+                                            if multi_target:
+                                                # 对每个目标分别评估
+                                                mt_item = item_multi_targets[matched_idx]
+                                                for tiles, is_combo in mt_item:
+                                                    if is_combo: continue # 目前不支持 combo
+                                                    tk = _target_key(tiles, is_combo)
+                                                    # 等价变换后的目标牌
+                                                    # 注意：variants[0]["target"] 是主目标的映射，
+                                                    # 这里的 tk 是原始目标名。需要应用映射。
+                                                    # mapped_tk = _transform_tile_with_mapping(tk, matched_variant["mapping_used"])
+                                                    # matched_variant 已经包含了映射后的 target。
+                                                    # 实际上在 generate_equivalent_variants 中，每个变体都有一个 "target" 字段。
+                                                    # 如果是多目标，我们需要确保这些目标也被正确映射。
+                                                    
+                                                    # 在 loop 外我们已经知道 mapping 了。
+                                                    # 这里的 mapped_target 是由 match_discard_to_variant 返回的，它已经处理了映射。
+                                                    # 对于多目标，我们需要重新处理映射。
+                                                    # 幸运的是，match_discard_to_variant 返回了 matched_variant["target"]。
+                                                    # 如果 multi_target 为 True，matched_variant["target"] 可能是 List。
+                                                    
+                                                    m_targets = matched_variant["target"]
+                                                    if isinstance(m_targets, list) and len(m_targets) == len(mt_item):
+                                                        mapped_t = m_targets[mt_item.index((tiles, is_combo))]
+                                                        ev = round_instant_analyzer.evaluate(
+                                                            player_state.player_id, discard.turn, mapped_t
+                                                        )
+                                                        instant_eval_multi[tk] = ev
+                                                        if ev.get("deal_in_hit"):
+                                                            instant_deal_in_dist[tk]["hits"] += 1
+                                                            instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
+                                                
+                                                # 为了兼容旧逻辑（记录 matched_states），取第一个目标的评估结果作为代表
+                                                first_tk = _target_key(mt_item[0][0], mt_item[0][1])
+                                                instant_eval = instant_eval_multi.get(first_tk, instant_eval)
+                                            else:
+                                                mapped_target_str = mapped_target if isinstance(mapped_target, str) else ""
+                                                if mapped_target_str:
+                                                    instant_eval = round_instant_analyzer.evaluate(
+                                                        player_state.player_id, discard.turn, mapped_target_str
+                                                    )
+                                        
                                         if instant_eval.get("deal_in_hit"):
                                             deal_in_hits_total += 1
                                             deal_in_point_sum_total += int(instant_eval.get("deal_in_point", 0))
@@ -1640,6 +1691,8 @@ class LiveAnalyzer:
                                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                             })
+                                            if multi_target:
+                                                ms_entry["instant_eval_multi"] = instant_eval_multi
                                         matched_states.append(ms_entry)
                                 
                                     # 主统计时顺带收集完整样本，供采样直接使用
@@ -1674,6 +1727,7 @@ class LiveAnalyzer:
                                             "mapped_target": mapped_target,
                                             "hand_tiles": list(hand_at_turn),
                                             "visible_tiles": visible_tiles_dict,
+                                            "dora_indicators": list(player_state.dora_indicators),
                                             "dora_readable": dora_readable,
                                             "visible_target": visible_target,
                                             "call_area": call_area,
@@ -1694,6 +1748,8 @@ class LiveAnalyzer:
                                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                             })
+                                            if multi_target:
+                                                sp_entry["instant_eval_multi"] = instant_eval_multi
                                         # 入库前校验：避免宣称拆搭/手切不符的样本（如NOTm-2s 要求 2s 手切；t 不应匹配）
                                         qp, tt = items[matched_idx]
                                         ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
@@ -1716,8 +1772,7 @@ class LiveAnalyzer:
                     if sample_limit and processed >= sample_limit:
                         break
 
-            # 批次结束后的维护
-            fetcher.stop()
+            # 批次结束后的维护（不要在此处调用 fetcher.stop()，否则会杀死预取线程导致下一批永远取不到）
             maintenance_batch_index += 1
             if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
                 gc.collect()
@@ -1797,6 +1852,21 @@ class LiveAnalyzer:
             if deal_in_hits_total > 0 else 0.0
         )
         instant_deal_in_intensity = instant_deal_in_rate * instant_deal_in_point_avg
+
+        # 即时铳率：如果是多目标，合并详细信息
+        multi_instant_stats = {}
+        if use_deal_in_instant and multi_target:
+            for tk, stats in instant_deal_in_dist.items():
+                hits = stats["hits"]
+                rate = hits / n if n > 0 else 0.0
+                p_avg = stats["points"] / hits if hits > 0 else 0.0
+                multi_instant_stats[tk] = {
+                    "hits": hits,
+                    "rate": rate,
+                    "point_avg": p_avg,
+                    "intensity": rate * p_avg
+                }
+
         result = {
             'total_logs_analyzed': processed,
             'total_matches': total_matches,
@@ -1804,6 +1874,7 @@ class LiveAnalyzer:
             'deal_in_point_sum': deal_in_point_sum_total,
             'deal_in_point_avg': instant_deal_in_point_avg,
             'deal_in_intensity': instant_deal_in_intensity,
+            'multi_instant_stats': multi_instant_stats if use_deal_in_instant and multi_target else None,
             'outcome_wins': outcome_wins_total,
             'outcome_deal_ins': outcome_deal_ins_total,
             'win_rate': outcome_wins_total / n,
@@ -1990,6 +2061,7 @@ class LiveAnalyzer:
             "deal_in_point_sum": result.get("deal_in_point_sum", 0),
             "deal_in_point_avg": result.get("deal_in_point_avg", 0.0),
             "deal_in_intensity": result.get("deal_in_intensity", 0.0),
+            "multi_instant_stats": result.get("multi_instant_stats"),
             "total_logs_analyzed": result.get("total_logs_analyzed", 0),
             "elapsed_seconds": result.get("elapsed_seconds", 0),
             "query_pattern": result.get("query_pattern", query_pattern or []),
@@ -2490,15 +2562,28 @@ class LiveAnalyzer:
                 elif outcome_filter == "neither":
                     candidates = [s for s in candidates if not s.get("outcome_won") and not s.get("outcome_deal_in")]
             if deal_in_filter is not None:
-                if deal_in_filter == "hit":
-                    candidates = [s for s in candidates if s.get("deal_in_hit")]
-                elif deal_in_filter == "miss":
-                    candidates = [s for s in candidates if not s.get("deal_in_hit")]
-                elif deal_in_filter == "furiten":
-                    candidates = [
-                        s for s in candidates
-                        if (not s.get("deal_in_hit")) and str(s.get("furiten_state", "none")) != "none"
-                    ]
+                if target_tile_filter and any("instant_eval_multi" in s for s in candidates):
+                    # 如果指定了目标牌且有详细评估结果，按该目标的评估结果过滤
+                    if deal_in_filter == "hit":
+                        candidates = [s for s in candidates if s.get("instant_eval_multi", {}).get(target_tile_filter, {}).get("deal_in_hit")]
+                    elif deal_in_filter == "miss":
+                        candidates = [s for s in candidates if not s.get("instant_eval_multi", {}).get(target_tile_filter, {}).get("deal_in_hit")]
+                    elif deal_in_filter == "furiten":
+                        candidates = [
+                            s for s in candidates
+                            if (not s.get("instant_eval_multi", {}).get(target_tile_filter, {}).get("deal_in_hit")) 
+                            and str(s.get("instant_eval_multi", {}).get(target_tile_filter, {}).get("furiten_state", "none")) != "none"
+                        ]
+                else:
+                    if deal_in_filter == "hit":
+                        candidates = [s for s in candidates if s.get("deal_in_hit")]
+                    elif deal_in_filter == "miss":
+                        candidates = [s for s in candidates if not s.get("deal_in_hit")]
+                    elif deal_in_filter == "furiten":
+                        candidates = [
+                            s for s in candidates
+                            if (not s.get("deal_in_hit")) and str(s.get("furiten_state", "none")) != "none"
+                        ]
             if target_count_filter is not None:
                 if target_tile_filter and any("target_counts" in s for s in candidates):
                     candidates = [s for s in candidates if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
@@ -2672,6 +2757,7 @@ class LiveAnalyzer:
 
                                 # 即时铳率分析
                                 instant_eval = {}
+                                instant_eval_multi = {}
                                 if use_deal_in_instant:
                                     if round_instant_analyzer is None and round_payload:
                                         try:
@@ -2679,8 +2765,23 @@ class LiveAnalyzer:
                                             round_instant_analyzer = RoundInstantDealInAnalyzer(rp_data, rp_events, player_state.round_num, player_state.oya)
                                         except:
                                             pass
-                                    if round_instant_analyzer and mapped_target_str:
-                                        instant_eval = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, mapped_target_str)
+                                    
+                                    if round_instant_analyzer:
+                                        if isinstance(mapped_target, list):
+                                            # 多目标
+                                            orig_targets, _ = parse_target_tiles(target_tile)
+                                            for i, m_t in enumerate(mapped_target):
+                                                ev = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, m_t)
+                                                tk = orig_targets[i]
+                                                instant_eval_multi[tk] = ev
+                                            
+                                            # 如果有 filter，取 filter 对应的结果；否则取第一个
+                                            if target_tile_filter and target_tile_filter in instant_eval_multi:
+                                                instant_eval = instant_eval_multi[target_tile_filter]
+                                            else:
+                                                instant_eval = list(instant_eval_multi.values())[0]
+                                        elif mapped_target_str:
+                                            instant_eval = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, mapped_target_str)
                                 
                                 if deal_in_filter:
                                     if deal_in_filter == "hit" and not instant_eval.get("deal_in_hit"):
@@ -2812,6 +2913,7 @@ class LiveAnalyzer:
                                     "mapped_target": mapped_target,
                                     "hand_tiles": list(hand_at_turn),
                                     "visible_tiles": visible_tiles_dict,
+                                    "dora_indicators": list(player_state.dora_indicators),
                                     "dora_readable": dora_readable,
                                     "visible_target": visible_target,
                                     "call_area": call_area,
@@ -2828,6 +2930,8 @@ class LiveAnalyzer:
                                         "furiten_reason": instant_eval.get("furiten_reason", ""),
                                         "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                     })
+                                    if instant_eval_multi:
+                                        sp_entry["instant_eval_multi"] = instant_eval_multi
                                 # 实时扫描匹配到的样本，无需再调用 verify_sample_consistency 校验，直接添加
                                 samples.append(sp_entry)
                                 if len(samples) >= sample_count:
@@ -2985,6 +3089,8 @@ def verify_sample_consistency(
             "kyokuze_list": MjlogParser.get_kyokuze_list(player_id, oya, round_num),
             "discard_riichi_flags": riichi_flags,
             "current_discard_turn": sample.get("turn"),
+            "visible_tiles": sample.get("visible_tiles"),
+            "dora_indicators": sample.get("dora_indicators"),
         }
         
         matched = match_discard_to_variant(full_discards, variants, ctx)
