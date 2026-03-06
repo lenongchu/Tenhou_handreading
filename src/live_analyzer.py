@@ -1240,80 +1240,79 @@ class LiveAnalyzer:
         # 启动后台预取线程，掩盖数据库 I/O 延迟
         fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
         
-        try:
-            while True:
-                # 检查是否取消
-                if should_cancel and should_cancel():
-                    logger.info("analysis cancelled")
-                    break
-                
-                # 从预取队列获取一批对局数据（如果后台还没读完，这里会阻塞等待，但通常已经预取好了）
-                logs = fetcher.next_batch()
-                if not logs:
-                    break
-                
-                if use_parallel and pool is not None:
-                    # 并行分支
-                    task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
-                    for per_log_result in _iter_pool_results_bounded(
-                        pool,
-                        _process_one_log_analyze,
-                        task_iter,
-                        max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
-                    ):
-                        if should_cancel and should_cancel():
-                            fetcher.stop()
-                            conn.close()
-                            gc.collect()
-                            _trim_process_memory()
-                            if pool:
-                                pool.shutdown(wait=False)
-                            return _empty_analysis_result(first_pattern, first_target)
-                        total_matches += per_log_result["total_matches"]
-                        outcome_wins_total += per_log_result.get("outcome_wins", 0)
-                        outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
-                        deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
-                        deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
-                        for i, n in enumerate(per_log_result["pattern_matches"]):
-                            pattern_matches[i] += n
-                        for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
-                            for k, v in d_delta.items():
-                                if isinstance(v, dict):
-                                    for c, n in v.items():
-                                        pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
-                                else:
-                                    pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
-                        matched_states.extend(per_log_result["matched_states"])
-                        sample_pool.extend(per_log_result["sample_pool"])
-                        # 每批合并后立即截断，避免跨批次内存无限增长
-                        if len(matched_states) > cap:
-                            del matched_states[cap:]
-                        if len(sample_pool) > sample_pool_cap:
-                            del sample_pool[sample_pool_cap:]
-                        processed += 1
-                        if progress_callback and (processed <= 10 or processed % 10 == 0):
-                            progress_callback(processed, total_logs)
-                        if sample_limit and processed >= sample_limit:
-                            break
-                    batch_count += 1
-                    # 定期重启 worker 池，释放子进程内 Python 持有的内存
-                    if batch_count >= POOL_RESTART_EVERY_BATCHES:
-                        pool.shutdown(wait=True)
-                        pool = ProcessPoolExecutor(max_workers=workers)
-                        batch_count = 0
-                else:
-                    # 串行分支
-                    for log_id, log_content in logs:
-                        if should_cancel and should_cancel():
-                            fetcher.stop()
-                            conn.close()
-                            gc.collect()
-                            _trim_process_memory()
-                            if pool:
-                                pool.shutdown(wait=False)
-                            return _empty_analysis_result(first_pattern, first_target)
-                        try:
-                            raw = _get_raw_content(log_content)
+        while True:
+            # 检查是否取消
+            if should_cancel and should_cancel():
+                logger.info("analysis cancelled")
+                break
+            
+            # 从预取队列获取一批对局数据（如果后台还没读完，这里会阻塞等待，但通常已经预取好了）
+            logs = fetcher.next_batch()
+            if not logs:
+                break
+            
+            if use_parallel and pool is not None:
+                # 并行分支
+                task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
+                for per_log_result in _iter_pool_results_bounded(
+                    pool,
+                    _process_one_log_analyze,
+                    task_iter,
+                    max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
+                ):
+                    if should_cancel and should_cancel():
+                        fetcher.stop()
+                        conn.close()
+                        gc.collect()
+                        _trim_process_memory()
+                        if pool:
+                            pool.shutdown(wait=False)
+                        return _empty_analysis_result(first_pattern, first_target)
+                    total_matches += per_log_result["total_matches"]
+                    outcome_wins_total += per_log_result.get("outcome_wins", 0)
+                    outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
+                    deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
+                    deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
+                    for i, n in enumerate(per_log_result["pattern_matches"]):
+                        pattern_matches[i] += n
+                    for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
+                        for k, v in d_delta.items():
+                            if isinstance(v, dict):
+                                for c, n in v.items():
+                                    pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
+                            else:
+                                pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
+                    matched_states.extend(per_log_result["matched_states"])
+                    sample_pool.extend(per_log_result["sample_pool"])
+                    # 每批合并后立即截断，避免跨批次内存无限增长
+                    if len(matched_states) > cap:
+                        del matched_states[cap:]
+                    if len(sample_pool) > sample_pool_cap:
+                        del sample_pool[sample_pool_cap:]
+                    processed += 1
+                    if progress_callback and (processed <= 10 or processed % 10 == 0):
+                        progress_callback(processed, total_logs)
+                    if sample_limit and processed >= sample_limit:
+                        break
+                batch_count += 1
+                # 定期重启 worker 池，释放子进程内 Python 持有的内存
+                if batch_count >= POOL_RESTART_EVERY_BATCHES:
+                    pool.shutdown(wait=True)
+                    pool = ProcessPoolExecutor(max_workers=workers)
+                    batch_count = 0
+            else:
+                # 串行分支
+                for log_id, log_content in logs:
+                    if should_cancel and should_cancel():
+                        fetcher.stop()
+                        conn.close()
+                        gc.collect()
+                        _trim_process_memory()
+                        if pool:
+                            pool.shutdown(wait=False)
+                        return _empty_analysis_result(first_pattern, first_target)
+                    try:
+                        raw = _get_raw_content(log_content)
                         # 立直宣言模式(r)：牌谱无立直时快速跳过
                         if riichi_any and _is_tenhou6_json(raw):
                             if "riichi" not in raw and "reach" not in raw:
@@ -1357,11 +1356,10 @@ class LiveAnalyzer:
                             if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
                                 dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
                                 # 指定宝牌：局级判断，不满足则跳过整局
-                                # 当前测试，之后可能也做等价变体处
                                 if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                                     continue
 
-                            # 局级consumed 棰勮繃婊わ細单模寮忕敤鍗曚竴 consumed；多模式需至少一个模式的 consumed 存在
+                            # 局级consumed 预过滤：单模式用单一 consumed；多模式需至少一个模式的 consumed 存在
                             if consumed_search_list:
                                 if len(items) == 1:
                                     if not round_has_matching_consumed(round_players, consumed_search_list[0]):
@@ -1388,7 +1386,7 @@ class LiveAnalyzer:
                                 if not round_has_riichi_decl:
                                     continue
 
-                            # 分析该局每个玩
+                            # 分析该局每个玩家
                             for player_state in round_players:
                                 # 玩家级副露约束预过滤：no_call 时该玩家有副露则跳过；call_area 时该玩家不可能满足则跳过
                                 if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
@@ -1399,7 +1397,7 @@ class LiveAnalyzer:
                                 elif call_area_constraints and not player_could_satisfy_call_area_constraints(player_state, oya, call_area_constraints):
                                     continue
 
-                                # 提取巡目范围鍐呯殑舍牌
+                                # 提取巡目范围内的舍牌
                                 if turn_range:
                                     min_turn, max_turn = turn_range
                                     in_range = [(i, d) for i, d in enumerate(player_state.discards)
@@ -1450,7 +1448,7 @@ class LiveAnalyzer:
                                     if not matched_variant:
                                         continue
                                     _, _, item_combo = item_variants[matched_idx]
-                                    # 前段嶅彲鎵擄細turn < in_range[0].turn 的舍牌不得触碰禁止集合（变体已含映射后的 prior）
+                                    # 前段禁打检查：turn < in_range[0].turn 的舍牌不得触碰禁止集合（变体已含映射后的 prior）
                                     if prior_discard_exclusion and turn_range:
                                         prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
                                         excl_str = matched_variant.get("prior_discard_exclusion")
@@ -1490,7 +1488,7 @@ class LiveAnalyzer:
                                         if call_constraint == "no_call" and discard.call_happened:
                                             continue
                                 
-                                    # 副露区域约束：目标玩家必须满足所有指定的副露锛圓ND锛夛紱仅统计此次舍牌前已完成的副露
+                                    # 副露区域约束：目标玩家必须满足所有指定的副露（AND）；仅统计此次舍牌前已完成的副露
                                     _ca = matched_variant.get("call_area_constraints") or call_area_constraints
                                     if _ca:
                                         if not player_satisfies_call_area_constraints(
@@ -1535,7 +1533,7 @@ class LiveAnalyzer:
                                         if discard.tile // 4 in target_equiv:
                                             continue
                                 
-                                    # 匹配鎴愬姛）
+                                    # 匹配成功
                                     total_matches += 1
                                     pattern_matches[matched_idx] += 1
                                     rw = getattr(player_state, "round_winners", [])
@@ -1546,7 +1544,6 @@ class LiveAnalyzer:
                                         outcome_deal_ins_total += 1
                                 
                                     # 获取该打出牌后的手牌快照（orig_i 为完整舍牌序列中的下标）
-                                    # 必须为 list 以保留同种牌枚数；set 会合并重复导致。张 p 显示为 张
                                     if orig_i < len(player_state.hand_tiles_history):
                                         hand_at_turn = player_state.hand_tiles_history[orig_i]
                                     else:
@@ -1702,20 +1699,20 @@ class LiveAnalyzer:
                                         ok, _ = verify_sample_consistency(sp_entry, qp, tt, visible_constraints)
                                         if ok:
                                             sample_pool.append(sp_entry)
-                                    elif len(sample_pool) < 10:  # 仅在前几条时记录，避免刷屏
-                                        logger.debug(f"样本入库校验未通过，跳过 {sp_entry.get('actual_pattern', [])} vs {qp}")
+                                        elif len(sample_pool) < 10:
+                                            logger.debug(f"样本入库校验未通过，跳过 {sp_entry.get('actual_pattern', [])} vs {qp}")
                     
                     except Exception as e:
                         logger.error(f"解析对局 {log_id} 失败: {e}")
                         continue
-                
+            
                     processed += 1
-                
+            
                     # 进度回调（每 10 场更新一次，避免长时间无反馈）
                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                         progress_callback(processed, total_logs)
-                
-                    # 杈惧埌鏍锋湰闄愬埗
+            
+                    # 达到样本限制
                     if sample_limit and processed >= sample_limit:
                         break
 
@@ -1734,7 +1731,7 @@ class LiveAnalyzer:
                 _ensure_log_json_column(conn)
                 _trim_process_memory()
 
-            # 杈惧埌鏍锋湰闄愬埗
+            # 达到样本限制
             if sample_limit and processed >= sample_limit:
                 break
 
@@ -1745,7 +1742,7 @@ class LiveAnalyzer:
         gc.collect()
         _trim_process_memory()
 
-        # 并行鏃跺彲鑳借秴鍑?cap锛屾埅鏂?
+        # 并行时可能超过 cap，截断
         matched_states = matched_states[:cap]
         sample_pool = sample_pool[:sample_pool_cap]
 
