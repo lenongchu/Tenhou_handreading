@@ -30,7 +30,9 @@ except Exception:
     HAS_MAHJONG = False
 
 
+# 赤五 base(34/35/36) → 标准 5m/5p/5s 的 base(4/13/22)，用于 mahjong 库 34 种牌统计时归并
 RED_TO_STANDARD = {34: 4, 35: 13, 36: 22}
+# 赤五 base(34/35/36) → mahjong 库 136 编码中的 tile 索引（赤五有固定位置）
 RED_TO_136 = {34: 16, 35: 52, 36: 88}
 WIND_STR_TO_BASE = {"东": 27, "南": 28, "西": 29, "北": 30}
 BAKAZE_TO_BASE = {"E": 27, "S": 28, "W": 29, "N": 30, "东": 27, "南": 28, "西": 29, "北": 30}

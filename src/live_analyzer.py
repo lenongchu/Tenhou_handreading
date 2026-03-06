@@ -305,6 +305,22 @@ def _is_tenhou6_json(raw: str) -> bool:
     return s.startswith("{") and "games" in raw
 
 
+def _raw_to_tenhou6_for_instant(raw: str) -> str:
+    """
+    将 raw 转为 tenhou6 JSON 字符串，供 extract_tenhou6_rounds 使用。
+    若已是 tenhou6 则直接返回；若为 XML 则尝试转换（与 parse_log_to_game_states 一致）。
+    否则返回 raw（extract_tenhou6_rounds 对非 tenhou6 会返回 []）。
+    """
+    if _is_tenhou6_json(raw):
+        return raw
+    try:
+        from .tenhou6_adapter import xml_to_tenhou6_json
+        json_str = xml_to_tenhou6_json(raw)
+        return json_str if json_str else raw
+    except Exception:
+        return raw
+
+
 def _format_actual_pattern(
     full_discards: List[Tuple[str, bool]],
     discard_riichi_flags: List[bool],
@@ -734,7 +750,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
-        round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
+        round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
         game_states = parse_log_to_game_states(raw)
         round_size = 4
 
@@ -1466,7 +1482,7 @@ class LiveAnalyzer:
                                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                                         progress_callback(processed, total_logs)
                                     continue
-                        round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
+                        round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
                         game_states = parse_log_to_game_states(raw)
                     
                         # 按小局分组（每局 4 个玩家）
@@ -2809,7 +2825,7 @@ class LiveAnalyzer:
                         if not log_contains_consumed(raw, consumed_search):
                             continue
                     game_states = parse_log_to_game_states(raw)
-                    round_payloads = extract_tenhou6_rounds(raw) if use_deal_in_instant else []
+                    round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
                     round_size = 4
 
                     for round_start in range(0, len(game_states), round_size):
