@@ -242,6 +242,56 @@
 
 ---
 
+## 六.1 即时铳率分析 (Instant Deal-in Rate)
+
+### 概念与口径
+
+**即时铳率**：在“命中样本所在的当巡时点”，假想目标牌（如 3p）若被对手打出，我方是否可荣和、是否振听、理论 ron 点多少。与“结局放铳率”（对局结束后是否放铳）不同，口径为**当巡时点**。
+
+### 核心模块与流程
+
+| 组件 | 职责 |
+|------|------|
+| `instant_deal_in.RoundInstantDealInAnalyzer` | 按 tenhou6 事件流重放，判定当巡可荣和/振听/理论点 |
+| `instant_deal_in.extract_tenhou6_rounds` | 从 tenhou6 JSON 提取小局 (game_data, game_events) |
+| `live_analyzer` | analysis_target=`deal_in_instant` 时调用引擎，汇总铳率/铳点/铳度 |
+
+流程：舍牌模式匹配 → 取 matched_variant["target"]（等价映射后目标牌）→ `round_instant_analyzer.evaluate(player_id, turn, mapped_target)` → 返回 `deal_in_hit`、`deal_in_point`、`furiten_state` 等。
+
+### 假想目标牌与等价变体
+
+- **假想目标牌参与等价变体**：目标牌与舍牌模式一起做花色映射（`_transform_tile_with_mapping`），如 2s → 2m/2p。
+- **样本生成**：匹配任一等价变体即生成样本，`actual_pattern` 为实际舍牌，`mapped_target` 为映射后目标牌；即时铳率评估使用 `mapped_target`。
+
+### 多目标即时铳率
+
+- **目标格式**：逗号分隔，如 `3p,4p`，表示同时分析 3p、4p 两张假想牌。
+- **变体 target**：多目标时 `variant_target="3p,4p"` 传入 `generate_equivalent_variants`，变体 `target` 为列表 `["3m","4m"]` 等。
+- **逐目标统计**：`instant_deal_in_dist[tk]` 按目标牌分别累计 hits/points；`multi_instant_stats` 输出各目标铳率、平均铳点、铳度。
+- **并行 worker**：worker 需实现多目标逻辑并返回 `instant_deal_in_dist`，主进程合并。
+
+### 样本池与可铳样本
+
+- **可铳优先**：池满时，若新样本为可铳（`deal_in_hit` 或 `instant_eval_multi[tk]["deal_in_hit"]`），替换池中首个非可铳样本。
+- **多目标筛选**：生成样本时 `target_tile_filter`（如 "3p"）按 `instant_eval_multi[target_tile_filter]["deal_in_hit"]` 过滤。
+- **每局样本上限**：`PARALLEL_MAX_SAMPLE_POOL_PER_LOG` 控制单局最多保留样本数，避免单局多匹配时截断过多可铳样本。
+
+### 假想振听牌 (Hypothetical Furiten Tiles)
+
+- **参数**：`hypothetical_furiten_tiles`，如 `"6p"` 或 `"6p,7p"`，在铳率分析页输入框「假想振听牌」。
+- **逻辑**：若目标牌可铳且假想振听牌（**且非目标牌本身**）在该时点也会放铳，则该匹配**不计入主铳率**，而是计入 `excluded_due_to_hypothetical_furiten`。
+- **目标牌排除**：假想振听牌若与目标牌相同（映射后），不参与排除判定，避免误排除全部可铳样本。
+- **等价变换**：假想振听牌按 `matched_variant["mapping"]` 做花色映射（`_transform_tile_with_mapping`），与目标牌一致。
+- **结果展示**：当 `excluded_due_to_hypothetical_furiten > 0` 时，显示「因假想振听牌被排除的案列数」。
+
+### 约束与限制
+
+- 支持主分析页全部约束：宝牌、立直、副露、南三南四、副露区域、场上可见枚数。
+- 不支持 combo 目标（如 4s-5s 搭子），请用逗号分隔多目标（如 4s,5s）。
+- 振听判定：含同巡振听、立直振听、舍张振听，由 `RoundInstantDealInAnalyzer` 实现。
+
+---
+
 ## 七、维护约定
 
 - **修改牌编码逻辑**：改 `mjlog_parser.TileUtils` 与 `tenhou6_adapter.TENHOU6_TO_BASE`

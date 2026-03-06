@@ -2474,10 +2474,20 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.instant_pattern_input, 1)
         row1.addWidget(QLabel("目标牌:"))
         self.instant_target_input = QLineEdit()
-        self.instant_target_input.setPlaceholderText("例: 6s（仅单张）")
-        self.instant_target_input.setMaximumWidth(80)
+        self.instant_target_input.setPlaceholderText("例: 6s 或 3p,4p")
+        self.instant_target_input.setMaximumWidth(100)
         row1.addWidget(self.instant_target_input)
         layout.addLayout(row1)
+
+        row1b = QHBoxLayout()
+        row1b.addWidget(QLabel("假想振听牌:"))
+        self.instant_hypothetical_furiten_input = QLineEdit()
+        self.instant_hypothetical_furiten_input.setPlaceholderText("例: 6p 或 6p,7p（若也会放铳则不计入主铳率）")
+        self.instant_hypothetical_furiten_input.setToolTip(
+            "若假想振听牌在该时点也会放铳，则该匹配不计入主铳率，而是计入「因假想振听牌被排除的案列数」"
+        )
+        row1b.addWidget(self.instant_hypothetical_furiten_input, 1)
+        layout.addLayout(row1b)
 
         # 约束区
         constraints_group = QGroupBox("约束条件")
@@ -3657,6 +3667,9 @@ class MainWindow(QMainWindow):
         matched_states_cap = self.matched_states_cap_spin.value()
         analysis_batch_size = self.analysis_batch_size_spin.value()
 
+        hypothetical_furiten = None
+        if use_instant and getattr(self, "instant_hypothetical_furiten_input", None):
+            hypothetical_furiten = self.instant_hypothetical_furiten_input.text().strip() or None
         params = {
             "query_items": query_items,
             "analysis_target": analysis_target,
@@ -3674,6 +3687,7 @@ class MainWindow(QMainWindow):
             "exclude_south4": self.exclude_south4_check.isChecked(),
             "exclude_south3": self.exclude_south3_check.isChecked(),
             "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+            "hypothetical_furiten_tiles": hypothetical_furiten,
             "max_workers": self.max_workers_spin.value(),
             "gc_interval_batches": self.gc_interval_batches_spin.value(),
         }
@@ -4080,6 +4094,9 @@ class MainWindow(QMainWindow):
                         f"平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}",
                         f"铳度: {result.get('deal_in_intensity', 0.0):.2f}",
                     ])
+                    exc = result.get("excluded_due_to_hypothetical_furiten", 0)
+                    if exc > 0:
+                        lines.append(f"因假想振听牌被排除的案列数: {_fmt_int(exc)}")
                 result_text = "\n".join(lines)
 
                 # 多模式：勾选与合并（_setup_multi_pattern_merge 内 _update_merged_result 已设置 _excel_clipboard_text 为合并结果）
@@ -4102,9 +4119,13 @@ class MainWindow(QMainWindow):
                         lines.append(
                             f"    {tk}: 铳率 {s['rate']:.2%} ({_fmt_int(s['hits'])} 例) | 平均铳点 {s['point_avg']:.1f} | 铳度 {s['intensity']:.2f}"
                         )
+                    exc = result.get("excluded_due_to_hypothetical_furiten", 0)
+                    if exc > 0:
+                        lines.append(f"  因假想振听牌被排除的案列数: {_fmt_int(exc)}")
                     dist_text = "\n".join(lines)
                     target_label = f"目标: {result['target_tile']} (多目标即时铳率)"
                 elif use_instant:
+                    exc = result.get("excluded_due_to_hypothetical_furiten", 0)
                     dist_text = (
                         f"  总样本: {_fmt_int(result.get('total_matches', 0))}\n"
                         f"  可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}\n"
@@ -4112,6 +4133,8 @@ class MainWindow(QMainWindow):
                         f"  平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}\n"
                         f"  铳度: {result.get('deal_in_intensity', 0.0):.2f}"
                     )
+                    if exc > 0:
+                        dist_text += f"\n  因假想振听牌被排除的案列数: {_fmt_int(exc)}"
                     target_label = f"目标: {result['target_tile']} (即时铳率)"
                 elif use_tenpai:
                     dist_text = (

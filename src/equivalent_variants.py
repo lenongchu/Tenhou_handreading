@@ -1265,8 +1265,9 @@ def generate_equivalent_variants(
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
         call_area = list(call_area_constraints) if call_area_constraints else None
+        mapping = {"m": "m", "p": "p", "s": "s"}
         return [
-            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "call_area_constraints": call_area}
+            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "call_area_constraints": call_area, "mapping": mapping}
             for p in honor_variants
         ]
 
@@ -1291,6 +1292,7 @@ def generate_equivalent_variants(
             "is_combo": is_combo,
             "prior_discard_exclusion": prior_mapped,
             "call_area_constraints": call_area_new,
+            "mapping": mapping,
         })
     return variants
 
