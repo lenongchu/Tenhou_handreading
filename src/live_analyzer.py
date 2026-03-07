@@ -59,15 +59,51 @@ POOL_RESTART_EVERY_BATCHES = 10
 DEAL_IN_INSTANT_BATCH_SIZE = 8000
 
 
+def _get_variant_pattern_suit(matched_variant: Optional[Dict]) -> Optional[str]:
+    """从变体舍牌中取第一个数牌/赤五的花色，用于假想振听牌的等价变换。无则返回 None。"""
+    if not matched_variant:
+        return None
+    discard = matched_variant.get("discard") or []
+    for elem in discard:
+        t = elem[0] if isinstance(elem, tuple) else elem
+        if isinstance(t, str):
+            if t in ("0m", "0p", "0s"):
+                return t[-1]
+            if len(t) >= 2 and t[-1] in "mps" and (t[0].isdigit() or t in ("0m", "0p", "0s")):
+                return t[-1]
+            if t.startswith("@r:") and len(t) > 3:
+                sub = t[3:]
+                if sub in ("0m", "0p", "0s") or (len(sub) >= 2 and sub[-1] in "mps"):
+                    return sub[-1]
+    return None
+
+
 def _should_exclude_for_hypothetical_furiten(
     round_instant_analyzer, player_id: int, turn: int,
     hypothetical_furiten_list: List[str], mapping: Optional[Dict[str, str]],
     mapped_targets_to_skip: Optional[Union[str, List[str]]] = None,
+    matched_variant: Optional[Dict] = None,
 ) -> bool:
     """若假想振听牌（且非目标牌）也会放铳，返回 True（应从主铳率中排除）"""
+    return len(_get_hypothetical_furiten_deal_in_tiles(
+        round_instant_analyzer, player_id, turn,
+        hypothetical_furiten_list, mapping, mapped_targets_to_skip, matched_variant,
+    )) > 0
+
+
+def _get_hypothetical_furiten_deal_in_tiles(
+    round_instant_analyzer, player_id: int, turn: int,
+    hypothetical_furiten_list: List[str], mapping: Optional[Dict[str, str]],
+    mapped_targets_to_skip: Optional[Union[str, List[str]]] = None,
+    matched_variant: Optional[Dict] = None,
+) -> List[str]:
+    """返回在该时点会放铳的假想振听牌列表（原输入牌符，用于按牌统计排除数）。
+    假想振听牌做等价变换：数牌/赤五按当前变体的 pattern suit 变换（与目标牌一致），字牌仍用 mapping。
+    """
     if not hypothetical_furiten_list or round_instant_analyzer is None:
-        return False
+        return []
     mapping = mapping or {"m": "m", "p": "p", "s": "s"}
+    variant_suit = _get_variant_pattern_suit(matched_variant)
     skip_set = set()
     if mapped_targets_to_skip is not None:
         skip_set = (
@@ -75,14 +111,18 @@ def _should_exclude_for_hypothetical_furiten(
             if isinstance(mapped_targets_to_skip, str)
             else set(mapped_targets_to_skip)
         )
+    out = []
     for tile in hypothetical_furiten_list:
-        mapped = _transform_tile_with_mapping(tile, mapping)
+        if variant_suit and (tile in ("0m", "0p", "0s") or (len(tile) >= 2 and tile[-1] in "mps" and tile[0].isdigit())):
+            mapped = (tile[0] if tile[0].isdigit() else "0") + variant_suit
+        else:
+            mapped = _transform_tile_with_mapping(tile, mapping)
         if mapped in skip_set:
             continue
         ev = round_instant_analyzer.evaluate(player_id, turn, mapped)
         if ev.get("deal_in_hit"):
-            return True
-    return False
+            out.append(tile)
+    return out
 
 
 def _is_deal_in_hit_sample(sample: Dict) -> bool:
@@ -726,6 +766,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     instant_deal_in_dist = {}
     excluded_due_to_hypothetical_furiten = 0
     hypothetical_furiten_list = params.get("hypothetical_furiten_list") or []
+    excluded_due_to_hypothetical_furiten_by_tile = {t: 0 for t in hypothetical_furiten_list} if hypothetical_furiten_list else {}
     if use_deal_in_instant and multi_target:
         for tk in [_target_key(t[0], t[1]) for t in item_multi_targets[0]]:
             instant_deal_in_dist[tk] = {"hits": 0, "points": 0}
@@ -736,6 +777,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             if "riichi" not in raw and "reach" not in raw:
                 return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                         "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
+                        "excluded_due_to_hypothetical_furiten_by_tile": {},
                         "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                         "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
         if consumed_search_list and _is_tenhou6_json(raw):
@@ -743,12 +785,14 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 if not log_contains_consumed(raw, consumed_search_list[0]):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                             "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
+                            "excluded_due_to_hypothetical_furiten_by_tile": {},
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
             else:
                 if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                             "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
+                            "excluded_due_to_hypothetical_furiten_by_tile": {},
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
         round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
@@ -978,12 +1022,17 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                         )
                                         instant_eval_multi[tk] = ev
                                     any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
-                                    if any_hit and hypothetical_furiten_list and _should_exclude_for_hypothetical_furiten(
-                                        round_instant_analyzer, player_state.player_id, discard.turn,
-                                        hypothetical_furiten_list, matched_variant.get("mapping"),
-                                        mapped_targets_to_skip=m_targets,
-                                    ):
-                                        excluded_due_to_hypothetical_furiten += 1
+                                    if any_hit and hypothetical_furiten_list:
+                                        tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                            round_instant_analyzer, player_state.player_id, discard.turn,
+                                            hypothetical_furiten_list, matched_variant.get("mapping"),
+                                            mapped_targets_to_skip=m_targets,
+                                            matched_variant=matched_variant,
+                                        )
+                                        if tiles_deal_in:
+                                            excluded_due_to_hypothetical_furiten += 1
+                                            for t in tiles_deal_in:
+                                                excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
                                     else:
                                         for tk, ev in instant_eval_multi.items():
                                             if ev.get("deal_in_hit"):
@@ -1002,12 +1051,20 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                         player_state.player_id, discard.turn, mapped_target_str
                                     )
                         if instant_eval.get("deal_in_hit"):
-                            if hypothetical_furiten_list and _should_exclude_for_hypothetical_furiten(
-                                round_instant_analyzer, player_state.player_id, discard.turn,
-                                hypothetical_furiten_list, matched_variant.get("mapping"),
-                                mapped_targets_to_skip=mapped_target_str,
-                            ):
-                                excluded_due_to_hypothetical_furiten += 1
+                            if hypothetical_furiten_list:
+                                tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                    round_instant_analyzer, player_state.player_id, discard.turn,
+                                    hypothetical_furiten_list, matched_variant.get("mapping"),
+                                    mapped_targets_to_skip=mapped_target_str,
+                                    matched_variant=matched_variant,
+                                )
+                                if tiles_deal_in:
+                                    excluded_due_to_hypothetical_furiten += 1
+                                    for t in tiles_deal_in:
+                                        excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
+                                else:
+                                    deal_in_hits += 1
+                                    deal_in_point_sum += int(instant_eval.get("deal_in_point", 0))
                             else:
                                 deal_in_hits += 1
                                 deal_in_point_sum += int(instant_eval.get("deal_in_point", 0))
@@ -1111,6 +1168,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         "deal_in_hits": deal_in_hits,
         "deal_in_point_sum": deal_in_point_sum,
         "excluded_due_to_hypothetical_furiten": excluded_due_to_hypothetical_furiten,
+        "excluded_due_to_hypothetical_furiten_by_tile": excluded_due_to_hypothetical_furiten_by_tile,
         "pattern_matches": pattern_matches,
         "pattern_distributions": pattern_distributions,
         "matched_states": matched_states,
@@ -1297,6 +1355,9 @@ class LiveAnalyzer:
         deal_in_hits_total = 0
         deal_in_point_sum_total = 0
         excluded_due_to_hypothetical_furiten = 0
+        excluded_due_to_hypothetical_furiten_by_tile: Dict[str, int] = {
+            t: 0 for t in hypothetical_furiten_list
+        } if hypothetical_furiten_list else {}
         # 即时铳率多目标分布：target_key -> {"hits": n, "points": n}
         instant_deal_in_dist = {}
         if use_deal_in_instant and multi_target:
@@ -1422,6 +1483,8 @@ class LiveAnalyzer:
                     deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
                     deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
                     excluded_due_to_hypothetical_furiten += per_log_result.get("excluded_due_to_hypothetical_furiten", 0)
+                    for t, c in per_log_result.get("excluded_due_to_hypothetical_furiten_by_tile", {}).items():
+                        excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + c
                     if use_deal_in_instant and multi_target:
                         wid = per_log_result.get("instant_deal_in_dist", {})
                         for tk, stats in wid.items():
@@ -1795,12 +1858,22 @@ class LiveAnalyzer:
                                                 
                                                 # 多目标：若有任一可铳且假想振听牌（非目标牌）也会放铳，整次匹配排除（不计入铳率）
                                                 any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
-                                                if any_hit and hypothetical_furiten_list and _should_exclude_for_hypothetical_furiten(
-                                                    round_instant_analyzer, player_state.player_id, discard.turn,
-                                                    hypothetical_furiten_list, matched_variant.get("mapping"),
-                                                    mapped_targets_to_skip=m_targets,
-                                                ):
-                                                    excluded_due_to_hypothetical_furiten += 1
+                                                if any_hit and hypothetical_furiten_list:
+                                                    tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                                        round_instant_analyzer, player_state.player_id, discard.turn,
+                                                        hypothetical_furiten_list, matched_variant.get("mapping"),
+                                                        mapped_targets_to_skip=m_targets,
+                                                        matched_variant=matched_variant,
+                                                    )
+                                                    if tiles_deal_in:
+                                                        excluded_due_to_hypothetical_furiten += 1
+                                                        for t in tiles_deal_in:
+                                                            excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
+                                                    else:
+                                                        for tk, ev in instant_eval_multi.items():
+                                                            if ev.get("deal_in_hit"):
+                                                                instant_deal_in_dist[tk]["hits"] += 1
+                                                                instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
                                                 else:
                                                     for tk, ev in instant_eval_multi.items():
                                                         if ev.get("deal_in_hit"):
@@ -1818,14 +1891,20 @@ class LiveAnalyzer:
                                                     )
                                         
                                         if instant_eval.get("deal_in_hit"):
-                                            if hypothetical_furiten_list and (
-                                                _should_exclude_for_hypothetical_furiten(
+                                            if hypothetical_furiten_list and round_instant_analyzer:
+                                                tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
                                                     round_instant_analyzer, player_state.player_id, discard.turn,
                                                     hypothetical_furiten_list, matched_variant.get("mapping"),
                                                     mapped_targets_to_skip=mapped_target,
-                                                ) if round_instant_analyzer else False
-                                            ):
-                                                excluded_due_to_hypothetical_furiten += 1
+                                                    matched_variant=matched_variant,
+                                                )
+                                                if tiles_deal_in:
+                                                    excluded_due_to_hypothetical_furiten += 1
+                                                    for t in tiles_deal_in:
+                                                        excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
+                                                else:
+                                                    deal_in_hits_total += 1
+                                                    deal_in_point_sum_total += int(instant_eval.get("deal_in_point", 0))
                                             else:
                                                 deal_in_hits_total += 1
                                                 deal_in_point_sum_total += int(instant_eval.get("deal_in_point", 0))
@@ -2046,6 +2125,7 @@ class LiveAnalyzer:
             'total_matches': total_matches,
             'deal_in_hits': deal_in_hits_total,
             'excluded_due_to_hypothetical_furiten': excluded_due_to_hypothetical_furiten,
+            'excluded_due_to_hypothetical_furiten_by_tile': excluded_due_to_hypothetical_furiten_by_tile,
             'deal_in_point_sum': deal_in_point_sum_total,
             'deal_in_point_avg': instant_deal_in_point_avg,
             'deal_in_intensity': instant_deal_in_intensity,

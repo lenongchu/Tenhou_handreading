@@ -863,17 +863,28 @@ def _get_suits_in_pattern(parsed_pattern: List[Tuple[str, bool]]) -> set:
     return suits
 
 
-# 字牌占位符中含字母 p 但不是花色：ap(安牌)、apr(立直宣言安牌)、yp(役牌)、ypr；映射时不得把其中的 p 当饼子替换
+# 字牌占位符中含字母 p 但不是花色：ap(安牌)、apr(立直宣言安牌)、yp(役牌)、ypr；带 f/t/r 后缀如 apf/apt 等也不参与映射
 _RESERVED_CONTAIN_P = frozenset({"ap", "apr", "yp", "ypr"})
+
+
+def _is_ap_or_yp_token(raw: str) -> bool:
+    """ap/yp 及其带 f/t/r 后缀的形式（apf, apt, apr, ypf, ypt, ypr 等）整词不参与花色替换"""
+    if raw in _RESERVED_CONTAIN_P:
+        return True
+    if raw.startswith("ap") and len(raw) > 2 and all(c in "ftr" for c in raw[2:]):
+        return True
+    if raw.startswith("yp") and len(raw) > 2 and all(c in "ftr" for c in raw[2:]):
+        return True
+    return False
 
 
 def _apply_suit_mapping_to_string(raw: str, mapping: Dict[str, str]) -> str:
     """
     对原始舍牌元素做花色映射：仅替换 m/p/s 字符，t、r 等后缀保持不变。
     例：2mt + m→p -> 2pt；NOTm + m→p -> NOTp
-    ap/apr/yp/ypr 为整词占位符，其中的 p 不是花色，不参与映射。
+    ap/apr/apf/apt 与 yp/ypr/ypf/ypt 等为整词占位符，其中的 p 不是花色，不参与映射。
     """
-    if raw in _RESERVED_CONTAIN_P:
+    if _is_ap_or_yp_token(raw):
         return raw
     return "".join(mapping[c] if c in "mps" else c for c in raw)
 

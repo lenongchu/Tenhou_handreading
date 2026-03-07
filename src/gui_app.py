@@ -4097,6 +4097,9 @@ class MainWindow(QMainWindow):
                     exc = result.get("excluded_due_to_hypothetical_furiten", 0)
                     if exc > 0:
                         lines.append(f"因假想振听牌被排除的案列数: {_fmt_int(exc)}")
+                        by_tile = result.get("excluded_due_to_hypothetical_furiten_by_tile") or {}
+                        if by_tile:
+                            lines.append("  （按牌: " + "、".join(f"{t}: {_fmt_int(c)} 例" for t, c in sorted(by_tile.items())) + "）")
                 result_text = "\n".join(lines)
 
                 # 多模式：勾选与合并（_setup_multi_pattern_merge 内 _update_merged_result 已设置 _excel_clipboard_text 为合并结果）
@@ -4122,6 +4125,9 @@ class MainWindow(QMainWindow):
                     exc = result.get("excluded_due_to_hypothetical_furiten", 0)
                     if exc > 0:
                         lines.append(f"  因假想振听牌被排除的案列数: {_fmt_int(exc)}")
+                        by_tile = result.get("excluded_due_to_hypothetical_furiten_by_tile") or {}
+                        if by_tile:
+                            lines.append("  （按牌: " + "、".join(f"{t}: {_fmt_int(c)} 例" for t, c in sorted(by_tile.items())) + "）")
                     dist_text = "\n".join(lines)
                     target_label = f"目标: {result['target_tile']} (多目标即时铳率)"
                 elif use_instant:
@@ -4135,6 +4141,9 @@ class MainWindow(QMainWindow):
                     )
                     if exc > 0:
                         dist_text += f"\n  因假想振听牌被排除的案列数: {_fmt_int(exc)}"
+                        by_tile = result.get("excluded_due_to_hypothetical_furiten_by_tile") or {}
+                        if by_tile:
+                            dist_text += "\n  （按牌: " + "、".join(f"{t}: {_fmt_int(c)} 例" for t, c in sorted(by_tile.items())) + "）"
                     target_label = f"目标: {result['target_tile']} (即时铳率)"
                 elif use_tenpai:
                     dist_text = (

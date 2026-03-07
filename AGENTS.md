@@ -199,6 +199,15 @@
 | 副露区域约束 | `_apply_suit_mapping_to_string` | 4sc3s5s → 4mc3m5m |
 | 前段禁打 | `_apply_suit_mapping_to_string` | NOTs → NOTm |
 
+### 3.4 占位符 ap/yp 与等价映射
+
+- **ap / apr / apf / apt**（安牌、立直宣言安牌等）与 **yp / ypr / ypf / ypt**（役牌等）中的字母 **p** 是占位符名的一部分，**不是**花色「饼子」。等价映射时这些整词**不参与**花色替换（否则会误写成 am/ym 等）。
+- 带后缀形式（如 `apf` 手摸切皆可、`apt` 摸切）同样按整词保留。实现见 `equivalent_variants._is_ap_or_yp_token` 与 `_apply_suit_mapping_to_string`。
+
+### 3.5 纯字牌模式 + 数牌目标
+
+- 舍牌模式**仅含字牌占位符**（如 `apr`、`z-ap`）而**目标牌为数牌或赤五**（如 `3p`）时，仍按目标牌花色生成 **3 个等价变体**（3m / 3p / 3s），以扩大样本。实现见 `generate_equivalent_variants` 中「纯字牌模式」分支对 `target_suits` 的处理。
+
 ---
 
 ## 四、核心模块
@@ -281,8 +290,8 @@
 - **参数**：`hypothetical_furiten_tiles`，如 `"6p"` 或 `"6p,7p"`，在铳率分析页输入框「假想振听牌」。
 - **逻辑**：若目标牌可铳且假想振听牌（**且非目标牌本身**）在该时点也会放铳，则该匹配**不计入主铳率**，而是计入 `excluded_due_to_hypothetical_furiten`。
 - **目标牌排除**：假想振听牌若与目标牌相同（映射后），不参与排除判定，避免误排除全部可铳样本。
-- **等价变换**：假想振听牌按 `matched_variant["mapping"]` 做花色映射（`_transform_tile_with_mapping`），与目标牌一致。
-- **结果展示**：当 `excluded_due_to_hypothetical_furiten > 0` 时，显示「因假想振听牌被排除的案列数」。
+- **等价变换**：假想振听牌与目标牌使用同一套等价：数牌/赤五按**当前变体的 pattern suit**（从 `matched_variant["discard"]` 取首个数牌花色）变换，即在该变体下检查「同数字、同变体花色」的牌是否也会放铳；字牌仍用 `mapping`。实现见 `_get_variant_pattern_suit` 与 `_get_hypothetical_furiten_deal_in_tiles`。
+- **结果展示**：当 `excluded_due_to_hypothetical_furiten > 0` 时，显示「因假想振听牌被排除的案列数」；若输入了多张假想振听牌（如 1p,2p），则同时按牌展示每张导致的排除数 `excluded_due_to_hypothetical_furiten_by_tile`（如「1p: 20 例、2p: 29 例」）。
 
 ### 约束与限制
 
