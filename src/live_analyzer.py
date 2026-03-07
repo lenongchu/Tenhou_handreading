@@ -25,6 +25,7 @@ from .equivalent_variants import (
     match_discard_to_variant,
     parse_target_tiles,
     parse_multi_targets,
+    split_discard_pattern,
     _transform_tile_with_mapping,
     get_consumed_search_patterns,
     log_contains_consumed,
@@ -1219,7 +1220,13 @@ class LiveAnalyzer:
         if query_items is not None and len(query_items) > 0:
             items = query_items
         elif query_pattern and target_tile:
-            items = [(query_pattern, target_tile)]
+            # 确保舍牌模式为列表，否则等价变换会失败（字符串会被逐字符解析）
+            pattern_list = (
+                split_discard_pattern(query_pattern)
+                if isinstance(query_pattern, str)
+                else list(query_pattern)
+            )
+            items = [(pattern_list, target_tile)]
         else:
             return _empty_analysis_result([], "")
 
@@ -2705,6 +2712,7 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
+        call_area_constraints: Optional[List[str]] = None,
         gc_interval_batches: Optional[int] = None,
         outcome_filter: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
         deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
@@ -2768,7 +2776,7 @@ class LiveAnalyzer:
             return candidates[:sample_count]
 
         variants = generate_equivalent_variants(
-            query_pattern, target_tile, visible_constraints, prior_discard_exclusion
+            query_pattern, target_tile, visible_constraints, prior_discard_exclusion, call_area_constraints
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
         riichi_search = pattern_has_riichi(query_pattern)
@@ -3231,6 +3239,8 @@ def verify_sample_consistency(
     query_pattern: List[str],
     target_tile: str,
     visible_constraints: Optional[Dict] = None,
+    prior_discard_exclusion: Optional[str] = None,
+    call_area_constraints: Optional[List[str]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     验证样本的 actual_pattern 是否与查询模式在匹配逻辑下一致。
@@ -3248,7 +3258,10 @@ def verify_sample_consistency(
             return (False, "actual_pattern parsed to empty sequence")
         first_t = parse_multi_targets(target_tile)[0]
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
-        variants = generate_equivalent_variants(query_pattern, variant_target, visible_constraints)
+        variants = generate_equivalent_variants(
+            query_pattern, variant_target, visible_constraints,
+            prior_discard_exclusion, call_area_constraints
+        )
         
         # 补充上下文，支持 r (立直) 及 zf/kf (自风/客风) 占位符校验
         player_id = sample.get("player_id", 0)

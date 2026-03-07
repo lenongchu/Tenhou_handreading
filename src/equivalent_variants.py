@@ -837,7 +837,9 @@ def _get_suits_in_pattern(parsed_pattern: List[Tuple[str, bool]]) -> set:
                     suits.add(tp[-1])
         elif tile.startswith("@r:"):
             sub = tile[3:]
-            if sub in RED_FIVES or (len(sub) >= 2 and sub[-1] in "mps"):
+            if sub in ("ap", "yp"):
+                pass
+            elif sub in RED_FIVES or (len(sub) >= 2 and sub[-1] in "mps"):
                 suits.add(sub[-1])
         elif tile.startswith(CD_PREFIX):
             suf = tile[len(CD_PREFIX):]
@@ -845,9 +847,14 @@ def _get_suits_in_pattern(parsed_pattern: List[Tuple[str, bool]]) -> set:
                 suits.add(suf)
         elif tile.startswith(CALL_PREFIX) and ":" in tile:
             rest = tile.split(":", 1)[1]
-            for i in range(0, len(rest) - 1, 2):
-                if rest[i + 1 : i + 2] in "mps":
-                    suits.add(rest[i + 1])
+            if rest in ("ap", "yp"):
+                pass
+            else:
+                for i in range(0, len(rest) - 1, 2):
+                    if i + 1 < len(rest) and rest[i + 1] in "mps":
+                        suits.add(rest[i + 1])
+        elif tile in ("ap", "yp"):
+            pass
         elif tile in RED_FIVES or (len(tile) >= 2 and tile[-1] in "mps"):
             suits.add(tile[-1])
 
@@ -856,11 +863,18 @@ def _get_suits_in_pattern(parsed_pattern: List[Tuple[str, bool]]) -> set:
     return suits
 
 
+# 字牌占位符中含字母 p 但不是花色：ap(安牌)、apr(立直宣言安牌)、yp(役牌)、ypr；映射时不得把其中的 p 当饼子替换
+_RESERVED_CONTAIN_P = frozenset({"ap", "apr", "yp", "ypr"})
+
+
 def _apply_suit_mapping_to_string(raw: str, mapping: Dict[str, str]) -> str:
     """
     对原始舍牌元素做花色映射：仅替换 m/p/s 字符，t、r 等后缀保持不变。
     例：2mt + m→p -> 2pt；NOTm + m→p -> NOTp
+    ap/apr/yp/ypr 为整词占位符，其中的 p 不是花色，不参与映射。
     """
+    if raw in _RESERVED_CONTAIN_P:
+        return raw
     return "".join(mapping[c] if c in "mps" else c for c in raw)
 
 
@@ -875,6 +889,8 @@ def _apply_suit_mapping_to_tile(tile: str, mapping: Dict[str, str]) -> str:
         return tile
     if tile.startswith("@r:"):
         sub = tile[3:]
+        if sub in ("ap", "yp"):
+            return tile
         if sub in RED_FIVES or (len(sub) >= 2 and sub[-1] in "mps"):
             return f"@r:{sub[0]}{mapping[sub[-1]]}"
         return tile
@@ -910,6 +926,8 @@ def _apply_suit_mapping_to_tile(tile: str, mapping: Dict[str, str]) -> str:
         return f"{OR_PREFIX}{','.join(transformed)}"
     if tile.startswith(CALL_PREFIX) and ":" in tile:
         prefix, rest = tile.split(":", 1)
+        if rest in ("ap", "yp"):
+            return tile
         if any(c in rest for c in "mps"):
             new_rest = ""
             i = 0
@@ -1230,7 +1248,7 @@ def generate_equivalent_variants(
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
     仅花色对称，无镜像对称。
 
-    - 0 种花色（纯字牌等）：1 个变体
+    - 0 种花色（纯字牌等）：1 个变体；若目标牌为数牌/赤五则按目标牌花色仍生成 3 变体（如 apr+3p -> 3m/3p/3s）
     - 1 种花色：3 个变体（该花色映到 m/p/s）
     - 2 或 3 种花色：6 个变体（全排列）
     """
@@ -1259,12 +1277,36 @@ def generate_equivalent_variants(
     if has_riichi and (has_chi or has_pon):
         raise ValueError("舍牌模式不能同时包含立直宣言(r)与吃/碰(c/p)，立直玩家不可副露")
 
-    # 纯字牌模式（无花色映射，副露区域约束原样传入）
+    # 纯字牌模式：舍牌无花色，但若目标牌为数牌/赤五，仍按目标牌花色生成等价变体（如 apr + 3p -> 3m/3p/3s）
     if not has_number:
         honor_variants = _expand_pure_honor_pattern(parsed_pattern)
-        t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
         call_area = list(call_area_constraints) if call_area_constraints else None
+        # 从目标牌中收集花色（数牌、赤五）
+        target_suits = set()
+        for t in target_tiles:
+            if t in RED_FIVES:
+                target_suits.add(t[-1])
+            elif len(t) >= 2 and t[-1] in "mps" and (t[0].isdigit() or t in RED_FIVES):
+                target_suits.add(t[-1])
+        if target_suits:
+            mappings = _get_suit_mappings_for_variants(target_suits)
+            result = []
+            for p in honor_variants:
+                for mapping in mappings:
+                    target_new = [_transform_tile_with_mapping(t, mapping) for t in target_tiles]
+                    target_new = target_new[0] if len(target_new) == 1 else target_new
+                    visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
+                    prior_mapped = _apply_suit_mapping_to_string(prior, mapping) if prior else None
+                    call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in (call_area or [])]
+                    result.append({
+                        "discard": p, "target": target_new,
+                        "visible_constraints": visible_new, "is_combo": is_combo,
+                        "prior_discard_exclusion": prior_mapped, "call_area_constraints": call_area_new,
+                        "mapping": mapping,
+                    })
+            return result
+        t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         mapping = {"m": "m", "p": "p", "s": "s"}
         return [
             {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "call_area_constraints": call_area, "mapping": mapping}

@@ -1,23 +1,23 @@
 # Tenhou Handreading Application - Dependencies
 
-# Data download
-houou-logs>=1.0.0
+# Data download (houou-logs from GitHub, not on PyPI)
+git+https://github.com/Apricot-S/houou-logs.git
 requests>=2.32.0
 
 # Data processing
 numpy>=1.24.0
 pandas>=2.0.0
 
-# 麻将向听/听牌计算（与天凤一致）
+# Mahjong shanten/tenpai (same as Tenhou)
 mahjong>=1.1.0
 
 # GUI framework
 PyQt5>=5.15.0
 
-# 麻将示意图立体效果（可选）：pip install cairosvg
+# Tile illustration (optional): pip install cairosvg
 cairosvg>=2.7.0
 
-# 3D 牌面渲染（可选）：pip install trimesh pyrender Pillow
+# 3D tile render (optional): pip install trimesh pyrender Pillow
 trimesh>=4.0.0
 pyrender>=0.1.45
 Pillow>=9.0.0
