@@ -4123,11 +4123,14 @@ class MainWindow(QMainWindow):
                             f"    {tk}: 铳率 {s['rate']:.2%} ({_fmt_int(s['hits'])} 例) | 平均铳点 {s['point_avg']:.1f} | 铳度 {s['intensity']:.2f}"
                         )
                     exc = result.get("excluded_due_to_hypothetical_furiten", 0)
+                    total_hits = sum(s.get("hits", 0) for s in stats.values())
                     if exc > 0:
                         lines.append(f"  因假想振听牌被排除的案列数: {_fmt_int(exc)}")
                         by_tile = result.get("excluded_due_to_hypothetical_furiten_by_tile") or {}
                         if by_tile:
                             lines.append("  （按牌: " + "、".join(f"{t}: {_fmt_int(c)} 例" for t, c in sorted(by_tile.items())) + "）")
+                        if total_hits == 0:
+                            lines.append("  （被排除的案列均为可铳匹配，排除后各目标铳率为 0%。）")
                     dist_text = "\n".join(lines)
                     target_label = f"目标: {result['target_tile']} (多目标即时铳率)"
                 elif use_instant:

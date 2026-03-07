@@ -275,7 +275,8 @@
 ### 多目标即时铳率
 
 - **目标格式**：逗号分隔，如 `3p,4p`，表示同时分析 3p、4p 两张假想牌。
-- **变体 target**：多目标时 `variant_target="3p,4p"` 传入 `generate_equivalent_variants`，变体 `target` 为列表 `["3m","4m"]` 等。
+- **变体 target**：多目标时 `variant_target="3p,4p"` 传入 `generate_equivalent_variants`，变体 `target` 为列表 `["3m","4m"]` 等；单目标时等价变体里存为**字符串**（如 `"3m"`）。
+- **变体 target 与 mt_item 统一逻辑**：一次分析可配置多条（舍牌模式, 目标牌），「是否多目标」按第一条判定（`multi_target = len(item_multi_targets[0]) > 1`），实际匹配可能命中其他条（单目标）。`live_analyzer` 取到 `matched_variant["target"]` 后**统一规范为列表**：若为字符串则 `m_targets = [m_targets]`，再以 `len(m_targets) == len(mt_item)` 与当前条目标列表 `mt_item = item_multi_targets[matched_idx]` 对齐，逐目标 evaluate 与统计。**长度不一致视为逻辑错误**，直接抛出 `ValueError`，不静默回退。
 - **逐目标统计**：`instant_deal_in_dist[tk]` 按目标牌分别累计 hits/points；`multi_instant_stats` 输出各目标铳率、平均铳点、铳度。
 - **并行 worker**：worker 需实现多目标逻辑并返回 `instant_deal_in_dist`，主进程合并。
 

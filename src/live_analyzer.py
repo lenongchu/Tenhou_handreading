@@ -1008,10 +1008,14 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             except Exception as e:
                                 logger.debug(f"即时铳率引擎初始化失败: {e}")
                                 round_instant_analyzer = None
+                        excluded_this_match_by_hypothetical_furiten = False
                         if round_instant_analyzer:
                             if multi_target:
+                                # 变体里单目标存成字符串、多目标存成列表，统一为列表后与 mt_item 一一对应
                                 m_targets = matched_variant["target"]
-                                if isinstance(m_targets, list) and len(m_targets) == len(mt_item):
+                                if isinstance(m_targets, str):
+                                    m_targets = [m_targets]
+                                if len(m_targets) == len(mt_item):
                                     for tiles, is_combo in mt_item:
                                         if is_combo:
                                             continue
@@ -1022,6 +1026,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                         )
                                         instant_eval_multi[tk] = ev
                                     any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
+                                    excluded_this_match_by_hypothetical_furiten = False
                                     if any_hit and hypothetical_furiten_list:
                                         tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
                                             round_instant_analyzer, player_state.player_id, discard.turn,
@@ -1031,9 +1036,10 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                         )
                                         if tiles_deal_in:
                                             excluded_due_to_hypothetical_furiten += 1
+                                            excluded_this_match_by_hypothetical_furiten = True
                                             for t in tiles_deal_in:
                                                 excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
-                                    else:
+                                    if not excluded_this_match_by_hypothetical_furiten:
                                         for tk, ev in instant_eval_multi.items():
                                             if ev.get("deal_in_hit"):
                                                 instant_deal_in_dist[tk]["hits"] += 1
@@ -1041,15 +1047,17 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                     first_tk = _target_key(mt_item[0][0], mt_item[0][1])
                                     instant_eval = instant_eval_multi.get(first_tk, {})
                                 else:
-                                    if mapped_target_str:
-                                        instant_eval = round_instant_analyzer.evaluate(
-                                            player_state.player_id, discard.turn, mapped_target_str
-                                        )
+                                    raise ValueError(
+                                        "多目标即时铳率：变体 target 与当前条目标数量不一致 "
+                                        "(len(m_targets)=%s, len(mt_item)=%s, matched_idx=%s)"
+                                        % (len(m_targets), len(mt_item), matched_idx)
+                                    )
                             else:
                                 if mapped_target_str:
                                     instant_eval = round_instant_analyzer.evaluate(
                                         player_state.player_id, discard.turn, mapped_target_str
                                     )
+                        excluded_this_match_by_hypothetical_furiten = False
                         if instant_eval.get("deal_in_hit"):
                             if hypothetical_furiten_list:
                                 tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
@@ -1060,6 +1068,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                 )
                                 if tiles_deal_in:
                                     excluded_due_to_hypothetical_furiten += 1
+                                    excluded_this_match_by_hypothetical_furiten = True
                                     for t in tiles_deal_in:
                                         excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
                                 else:
@@ -1092,18 +1101,22 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         else:
                             ms_entry['target_count'] = target_count
                         if use_deal_in_instant:
+                            deal_in_hit_val = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
                             ms_entry.update({
-                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                "deal_in_hit": deal_in_hit_val,
+                                "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
                                 "furiten_state": instant_eval.get("furiten_state", "none"),
                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                             })
                             if multi_target:
-                                ms_entry["instant_eval_multi"] = instant_eval_multi
+                                if excluded_this_match_by_hypothetical_furiten:
+                                    ms_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                                else:
+                                    ms_entry["instant_eval_multi"] = instant_eval_multi
                         matched_states.append(ms_entry)
 
-                    is_deal_in = use_deal_in_instant and (
+                    is_deal_in = use_deal_in_instant and not excluded_this_match_by_hypothetical_furiten and (
                         instant_eval.get("deal_in_hit")
                         or any(ev.get("deal_in_hit") for ev in (instant_eval_multi or {}).values())
                     )
@@ -1140,15 +1153,19 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         else:
                             sp_entry["target_count"] = target_count
                         if use_deal_in_instant:
+                            sp_deal_in_hit = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
                             sp_entry.update({
-                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                "deal_in_hit": sp_deal_in_hit,
+                                "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
                                 "furiten_state": instant_eval.get("furiten_state", "none"),
                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                             })
                             if multi_target:
-                                sp_entry["instant_eval_multi"] = instant_eval_multi
+                                if excluded_this_match_by_hypothetical_furiten:
+                                    sp_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                                else:
+                                    sp_entry["instant_eval_multi"] = instant_eval_multi
                         # 主分析已匹配成功，直接入库；不再调用 verify_sample_consistency 避免误过滤
                         if len(sample_pool) < worker_sample_pool_cap:
                             sample_pool.append(sp_entry)
@@ -1160,6 +1177,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
 
     except Exception as e:
         logger.error(f"解析对局 {log_id} 失败: {e}")
+        if isinstance(e, ValueError):
+            raise
 
     return {
         "total_matches": total_matches,
@@ -1827,60 +1846,49 @@ class LiveAnalyzer:
                                                 logger.debug(f"即时铳率引擎初始化失败: {e}")
                                                 round_instant_analyzer = None
 
+                                        excluded_this_match_by_hypothetical_furiten = False
                                         if round_instant_analyzer:
                                             if multi_target:
-                                                # 对每个目标分别评估
+                                                # 变体里单目标存成字符串、多目标存成列表，统一为列表后与 mt_item 一一对应
                                                 mt_item = item_multi_targets[matched_idx]
-                                                for tiles, is_combo in mt_item:
-                                                    if is_combo: continue # 目前不支持 combo
-                                                    tk = _target_key(tiles, is_combo)
-                                                    # 等价变换后的目标牌
-                                                    # 注意：variants[0]["target"] 是主目标的映射，
-                                                    # 这里的 tk 是原始目标名。需要应用映射。
-                                                    # mapped_tk = _transform_tile_with_mapping(tk, matched_variant["mapping_used"])
-                                                    # matched_variant 已经包含了映射后的 target。
-                                                    # 实际上在 generate_equivalent_variants 中，每个变体都有一个 "target" 字段。
-                                                    # 如果是多目标，我们需要确保这些目标也被正确映射。
-                                                    
-                                                    # 在 loop 外我们已经知道 mapping 了。
-                                                    # 这里的 mapped_target 是由 match_discard_to_variant 返回的，它已经处理了映射。
-                                                    # 对于多目标，我们需要重新处理映射。
-                                                    # 幸运的是，match_discard_to_variant 返回了 matched_variant["target"]。
-                                                    # 如果 multi_target 为 True，matched_variant["target"] 可能是 List。
-                                                    
-                                                    m_targets = matched_variant["target"]
-                                                    if isinstance(m_targets, list) and len(m_targets) == len(mt_item):
+                                                m_targets = matched_variant["target"]
+                                                if isinstance(m_targets, str):
+                                                    m_targets = [m_targets]
+                                                if len(m_targets) == len(mt_item):
+                                                    for tiles, is_combo in mt_item:
+                                                        if is_combo:
+                                                            continue
+                                                        tk = _target_key(tiles, is_combo)
                                                         mapped_t = m_targets[mt_item.index((tiles, is_combo))]
                                                         ev = round_instant_analyzer.evaluate(
                                                             player_state.player_id, discard.turn, mapped_t
                                                         )
                                                         instant_eval_multi[tk] = ev
-                                                
-                                                # 多目标：若有任一可铳且假想振听牌（非目标牌）也会放铳，整次匹配排除（不计入铳率）
-                                                any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
-                                                if any_hit and hypothetical_furiten_list:
-                                                    tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
-                                                        round_instant_analyzer, player_state.player_id, discard.turn,
-                                                        hypothetical_furiten_list, matched_variant.get("mapping"),
-                                                        mapped_targets_to_skip=m_targets,
-                                                        matched_variant=matched_variant,
-                                                    )
-                                                    if tiles_deal_in:
-                                                        excluded_due_to_hypothetical_furiten += 1
-                                                        for t in tiles_deal_in:
-                                                            excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
+                                                    # 多目标：若有任一可铳且假想振听牌（非目标牌）也会放铳，整次匹配排除（不计入铳率）
+                                                    any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
+                                                    if any_hit and hypothetical_furiten_list:
+                                                        tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                                            round_instant_analyzer, player_state.player_id, discard.turn,
+                                                            hypothetical_furiten_list, matched_variant.get("mapping"),
+                                                            mapped_targets_to_skip=m_targets,
+                                                            matched_variant=matched_variant,
+                                                        )
+                                                        if tiles_deal_in:
+                                                            excluded_due_to_hypothetical_furiten += 1
+                                                            excluded_this_match_by_hypothetical_furiten = True
+                                                            for t in tiles_deal_in:
+                                                                excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
                                                     else:
                                                         for tk, ev in instant_eval_multi.items():
                                                             if ev.get("deal_in_hit"):
                                                                 instant_deal_in_dist[tk]["hits"] += 1
                                                                 instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
                                                 else:
-                                                    for tk, ev in instant_eval_multi.items():
-                                                        if ev.get("deal_in_hit"):
-                                                            instant_deal_in_dist[tk]["hits"] += 1
-                                                            instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
-                                                
-                                                # 为了兼容旧逻辑（记录 matched_states），取第一个目标的评估结果作为代表
+                                                    raise ValueError(
+                                                        "多目标即时铳率：变体 target 与当前条目标数量不一致 "
+                                                        "(len(m_targets)=%s, len(mt_item)=%s, matched_idx=%s)"
+                                                        % (len(m_targets), len(mt_item), matched_idx)
+                                                    )
                                                 first_tk = _target_key(mt_item[0][0], mt_item[0][1])
                                                 instant_eval = instant_eval_multi.get(first_tk, instant_eval)
                                             else:
@@ -1900,6 +1908,7 @@ class LiveAnalyzer:
                                                 )
                                                 if tiles_deal_in:
                                                     excluded_due_to_hypothetical_furiten += 1
+                                                    excluded_this_match_by_hypothetical_furiten = True
                                                     for t in tiles_deal_in:
                                                         excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + 1
                                                 else:
@@ -1924,20 +1933,24 @@ class LiveAnalyzer:
                                         else:
                                             ms_entry['target_count'] = target_count
                                         if use_deal_in_instant:
+                                            ser_deal_in_hit = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
                                             ms_entry.update({
-                                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                                "deal_in_hit": ser_deal_in_hit,
+                                                "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
                                                 "furiten_state": instant_eval.get("furiten_state", "none"),
                                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                             })
                                             if multi_target:
-                                                ms_entry["instant_eval_multi"] = instant_eval_multi
+                                                if excluded_this_match_by_hypothetical_furiten:
+                                                    ms_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                                                else:
+                                                    ms_entry["instant_eval_multi"] = instant_eval_multi
                                         matched_states.append(ms_entry)
                                 
                                     # 主统计时顺带收集完整样本，供采样直接使用
                                     # 池未满时添加；池满且为可铳样本时，替换池中首个非可铳样本
-                                    is_deal_in = use_deal_in_instant and (
+                                    is_deal_in = use_deal_in_instant and not excluded_this_match_by_hypothetical_furiten and (
                                         instant_eval.get("deal_in_hit")
                                         or any(ev.get("deal_in_hit") for ev in (instant_eval_multi or {}).values())
                                     )
@@ -1992,15 +2005,19 @@ class LiveAnalyzer:
                                         else:
                                             sp_entry["target_count"] = target_count
                                         if use_deal_in_instant:
+                                            sp_ser_deal_in_hit = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
                                             sp_entry.update({
-                                                "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                                "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                                "deal_in_hit": sp_ser_deal_in_hit,
+                                                "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
                                                 "furiten_state": instant_eval.get("furiten_state", "none"),
                                                 "furiten_reason": instant_eval.get("furiten_reason", ""),
                                                 "waits_snapshot": instant_eval.get("waits_snapshot", []),
                                             })
                                             if multi_target:
-                                                sp_entry["instant_eval_multi"] = instant_eval_multi
+                                                if excluded_this_match_by_hypothetical_furiten:
+                                                    sp_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                                                else:
+                                                    sp_entry["instant_eval_multi"] = instant_eval_multi
                                         # 主分析已匹配成功，直接入库；不再调用 verify_sample_consistency 避免误过滤
                                         if len(sample_pool) < sample_pool_cap:
                                             sample_pool.append(sp_entry)
@@ -2013,6 +2030,8 @@ class LiveAnalyzer:
                     
                     except Exception as e:
                         logger.error(f"解析对局 {log_id} 失败: {e}")
+                        if isinstance(e, ValueError):
+                            raise
                         continue
             
                     processed += 1
