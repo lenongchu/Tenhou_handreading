@@ -145,11 +145,19 @@ class RoundInstantDealInAnalyzer:
     单局事件重放 + 即时荣和判定。
     """
 
-    def __init__(self, game_data: Dict, game_events: List[Dict], round_num: int, oya: int):
+    def __init__(
+        self,
+        game_data: Dict,
+        game_events: List[Dict],
+        round_num: int,
+        oya: int,
+        normalize_oya_ron_to_ko: bool = False,
+    ):
         self.game_data = game_data
         self.game_events = game_events or []
         self.round_num = int(round_num)
         self.oya = int(oya)
+        self.normalize_oya_ron_to_ko = bool(normalize_oya_ron_to_ko)
 
         bakaze = (self.game_data.get("bakaze") or "E")
         self.round_wind = BAKAZE_TO_BASE.get(str(bakaze).upper(), 27)
@@ -504,7 +512,10 @@ class RoundInstantDealInAnalyzer:
             return 0
 
         cost = getattr(response, "cost", None) or {}
-        return int(cost.get("main") or 0)
+        point = int(cost.get("main") or 0)
+        if point > 0 and self.normalize_oya_ron_to_ko and snapshot.player_id == self.oya:
+            point = (point + 1) // 2
+        return point
 
     def _build_melds(self, calls: Tuple[CallEventSnapshot, ...]) -> Tuple[List, List[int]]:
         if not calls:

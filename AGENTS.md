@@ -309,7 +309,7 @@
 - **修改等价/映射逻辑**：确保 `generate_equivalent_variants` 与 `_dora_matches_constraint` 语义一致
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
 - **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径
-- **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）
+- **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）。铳率分析页支持**多条舍牌模式**（可添加多行“模式 + 目标牌”），满足任一即计入，与主分析页一致。
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
 - **本手册维护**：新增重要目录/脚本/模块时，同步更新本文件；`docs/项目文件夹结构说明.md` 保持为轻量索引并指向本文件
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处

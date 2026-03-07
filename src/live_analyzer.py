@@ -1007,7 +1007,11 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             try:
                                 rp_data, rp_events = round_payload
                                 round_instant_analyzer = RoundInstantDealInAnalyzer(
-                                    rp_data, rp_events, player_state.round_num, player_state.oya
+                                    rp_data,
+                                    rp_events,
+                                    player_state.round_num,
+                                    player_state.oya,
+                                    normalize_oya_ron_to_ko=analysis_params.get("instant_normalize_oya_ron_to_ko", False),
                                 )
                             except Exception as e:
                                 logger.debug(f"即时铳率引擎初始化失败: {e}")
@@ -1269,6 +1273,8 @@ class LiveAnalyzer:
         hypothetical_furiten_tiles: Optional[str] = None,  # 假想振听牌，如 6p 或 6p,7p；若也会放铳则不计入主铳率
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
+        instant_use_theory_point_only: Optional[bool] = True,  # 即时铳率：True=平均铳点仅按理论点（表宝牌），False=可考虑里宝模拟（若已实现）
+        instant_normalize_oya_ron_to_ko: bool = False,  # 即时铳率：True=亲家和牌时铳点按子家算（折半），统一统计口径
     ) -> Dict:
         """
         分析舍牌模式，计算目标牌在手牌中的概率。
@@ -1441,6 +1447,8 @@ class LiveAnalyzer:
             "use_deal_in_instant": use_deal_in_instant,
             "multi_target": multi_target,
             "hypothetical_furiten_list": hypothetical_furiten_list,
+            "instant_use_theory_point_only": instant_use_theory_point_only if use_deal_in_instant else True,
+            "instant_normalize_oya_ron_to_ko": instant_normalize_oya_ron_to_ko if use_deal_in_instant else False,
             "cap": cap,
             "worker_matched_states_cap": worker_matched_states_cap,
             "worker_sample_pool_cap": worker_sample_pool_cap,
@@ -1703,6 +1711,7 @@ class LiveAnalyzer:
             'deal_in_point_sum': deal_in_point_sum_total,
             'deal_in_point_avg': instant_deal_in_point_avg,
             'deal_in_intensity': instant_deal_in_intensity,
+            'instant_use_theory_point_only': instant_use_theory_point_only if use_deal_in_instant else None,
             'multi_instant_stats': multi_instant_stats if use_deal_in_instant and multi_target else None,
             'outcome_wins': outcome_wins_total,
             'outcome_deal_ins': outcome_deal_ins_total,
@@ -1724,6 +1733,8 @@ class LiveAnalyzer:
             'target_tiles': [_target_key(t[0], t[1]) for t in multi_targets] if multi_target else None,
             'pattern_results': pattern_results,
             'elapsed_seconds': round(time.perf_counter() - t0, 1),
+            'instant_use_theory_point_only': instant_use_theory_point_only if use_deal_in_instant else None,
+            'instant_normalize_oya_ron_to_ko': instant_normalize_oya_ron_to_ko if use_deal_in_instant else None,
         }
 
         logger.info(f"analysis complete: matched {total_matches} states")
@@ -2596,7 +2607,13 @@ class LiveAnalyzer:
                                         if round_instant_analyzer is None and round_payload:
                                             try:
                                                 rp_data, rp_events = round_payload
-                                                round_instant_analyzer = RoundInstantDealInAnalyzer(rp_data, rp_events, player_state.round_num, player_state.oya)
+                                                round_instant_analyzer = RoundInstantDealInAnalyzer(
+                                                    rp_data,
+                                                    rp_events,
+                                                    player_state.round_num,
+                                                    player_state.oya,
+                                                    normalize_oya_ron_to_ko=analysis_params.get("instant_normalize_oya_ron_to_ko", False),
+                                                )
                                             except:
                                                 pass
 

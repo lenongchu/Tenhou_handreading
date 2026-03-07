@@ -2467,17 +2467,35 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: #8b949e;")
         layout.addWidget(hint)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("舍牌模式:"))
-        self.instant_pattern_input = QLineEdit()
-        self.instant_pattern_input.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
-        row1.addWidget(self.instant_pattern_input, 1)
-        row1.addWidget(QLabel("目标牌:"))
-        self.instant_target_input = QLineEdit()
-        self.instant_target_input.setPlaceholderText("例: 6s 或 3p,4p")
-        self.instant_target_input.setMaximumWidth(100)
-        row1.addWidget(self.instant_target_input)
-        layout.addLayout(row1)
+        ph_row = QHBoxLayout()
+        ph_row.addWidget(QLabel("舍牌模式 (可添加多条，满足任一即计入):"))
+        instant_pattern_help_btn = QPushButton("?")
+        instant_pattern_help_btn.setToolTip("舍牌模式输入说明")
+        instant_pattern_help_btn.setFixedWidth(28)
+        instant_pattern_help_btn.clicked.connect(self._show_pattern_help)
+        ph_row.addWidget(instant_pattern_help_btn)
+        ph_row.addStretch()
+        layout.addLayout(ph_row)
+        self.instant_pattern_rows_container = QWidget()
+        self.instant_pattern_rows_layout = QVBoxLayout(self.instant_pattern_rows_container)
+        self.instant_pattern_rows_layout.setSpacing(6)
+        self.instant_pattern_rows_layout.setContentsMargins(0, 0, 0, 0)
+        instant_pattern_scroll = QScrollArea()
+        instant_pattern_scroll.setWidget(self.instant_pattern_rows_container)
+        instant_pattern_scroll.setWidgetResizable(True)
+        instant_pattern_scroll.setMinimumHeight(72)
+        instant_pattern_scroll.setMaximumHeight(120)
+        instant_pattern_scroll.setFrameShape(QFrame.NoFrame)
+        instant_pattern_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(instant_pattern_scroll)
+        add_instant_row = QHBoxLayout()
+        self.instant_add_pattern_btn = QPushButton("+ 添加舍牌模式")
+        self.instant_add_pattern_btn.clicked.connect(self._instant_add_pattern_row)
+        add_instant_row.addWidget(self.instant_add_pattern_btn)
+        add_instant_row.addStretch()
+        layout.addLayout(add_instant_row)
+        self._instant_pattern_row_widgets = []
+        self._instant_add_pattern_row()
 
         row1b = QHBoxLayout()
         row1b.addWidget(QLabel("假想振听牌:"))
@@ -2655,6 +2673,19 @@ class MainWindow(QMainWindow):
         self.instant_matched_states_cap_spin.setValue(max(1, min(2000, saved_cap)))
         self.instant_matched_states_cap_spin.setMinimumWidth(56)
         row2.addWidget(self.instant_matched_states_cap_spin)
+        row2.addSpacing(8)
+        self.instant_use_theory_point_only_check = QCheckBox("不考虑里宝（平均铳点仅按理论点）")
+        self.instant_use_theory_point_only_check.setChecked(True)
+        self.instant_use_theory_point_only_check.setToolTip(
+            "勾选时：平均铳点 = 可铳样本的理论点（仅表宝牌）求平均。不勾选时：可考虑里宝（若已实现里宝随机模拟则用其求平均）。"
+        )
+        row2.addWidget(self.instant_use_theory_point_only_check)
+        self.instant_normalize_oya_ron_to_ko_check = QCheckBox("亲家和牌以自家计算")
+        self.instant_normalize_oya_ron_to_ko_check.setChecked(False)
+        self.instant_normalize_oya_ron_to_ko_check.setToolTip(
+            "勾选时：亲家荣和时的铳点按子家换算（折半），统一统计口径，减少亲家样本带来的偏差。"
+        )
+        row2.addWidget(self.instant_normalize_oya_ron_to_ko_check)
         row2.addStretch()
         self.instant_start_btn = QPushButton("开始即时铳率分析")
         self.instant_start_btn.clicked.connect(self._start_instant_deal_in_analysis)
@@ -2665,6 +2696,43 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.instant_status_label)
         layout.addStretch()
         return widget
+
+    def _instant_add_pattern_row(self):
+        """铳率分析页：添加一行舍牌模式+目标牌"""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        pattern_edit = QLineEdit()
+        pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
+        pattern_edit.setMinimumWidth(120)
+        target_edit = QLineEdit()
+        target_edit.setPlaceholderText("例: 6s 或 3p,4p")
+        target_edit.setMaximumWidth(100)
+        del_btn = QPushButton("×")
+        del_btn.setFixedWidth(28)
+        del_btn.setToolTip("删除此行")
+        row.addWidget(QLabel("模式:"))
+        row.addWidget(pattern_edit, 1)
+        row.addWidget(QLabel("目标牌:"))
+        row.addWidget(target_edit)
+        row.addWidget(del_btn)
+        entry = (pattern_edit, target_edit, del_btn, row)
+        self._instant_pattern_row_widgets.append(entry)
+        del_btn.clicked.connect(lambda checked=False, e=entry: self._instant_remove_pattern_row(e))
+        self.instant_pattern_rows_layout.addLayout(row)
+
+    def _instant_remove_pattern_row(self, entry):
+        """铳率分析页：移除一行舍牌模式"""
+        if len(self._instant_pattern_row_widgets) <= 1:
+            QMessageBox.warning(self, "提示", "至少需保留一个舍牌模式")
+            return
+        pattern_edit, target_edit, del_btn, row = entry
+        while row.count():
+            item = row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.instant_pattern_rows_layout.removeItem(row)
+        if entry in self._instant_pattern_row_widgets:
+            self._instant_pattern_row_widgets.remove(entry)
 
     def _instant_rebuild_visible_constraint_grid(self):
         """将即时铳率页的场上可见枚数条目按 2 列重新排列。"""
@@ -2771,26 +2839,36 @@ class MainWindow(QMainWindow):
         self.matched_states_cap_spin.setValue(self.instant_matched_states_cap_spin.value())
 
     def _start_instant_deal_in_analysis(self):
-        pattern = self.instant_pattern_input.text().strip()
-        target = self.instant_target_input.text().strip()
         tmin = self.instant_turn_min.value()
         tmax = self.instant_turn_max.value()
-
-        if not pattern or not target:
-            QMessageBox.warning(self, "输入错误", "请填写舍牌模式与目标牌（单张）")
-            return
         if tmin > tmax:
             QMessageBox.warning(self, "输入错误", "巡目范围最小值不能大于最大值")
             return
 
-        # 即时铳率现在支持多张目标牌（逗号分隔），但仍不支持 combo（连号）
-        try:
-            mt = parse_multi_targets(target)
-            if any(is_combo for tiles, is_combo in mt):
-                QMessageBox.warning(self, "输入错误", "即时铳率暂不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
+        # 从铳率分析页多行收集 (pattern, target) 原始字符串
+        items = []
+        for pattern_edit, target_edit, _, _ in self._instant_pattern_row_widgets:
+            pt = pattern_edit.text().strip()
+            tg = target_edit.text().strip()
+            if not pt or not tg:
+                continue
+            try:
+                split_discard_pattern(pt)
+            except Exception:
+                QMessageBox.warning(self, "输入错误", "舍牌模式格式无效: %s" % pt[:20])
                 return
-        except Exception:
-            QMessageBox.warning(self, "输入错误", "目标牌格式无效")
+            try:
+                mt = parse_multi_targets(tg)
+                if any(is_combo for tiles, is_combo in mt):
+                    QMessageBox.warning(self, "输入错误", "即时铳率暂不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
+                    return
+            except Exception:
+                QMessageBox.warning(self, "输入错误", "目标牌格式无效: %s" % tg[:20])
+                return
+            items.append((pt, tg))
+
+        if not items:
+            QMessageBox.warning(self, "输入错误", "请至少填写一行舍牌模式与目标牌")
             return
 
         # 宝牌输入校验
@@ -2801,20 +2879,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "输入错误", "请选择“宝牌=模式第”时，请填写位置（例: 1 或 1,3）")
             return
 
-        # 先验证模式是否可解析，避免复制后才失败
-        try:
-            split_discard_pattern(pattern)
-        except Exception:
-            QMessageBox.warning(self, "输入错误", "舍牌模式格式无效")
-            return
-
-        # 复用主查询页控件，确保约束/采样/线程管理逻辑一致
+        # 复用主查询页控件：确保有足够行并填入 instant 的多条，多余行清空
         if not getattr(self, "_pattern_row_widgets", None):
             self._add_pattern_row()
+        while len(self._pattern_row_widgets) < len(items):
+            self._add_pattern_row()
         for idx, (pattern_edit, target_edit, _, _, _, _) in enumerate(self._pattern_row_widgets):
-            if idx == 0:
-                pattern_edit.setText(pattern)
-                target_edit.setText(target)
+            if idx < len(items):
+                pattern_edit.setText(items[idx][0])
+                target_edit.setText(items[idx][1])
             else:
                 pattern_edit.clear()
                 target_edit.clear()
@@ -3670,9 +3743,17 @@ class MainWindow(QMainWindow):
         hypothetical_furiten = None
         if use_instant and getattr(self, "instant_hypothetical_furiten_input", None):
             hypothetical_furiten = self.instant_hypothetical_furiten_input.text().strip() or None
+        instant_use_theory_point_only = True
+        if use_instant and getattr(self, "instant_use_theory_point_only_check", None):
+            instant_use_theory_point_only = self.instant_use_theory_point_only_check.isChecked()
+        instant_normalize_oya_ron_to_ko = False
+        if use_instant and getattr(self, "instant_normalize_oya_ron_to_ko_check", None):
+            instant_normalize_oya_ron_to_ko = self.instant_normalize_oya_ron_to_ko_check.isChecked()
         params = {
             "query_items": query_items,
             "analysis_target": analysis_target,
+            "instant_use_theory_point_only": instant_use_theory_point_only if use_instant else None,
+            "instant_normalize_oya_ron_to_ko": instant_normalize_oya_ron_to_ko if use_instant else False,
             "visible_constraints": visible_constraints if visible_constraints else None,
             "dora_constraint": dora_constraint,
             "dora_position_spec": dora_position_spec,
@@ -4087,11 +4168,14 @@ class MainWindow(QMainWindow):
                     f"分析耗时: {result.get('elapsed_seconds', 0):.1f} 秒",
                 ])
                 if use_instant:
+                    pt_label = "平均铳点（仅理论点）" if result.get("instant_use_theory_point_only", True) else "平均铳点"
+                    if result.get("instant_normalize_oya_ron_to_ko"):
+                        pt_label += "（亲家已按子家换算）"
                     lines.extend([
                         "",
                         f"即时铳率: {result.get('deal_in_rate', 0.0):.2%}",
                         f"可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}",
-                        f"平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}",
+                        f"{pt_label}: {result.get('deal_in_point_avg', 0.0):.1f}",
                         f"铳度: {result.get('deal_in_intensity', 0.0):.2f}",
                     ])
                     exc = result.get("excluded_due_to_hypothetical_furiten", 0)
@@ -4135,11 +4219,14 @@ class MainWindow(QMainWindow):
                     target_label = f"目标: {result['target_tile']} (多目标即时铳率)"
                 elif use_instant:
                     exc = result.get("excluded_due_to_hypothetical_furiten", 0)
+                    pt_label = "平均铳点（仅理论点）" if result.get("instant_use_theory_point_only", True) else "平均铳点"
+                    if result.get("instant_normalize_oya_ron_to_ko"):
+                        pt_label += "（亲家已按子家换算）"
                     dist_text = (
                         f"  总样本: {_fmt_int(result.get('total_matches', 0))}\n"
                         f"  可铳样本: {_fmt_int(result.get('deal_in_hits', 0))}\n"
                         f"  即时铳率: {result.get('deal_in_rate', 0.0):.2%}\n"
-                        f"  平均铳点: {result.get('deal_in_point_avg', 0.0):.1f}\n"
+                        f"  {pt_label}: {result.get('deal_in_point_avg', 0.0):.1f}\n"
                         f"  铳度: {result.get('deal_in_intensity', 0.0):.2f}"
                     )
                     if exc > 0:
