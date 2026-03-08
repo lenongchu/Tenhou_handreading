@@ -2074,6 +2074,14 @@ class MainWindow(QMainWindow):
         self.add_pattern_btn = QPushButton("+ 添加舍牌模式")
         self.add_pattern_btn.clicked.connect(self._add_pattern_row)
         add_btn_row.addWidget(self.add_pattern_btn)
+        self.gen_share_btn = QPushButton("生成分享串")
+        self.gen_share_btn.setToolTip("将当前舍牌模式与约束生成可读字符串，便于保存或分享")
+        self.gen_share_btn.clicked.connect(lambda: self._show_generate_share_dialog(from_instant=False))
+        add_btn_row.addWidget(self.gen_share_btn)
+        self.import_share_btn = QPushButton("从分享串导入")
+        self.import_share_btn.setToolTip("粘贴分享串，自动填充舍牌模式与约束")
+        self.import_share_btn.clicked.connect(self._show_import_share_dialog)
+        add_btn_row.addWidget(self.import_share_btn)
         add_btn_row.addStretch()
         left_layout.addLayout(add_btn_row)
         self._pattern_row_widgets = []
@@ -2694,6 +2702,14 @@ class MainWindow(QMainWindow):
         )
         row2.addWidget(self.instant_normalize_oya_ron_to_ko_check)
         row2.addStretch()
+        self.instant_gen_share_btn = QPushButton("生成分享串")
+        self.instant_gen_share_btn.setToolTip("将当前舍牌模式与约束生成可读字符串")
+        self.instant_gen_share_btn.clicked.connect(lambda: self._show_generate_share_dialog(from_instant=True))
+        row2.addWidget(self.instant_gen_share_btn)
+        self.instant_import_share_btn = QPushButton("从分享串导入")
+        self.instant_import_share_btn.setToolTip("粘贴分享串，自动填充舍牌模式与约束")
+        self.instant_import_share_btn.clicked.connect(self._show_import_share_dialog)
+        row2.addWidget(self.instant_import_share_btn)
         self.instant_start_btn = QPushButton("开始即时铳率分析")
         self.instant_start_btn.clicked.connect(self._start_instant_deal_in_analysis)
         row2.addWidget(self.instant_start_btn)
@@ -3108,6 +3124,21 @@ class MainWindow(QMainWindow):
             cb.setText(self._excel_clipboard_text)
             self.statusBar().showMessage("已复制合并结果到剪贴板", 2000)
 
+    def _copy_per_mode_result(self):
+        """复制各模式分别的即时铳率数据到剪贴板（Tab 分隔，可粘贴到 Excel）"""
+        result = getattr(self, "last_query_result", None)
+        if not result or result.get("analysis_target") != "deal_in_instant":
+            self.statusBar().showMessage("当前无多模式即时铳率结果可复制", 2000)
+            return
+        pr_list = result.get("pattern_results") or []
+        if not pr_list:
+            self.statusBar().showMessage("当前无多模式即时铳率结果可复制", 2000)
+            return
+        text = self._build_excel_text(result, pr_list, multi=True)
+        if text:
+            QApplication.clipboard().setText(text)
+            self.statusBar().showMessage("已复制各模式数据到剪贴板", 2000)
+
     def _copy_result_to_excel(self):
         """复制当前分析结果到剪贴板（Tab 分隔，可直接粘贴到 Excel）"""
         if self._excel_clipboard_text:
@@ -3336,7 +3367,14 @@ class MainWindow(QMainWindow):
                 return f"{p}\t{t}\t{turn_str}\t{rate:.2%}\t{hits}\t{p_avg:.1f}\t{intensity:.2f}"
 
             multi_target = result.get('multi_target', False)
-            if multi_target and result.get('multi_instant_stats'):
+            if multi and pr_list:
+                for pr in pr_list:
+                    mis = pr.get("multi_instant_stats") or {}
+                    for tk in pr.get("target_tiles") or []:
+                        s = mis.get(tk, {})
+                        if s:
+                            rows.append(_instant_row(pr["pattern_str"], tk, s))
+            elif multi_target and result.get('multi_instant_stats'):
                 for tk, stats in result['multi_instant_stats'].items():
                     rows.append(_instant_row(pattern, tk, stats))
             else:
@@ -3386,6 +3424,8 @@ class MainWindow(QMainWindow):
         def _clear_layout(layout):
             while layout.count():
                 item = layout.takeAt(0)
+                if item.layout():
+                    _clear_layout(item.layout())
                 if item.widget():
                     item.widget().deleteLater()
 
@@ -3433,13 +3473,25 @@ class MainWindow(QMainWindow):
         self.merged_result_label = QLabel("")
         self.merged_result_label.setWordWrap(True)
         self.merged_result_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.merged_result_label.setMinimumHeight(72)  # 确保多行合并结果有足够空间，避免文字叠在一起
-        merge_display_row.addWidget(self.merged_result_label, 1)
+        self.merged_result_label.setMinimumHeight(60)
+        merge_result_scroll = QScrollArea()
+        merge_result_scroll.setWidget(self.merged_result_label)
+        merge_result_scroll.setWidgetResizable(True)
+        merge_result_scroll.setFrameShape(QFrame.NoFrame)
+        merge_result_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        merge_result_scroll.setMinimumHeight(64)
+        merge_result_scroll.setMaximumHeight(200)
+        merge_display_row.addWidget(merge_result_scroll, 1)
         copy_merge_btn = QPushButton("复制合并")
         copy_merge_btn.setFixedWidth(70)
         copy_merge_btn.setToolTip("将合并结果复制到剪贴板（Tab 分隔，可粘贴到 Excel）")
         copy_merge_btn.clicked.connect(self._copy_merged_result)
         merge_display_row.addWidget(copy_merge_btn)
+        copy_per_mode_btn = QPushButton("复制各模式")
+        copy_per_mode_btn.setFixedWidth(78)
+        copy_per_mode_btn.setToolTip("将各模式分别的即时铳率数据复制到剪贴板（Tab 分隔，可粘贴到 Excel）")
+        copy_per_mode_btn.clicked.connect(self._copy_per_mode_result)
+        merge_display_row.addWidget(copy_per_mode_btn)
         self.multi_merge_layout.addLayout(merge_display_row)
         self.multi_merge_widget.setVisible(True)
         self._update_merged_result(result, pr_list)
@@ -3697,6 +3749,427 @@ class MainWindow(QMainWindow):
             visible_constraints[tile] = (min_count, max_count)
         return visible_constraints
 
+    # ---------- 分享串：生成可读字符串 / 从字符串恢复约束 ----------
+    _SHARE_VERSION = "RHM1"
+
+    def _build_share_string_from_main(self) -> str:
+        """从主分析页当前输入生成分享串（可读的 key=value 多行）。"""
+        lines = [self._SHARE_VERSION]
+        for pattern_edit, target_edit, _, _, _, _ in self._pattern_row_widgets:
+            pt = pattern_edit.text().strip()
+            tg = target_edit.text().strip()
+            if not pt:
+                continue
+            lines.append("模式=%s→%s" % (pt, tg or ""))
+        analysis = self.analysis_target_combo.currentData() or "target_count"
+        analysis_map = {"target_count": "目标牌存量", "tenpai": "是否听牌", "outcome": "和铳率"}
+        lines.append("分析=%s" % analysis_map.get(analysis, "目标牌存量"))
+        turn_ranges = self._get_turn_ranges_from_ui()
+        if turn_ranges:
+            t_min = min(r[0] for r in turn_ranges)
+            t_max = max(r[1] for r in turn_ranges)
+            lines.append("巡目=%d-%d" % (t_min, t_max))
+        else:
+            lo, hi = self.turn_range_slider.getRange()
+            if lo != 1 or hi != 18:
+                lines.append("巡目=%d-%d" % (lo, hi))
+        if self.dora_irrelevant_radio.isChecked():
+            lines.append("宝牌=无关")
+        elif self.dora_matches_position_radio.isChecked():
+            lines.append("宝牌=模式第")
+            pos = self.dora_position_input.text().strip()
+            if pos:
+                lines.append("宝牌位置=%s" % pos)
+        else:
+            tile = self.dora_tile_input.text().strip()
+            if tile:
+                lines.append("宝牌=%s" % tile)
+            else:
+                lines.append("宝牌=无关")
+        riichi_map = {"any": "任意", "has_riichi": "有人", "no_riichi": "无人"}
+        rv = "any"
+        if self.riichi_has_radio.isChecked():
+            rv = "has_riichi"
+        elif self.riichi_no_radio.isChecked():
+            rv = "no_riichi"
+        lines.append("立直=%s" % riichi_map.get(rv, "任意"))
+        call_map = {"any": "任意", "has_call": "有人", "no_call": "无人"}
+        cv = "any"
+        if self.call_has_radio.isChecked():
+            cv = "has_call"
+        elif self.call_no_radio.isChecked():
+            cv = "no_call"
+        lines.append("副露=%s" % call_map.get(cv, "任意"))
+        lines.append("南三=%s" % ("是" if self.exclude_south3_check.isChecked() else "否"))
+        lines.append("南四=%s" % ("是" if self.exclude_south4_check.isChecked() else "否"))
+        prior = self.prior_discard_exclusion_input.text().strip()
+        if prior:
+            lines.append("前段禁打=%s" % prior)
+        for le in self.call_area_inputs:
+            t = le.text().strip()
+            if t:
+                lines.append("副露区域=%s" % t)
+        for tile, (lo, hi) in self._get_visible_constraints_from_ui().items():
+            lines.append("可见=%s:%d-%d" % (tile, lo, hi))
+        sample_limit = self.sample_limit_input.value()
+        if sample_limit != 10000:
+            lines.append("样本上限=%d" % sample_limit)
+        match_cap = self.matched_states_cap_spin.value()
+        if match_cap != 200:
+            lines.append("匹配保留=%d" % match_cap)
+        return "\n".join(lines)
+
+    def _build_share_string_from_instant(self) -> str:
+        """从铳率分析页当前输入生成分享串。"""
+        lines = [self._SHARE_VERSION]
+        for pattern_edit, target_edit, _, _ in self._instant_pattern_row_widgets:
+            pt = pattern_edit.text().strip()
+            tg = target_edit.text().strip()
+            if not pt or not tg:
+                continue
+            lines.append("模式=%s→%s" % (pt, tg))
+        lines.append("分析=即时铳率")
+        t_min = self.instant_turn_min.value()
+        t_max = self.instant_turn_max.value()
+        if t_min != 1 or t_max != 18:
+            lines.append("巡目=%d-%d" % (t_min, t_max))
+        if self.instant_dora_irrelevant_radio.isChecked():
+            lines.append("宝牌=无关")
+        elif self.instant_dora_matches_position_radio.isChecked():
+            lines.append("宝牌=模式第")
+            pos = self.instant_dora_position_input.text().strip()
+            if pos:
+                lines.append("宝牌位置=%s" % pos)
+        else:
+            tile = self.instant_dora_tile_input.text().strip()
+            if tile:
+                lines.append("宝牌=%s" % tile)
+            else:
+                lines.append("宝牌=无关")
+        riichi_map = {"any": "任意", "has_riichi": "有人", "no_riichi": "无人"}
+        rv = "any"
+        if self.instant_riichi_has_radio.isChecked():
+            rv = "has_riichi"
+        elif self.instant_riichi_no_radio.isChecked():
+            rv = "no_riichi"
+        lines.append("立直=%s" % riichi_map.get(rv, "任意"))
+        call_map = {"any": "任意", "has_call": "有人", "no_call": "无人"}
+        cv = "any"
+        if self.instant_call_has_radio.isChecked():
+            cv = "has_call"
+        elif self.instant_call_no_radio.isChecked():
+            cv = "no_call"
+        lines.append("副露=%s" % call_map.get(cv, "任意"))
+        lines.append("南三=%s" % ("是" if self.instant_exclude_south3_check.isChecked() else "否"))
+        lines.append("南四=%s" % ("是" if self.instant_exclude_south4_check.isChecked() else "否"))
+        prior = self.instant_prior_discard_exclusion_input.text().strip()
+        if prior:
+            lines.append("前段禁打=%s" % prior)
+        for le in self.instant_call_area_inputs:
+            t = le.text().strip()
+            if t:
+                lines.append("副露区域=%s" % t)
+        for tile, (lo, hi) in self._instant_get_visible_constraints_from_ui().items():
+            lines.append("可见=%s:%d-%d" % (tile, lo, hi))
+        furiten = self.instant_hypothetical_furiten_input.text().strip()
+        if furiten:
+            lines.append("假想振听=%s" % furiten)
+        lines.append("仅理论点=%s" % ("是" if self.instant_use_theory_point_only_check.isChecked() else "否"))
+        lines.append("亲家子家=%s" % ("是" if self.instant_normalize_oya_ron_to_ko_check.isChecked() else "否"))
+        sample_limit = self.instant_sample_limit_input.value()
+        if sample_limit != 10000:
+            lines.append("样本上限=%d" % sample_limit)
+        match_cap = self.instant_matched_states_cap_spin.value()
+        if match_cap != 200:
+            lines.append("匹配保留=%d" % match_cap)
+        return "\n".join(lines)
+
+    def _parse_share_string(self, text: str) -> Optional[Dict[str, Any]]:
+        """解析分享串为字典。键为中文名，值为字符串或列表（模式/副露区域/可见可多条）。不支持版本则返回 None。"""
+        text = (text or "").strip()
+        if not text:
+            return None
+        lines = [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
+        if not lines:
+            return None
+        first = lines[0]
+        if first == self._SHARE_VERSION:
+            lines = lines[1:]
+        elif "=" in first and first.split("=")[0].strip() != self._SHARE_VERSION:
+            ver = first.split("=")[0].strip()
+            if ver == self._SHARE_VERSION:
+                pass
+            else:
+                return None
+        data = {}
+        for line in lines:
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if k in ("模式", "副露区域", "可见"):
+                data.setdefault(k, []).append(v)
+            else:
+                data[k] = v
+        for k in ("模式", "副露区域", "可见"):
+            if k in data and isinstance(data[k], str):
+                data[k] = [data[k]]
+        return data if data else None
+
+    def _apply_share_string(self, data: Dict[str, Any]) -> bool:
+        """将解析后的分享串应用到界面。若分析=即时铳率则填铳率分析页并切到该页，否则填主分析页。返回是否成功。"""
+        if not data:
+            return False
+        is_instant = data.get("分析") == "即时铳率"
+        patterns = data.get("模式") or []
+        if not patterns:
+            return False
+        if is_instant:
+            while len(self._instant_pattern_row_widgets) < len(patterns):
+                self._instant_add_pattern_row()
+            for idx, (pattern_edit, target_edit, _, _) in enumerate(self._instant_pattern_row_widgets):
+                if idx < len(patterns):
+                    s = patterns[idx]
+                    if "→" in s:
+                        pt, _, tg = s.partition("→")
+                        pattern_edit.setText(pt.strip())
+                        target_edit.setText(tg.strip())
+                    else:
+                        pattern_edit.setText(s.strip())
+                        target_edit.clear()
+                else:
+                    pattern_edit.clear()
+                    target_edit.clear()
+            t_min, t_max = 1, 18
+            turn = data.get("巡目", "")
+            if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
+                a, b = turn.split("-")
+                t_min, t_max = int(a), int(b)
+            self.instant_turn_min.setValue(max(1, min(18, t_min)))
+            self.instant_turn_max.setValue(max(1, min(18, t_max)))
+            self._apply_share_string_dora(data, instant=True)
+            self._apply_share_string_riichi_call_south(data, instant=True)
+            self._apply_share_string_prior_call_area(data, instant=True)
+            self._apply_share_string_visible(data, instant=True)
+            self.instant_hypothetical_furiten_input.setText((data.get("假想振听") or "").strip())
+            self.instant_use_theory_point_only_check.setChecked((data.get("仅理论点") or "是") == "是")
+            self.instant_normalize_oya_ron_to_ko_check.setChecked((data.get("亲家子家") or "否") == "是")
+            if "样本上限" in data:
+                try:
+                    self.instant_sample_limit_input.setValue(max(100, min(10000000, int(data["样本上限"]))))
+                except (ValueError, TypeError):
+                    pass
+            if "匹配保留" in data:
+                try:
+                    self.instant_matched_states_cap_spin.setValue(max(1, min(2000, int(data["匹配保留"]))))
+                except (ValueError, TypeError):
+                    pass
+            self._sync_instant_constraints_to_main()
+            self.main_tab.setCurrentIndex(1)
+        else:
+            while len(self._pattern_row_widgets) < len(patterns):
+                self._add_pattern_row()
+            for idx, (pattern_edit, target_edit, _, _, _, _) in enumerate(self._pattern_row_widgets):
+                if idx < len(patterns):
+                    s = patterns[idx]
+                    if "→" in s:
+                        pt, _, tg = s.partition("→")
+                        pattern_edit.setText(pt.strip())
+                        target_edit.setText((tg or "").strip())
+                    else:
+                        pattern_edit.setText(s.strip())
+                        target_edit.clear()
+                else:
+                    pattern_edit.clear()
+                    target_edit.clear()
+            analysis_map = {"目标牌存量": "target_count", "是否听牌": "tenpai", "和铳率": "outcome"}
+            target = analysis_map.get(data.get("分析", "目标牌存量"), "target_count")
+            for i in range(self.analysis_target_combo.count()):
+                if self.analysis_target_combo.itemData(i) == target:
+                    self.analysis_target_combo.setCurrentIndex(i)
+                    break
+            turn = data.get("巡目", "")
+            if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
+                a, b = turn.split("-")
+                t_min, t_max = int(a), int(b)
+                self.turn_range_slider.setRange(t_min, t_max)
+                for edit in self._turn_range_edits:
+                    edit.clear()
+                if self._turn_range_edits:
+                    self._turn_range_edits[0].setText("%d-%d" % (t_min, t_max))
+            self._apply_share_string_dora(data, instant=False)
+            self._apply_share_string_riichi_call_south(data, instant=False)
+            self._apply_share_string_prior_call_area(data, instant=False)
+            self._apply_share_string_visible(data, instant=False)
+            if "样本上限" in data:
+                try:
+                    self.sample_limit_input.setValue(max(100, min(10000000, int(data["样本上限"]))))
+                except (ValueError, TypeError):
+                    pass
+            if "匹配保留" in data:
+                try:
+                    self.matched_states_cap_spin.setValue(max(1, min(2000, int(data["匹配保留"]))))
+                except (ValueError, TypeError):
+                    pass
+            self.main_tab.setCurrentIndex(0)
+        QTimer.singleShot(0, self._on_analysis_target_changed)
+        return True
+
+    def _apply_share_string_dora(self, data: Dict[str, Any], instant: bool):
+        if instant:
+            ir, isp, ipos = self.instant_dora_irrelevant_radio, self.instant_dora_specific_radio, self.instant_dora_position_input
+            itile = self.instant_dora_tile_input
+            imatch = self.instant_dora_matches_position_radio
+        else:
+            ir, isp, ipos = self.dora_irrelevant_radio, self.dora_specific_radio, self.dora_position_input
+            itile = self.dora_tile_input
+            imatch = self.dora_matches_position_radio
+        dora = data.get("宝牌", "无关")
+        if dora == "无关":
+            ir.setChecked(True)
+            itile.clear()
+            ipos.clear()
+        elif dora == "模式第":
+            imatch.setChecked(True)
+            ipos.setText((data.get("宝牌位置") or "").strip())
+            itile.clear()
+        else:
+            isp.setChecked(True)
+            itile.setText(dora.strip())
+            ipos.clear()
+
+    def _apply_share_string_riichi_call_south(self, data: Dict[str, Any], instant: bool):
+        rmap = {"任意": "any", "有人": "has_riichi", "无人": "no_riichi"}
+        cmap = {"任意": "any", "有人": "has_call", "无人": "no_call"}
+        riichi = rmap.get(data.get("立直", "任意"), "any")
+        call = cmap.get(data.get("副露", "任意"), "any")
+        if instant:
+            ra, rh, rn = self.instant_riichi_any_radio, self.instant_riichi_has_radio, self.instant_riichi_no_radio
+            ca, ch, cn = self.instant_call_any_radio, self.instant_call_has_radio, self.instant_call_no_radio
+            s3, s4 = self.instant_exclude_south3_check, self.instant_exclude_south4_check
+        else:
+            ra, rh, rn = self.riichi_any_radio, self.riichi_has_radio, self.riichi_no_radio
+            ca, ch, cn = self.call_any_radio, self.call_has_radio, self.call_no_radio
+            s3, s4 = self.exclude_south3_check, self.exclude_south4_check
+        ra.setChecked(riichi == "any")
+        rh.setChecked(riichi == "has_riichi")
+        rn.setChecked(riichi == "no_riichi")
+        ca.setChecked(call == "any")
+        ch.setChecked(call == "has_call")
+        cn.setChecked(call == "no_call")
+        s3.setChecked((data.get("南三") or "否") == "是")
+        s4.setChecked((data.get("南四") or "否") == "是")
+
+    def _apply_share_string_prior_call_area(self, data: Dict[str, Any], instant: bool):
+        prior = (data.get("前段禁打") or "").strip()
+        areas = data.get("副露区域")
+        if not isinstance(areas, list):
+            areas = [areas] if areas else []
+        areas = [str(x).strip() for x in areas if x][:4]
+        if instant:
+            self.instant_prior_discard_exclusion_input.setText(prior)
+            for i, le in enumerate(self.instant_call_area_inputs):
+                le.setText(areas[i] if i < len(areas) else "")
+        else:
+            self.prior_discard_exclusion_input.setText(prior)
+            for i, le in enumerate(self.call_area_inputs):
+                le.setText(areas[i] if i < len(areas) else "")
+
+    def _apply_share_string_visible(self, data: Dict[str, Any], instant: bool):
+        vis = data.get("可见") or []
+        if not isinstance(vis, list):
+            vis = [vis] if vis else []
+        entries = []
+        for v in vis:
+            v = str(v).strip()
+            if not v:
+                continue
+            if ":" in v:
+                tile, _, rng = v.partition(":")
+                tile = tile.strip()
+                rng = rng.strip()
+                if re.match(r"^\d+-\d+$", rng):
+                    lo, hi = int(rng.split("-")[0]), int(rng.split("-")[1])
+                    entries.append((tile, max(0, min(4, lo)), max(0, min(4, hi))))
+            else:
+                parts = v.split()
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    entries.append((parts[0], int(parts[1]), int(parts[2])))
+        if instant:
+            for _, _, row_widget in list(self.instant_visible_constraint_row_refs):
+                self.instant_visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.instant_visible_constraint_row_refs.clear()
+            for tile, lo, hi in entries:
+                self._instant_add_visible_constraint_row()
+                tile_edit, range_slider, _ = self.instant_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not entries:
+                self._instant_add_visible_constraint_row()
+        else:
+            for _, _, row_widget in list(self.visible_constraint_row_refs):
+                self.visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.visible_constraint_row_refs.clear()
+            for tile, lo, hi in entries:
+                self._add_visible_constraint_row()
+                tile_edit, range_slider, _ = self.visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not entries:
+                self._add_visible_constraint_row()
+
+    def _show_generate_share_dialog(self, from_instant: bool):
+        """弹出对话框展示分享串并复制到剪贴板。from_instant 为 True 时从铳率分析页生成。"""
+        s = self._build_share_string_from_instant() if from_instant else self._build_share_string_from_main()
+        QApplication.clipboard().setText(s)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("分享串（已复制到剪贴板）")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("以下内容已复制到剪贴板，可粘贴到「从分享串导入」或分享给他人："))
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText(s)
+        te.setMinimumSize(400, 180)
+        layout.addWidget(te)
+        copy_btn = QPushButton("再次复制")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(s))
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(close_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        dlg.exec_()
+
+    def _show_import_share_dialog(self):
+        """弹出输入框供用户粘贴分享串，解析后应用到对应页并切换标签。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("从分享串导入")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("请粘贴之前生成的分享串（多行 key=value 格式）："))
+        te = QTextEdit()
+        te.setPlaceholderText("例：\nRHM1\n模式=7s-9s→6s\n分析=目标牌存量\n巡目=1-6\n...")
+        te.setMinimumSize(420, 200)
+        layout.addWidget(te)
+        bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bbox.accepted.connect(dlg.accept)
+        bbox.rejected.connect(dlg.reject)
+        layout.addWidget(bbox)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        text = te.toPlainText().strip()
+        data = self._parse_share_string(text)
+        if not data:
+            QMessageBox.warning(self, "导入失败", "无法识别分享串格式，请确认以 RHM1 开头且包含「模式=」行。")
+            return
+        if self._apply_share_string(data):
+            QMessageBox.information(self, "导入成功", "已根据分享串填充舍牌模式与约束。")
+        else:
+            QMessageBox.warning(self, "导入失败", "分享串中未包含有效的舍牌模式。")
+
     def execute_query(self):
         """执行查询"""
         forced_target = self._forced_analysis_target
@@ -3916,17 +4389,18 @@ class MainWindow(QMainWindow):
         self._last_sample_pattern_str = "-".join(selected_pattern)
         self._last_sample_target_tile = selected_target
 
+        multi = self.last_query_params.get("multi_pattern", False) and len(query_items) > 1
         # 构建用于本次采样的参数（单模式用选中的 pattern/target）
         params_for_sample = {
             **self.last_query_params,
             "query_pattern": selected_pattern,
             "query_pattern_str": self._last_sample_pattern_str,
             "target_tile": selected_target,
+            "pattern_index_filter": pattern_index if multi else None,  # 多模式时只保留该模式的样本
         }
 
         # 若有预收集的 sample_pool 且为多模式，只保留当前选中模式的样本
         sample_pool = self.last_query_result.get("sample_pool") if self.last_query_result else None
-        multi = self.last_query_params.get("multi_pattern", False) and len(query_items) > 1
         if sample_pool and multi:
             sample_pool = [s for s in sample_pool if s.get("matched_pattern_idx") == pattern_index]
 

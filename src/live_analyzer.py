@@ -1742,6 +1742,7 @@ class LiveAnalyzer:
                     p_avg = st["points"] / hits if hits > 0 else 0.0
                     multi_instant_stats_idx[tk] = {
                         "hits": hits,
+                        "points": st["points"],
                         "rate": rate,
                         "point_avg": p_avg,
                         "intensity": rate * p_avg,
@@ -2463,11 +2464,13 @@ class LiveAnalyzer:
         outcome_filter: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
         deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
         analysis_target: Optional[str] = None,
+        pattern_index_filter: Optional[int] = None,  # 多模式时只保留 matched_pattern_idx == 此值的样本
     ) -> List[Dict]:
         """
         收集验证样本，用于人工复盘核验。
         返回含 log_id、oya、局显示等完整信息的样本列表。
         若传入 sample_pool（主统计时预收集），则直接从池采样，无需二次分析。
+        多模式时若传入 pattern_index_filter，仅保留 matched_pattern_idx 等于该值的样本。
         """
         requested_batch_size = (
             analysis_batch_size if analysis_batch_size is not None else ANALYSIS_BATCH_SIZE
@@ -2478,6 +2481,8 @@ class LiveAnalyzer:
         if sample_pool is not None:
             # 从预收集的样本池中筛选并取前 N 个，无需遍历牌谱（主分析已排除南四局则无需再过滤）
             candidates = sample_pool
+            if pattern_index_filter is not None:
+                candidates = [s for s in candidates if s.get("matched_pattern_idx") == pattern_index_filter]
             if outcome_filter is not None:
                 if outcome_filter == "win":
                     candidates = [s for s in candidates if s.get("outcome_won")]
@@ -2622,262 +2627,262 @@ class LiveAnalyzer:
                             if not in_range:
                                 continue
 
-                                # 预转换：全量舍牌（用于 matched_variant 判断）
-                                all_discards_precomputed = [
-                                    (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                    for d in player_state.discards
-                                ]
-                                all_riichi_flags = [
-                                    getattr(d, 'is_riichi_declaration', False)
-                                    for d in player_state.discards
-                                ]
-                                honor_ctx_base = {
-                                    "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
-                                    "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
-                                    "calls": getattr(player_state, "calls", []),
-                                    "visible_tiles": player_state.visible_tiles,
-                                    "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
+                            # 预转换：全量舍牌（用于 matched_variant 判断）
+                            all_discards_precomputed = [
+                                (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
+                                for d in player_state.discards
+                            ]
+                            all_riichi_flags = [
+                                getattr(d, 'is_riichi_declaration', False)
+                                for d in player_state.discards
+                            ]
+                            honor_ctx_base = {
+                                "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
+                                "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
+                                "calls": getattr(player_state, "calls", []),
+                                "visible_tiles": player_state.visible_tiles,
+                                "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
+                            }
+
+                            discarded_bases = set()
+                            for j, (orig_i, discard) in enumerate(in_range):
+                                discarded_bases.add(discard.tile // 4)
+                                full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
+                                current_riichi_flags = all_riichi_flags[:orig_i + 1]
+                                hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
+
+                                honor_ctx = {
+                                    **honor_ctx_base,
+                                    "current_discard_turn": discard.turn,
+                                    "discard_riichi_flags": current_riichi_flags,
                                 }
+                                matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
+                                if not matched_variant:
+                                    continue
 
-                                discarded_bases = set()
-                                for j, (orig_i, discard) in enumerate(in_range):
-                                    discarded_bases.add(discard.tile // 4)
-                                    full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
-                                    current_riichi_flags = all_riichi_flags[:orig_i + 1]
-                                    hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
-
-                                    honor_ctx = {
-                                        **honor_ctx_base,
-                                        "current_discard_turn": discard.turn,
-                                        "discard_riichi_flags": current_riichi_flags,
-                                    }
-                                    matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
-                                    if not matched_variant:
+                                # 排除：若未打出牌就是目标牌，不计入
+                                mapped_target = matched_variant["target"]
+                                mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
+                                sample_is_combo = matched_variant.get("is_combo", False)
+                                if sample_is_combo:
+                                    target_equiv = set()
+                                    for t in mapped_target:
+                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                    if discard.tile // 4 in target_equiv:
+                                        continue
+                                else:
+                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
                                         continue
 
-                                    # 排除：若未打出牌就是目标牌，不计入
-                                    mapped_target = matched_variant["target"]
-                                    mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
-                                    sample_is_combo = matched_variant.get("is_combo", False)
-                                    if sample_is_combo:
-                                        target_equiv = set()
-                                        for t in mapped_target:
-                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
-                                        if discard.tile // 4 in target_equiv:
-                                            continue
-                                    else:
-                                        if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
-                                            continue
+                                # 结局过滤
+                                rw = getattr(player_state, "round_winners", [])
+                                rdi = getattr(player_state, "round_deal_in", None)
+                                if outcome_filter:
+                                    if outcome_filter == "win" and player_state.player_id not in rw:
+                                        continue
+                                    if outcome_filter == "deal_in" and rdi != player_state.player_id:
+                                        continue
+                                    if outcome_filter == "neither" and (player_state.player_id in rw or rdi == player_state.player_id):
+                                        continue
 
-                                    # 结局过滤
-                                    rw = getattr(player_state, "round_winners", [])
-                                    rdi = getattr(player_state, "round_deal_in", None)
-                                    if outcome_filter:
-                                        if outcome_filter == "win" and player_state.player_id not in rw:
-                                            continue
-                                        if outcome_filter == "deal_in" and rdi != player_state.player_id:
-                                            continue
-                                        if outcome_filter == "neither" and (player_state.player_id in rw or rdi == player_state.player_id):
-                                            continue
-
-                                    # 即时铳率分析
-                                    instant_eval = {}
-                                    instant_eval_multi = {}
-                                    if use_deal_in_instant:
-                                        if round_instant_analyzer is None and round_payload:
-                                            try:
-                                                rp_data, rp_events = round_payload
-                                                norm_oya = False  # 离线样本扫描未传该选项，使用默认
-                                                round_instant_analyzer = RoundInstantDealInAnalyzer(
-                                                    rp_data,
-                                                    rp_events,
-                                                    player_state.round_num,
-                                                    player_state.oya,
-                                                    normalize_oya_ron_to_ko=norm_oya,
-                                                )
-                                            except Exception:
-                                                logger.exception("即时铳率引擎初始化失败（样本扫描本局跳过）")
-
-                                        if round_instant_analyzer:
-                                            if isinstance(mapped_target, list):
-                                                # 多目标
-                                                orig_targets, _ = parse_target_tiles(target_tile)
-                                                for i, m_t in enumerate(mapped_target):
-                                                    ev = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, m_t)
-                                                    tk = orig_targets[i]
-                                                    instant_eval_multi[tk] = ev
-
-                                                # 如果有 filter，取 filter 对应的结果；否则取第一个
-                                                if target_tile_filter and target_tile_filter in instant_eval_multi:
-                                                    instant_eval = instant_eval_multi[target_tile_filter]
-                                                else:
-                                                    instant_eval = list(instant_eval_multi.values())[0]
-                                            elif mapped_target_str:
-                                                instant_eval = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, mapped_target_str)
-
-                                    if deal_in_filter:
-                                        if deal_in_filter == "hit" and not instant_eval.get("deal_in_hit"):
-                                            continue
-                                        if deal_in_filter == "miss" and instant_eval.get("deal_in_hit"):
-                                            continue
-                                        if deal_in_filter == "furiten" and (instant_eval.get("deal_in_hit") or str(instant_eval.get("furiten_state", "none")) == "none"):
-                                            continue
-
-                                    if prior_discard_exclusion:
-                                        excl_str = matched_variant.get("prior_discard_exclusion")
-                                        if excl_str:
-                                            forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
-                                            start_idx = matched_variant.get("matched_start_index")
-                                            if start_idx is not None:
-                                                prior_tiles = full_discards_up_to_now[:start_idx]
-                                                if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
-                                                    continue
-                                            elif turn_range:
-                                                prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
-                                                if any((d.tile // 4) in forbidden for d in prior_discards):
-                                                    continue
-
-                                    if dora_constraint == "dora_unrelated" and dora_str:
-                                        pattern_suit = None
-                                        for elem in matched_variant["discard"]:
-                                            t = elem[0] if isinstance(elem, tuple) else elem
-                                            if len(t) >= 2 and t[-1] in "mps":
-                                                pattern_suit = t[-1]
-                                                break
-                                        if pattern_suit and dora_str[-1] == pattern_suit:
-                                            continue
-                                    if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
-                                        pos_to_tile = matched_variant.get("position_to_tile") or {}
-                                        skip_match = False
-                                        for pos in dora_position_spec:
-                                            tile_at_pos = pos_to_tile.get(pos)
-                                            if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
-                                                skip_match = True
-                                                break
-                                        if skip_match:
-                                            continue
-                                    if riichi_constraint and riichi_constraint != "any":
-                                        if riichi_constraint == "has_riichi" and not discard.riichi_happened:
-                                            continue
-                                        if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
-                                            continue
-                                    if call_constraint and call_constraint != "any":
-                                        if call_constraint == "has_call" and not discard.call_happened:
-                                            continue
-                                        if call_constraint == "no_call" and discard.call_happened:
-                                            continue
-
-                                    vc = matched_variant["visible_constraints"]
-                                    if vc:
-                                        match_visible = True
-                                        for tile_str, (min_count, max_count) in vc.items():
-                                            base_code = MjlogParser.string_to_tile(tile_str)
-                                            equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
-                                            count = sum(
-                                                c for t, c in player_state.visible_tiles.items()
-                                                if t // 4 in equiv_bases
+                                # 即时铳率分析
+                                instant_eval = {}
+                                instant_eval_multi = {}
+                                if use_deal_in_instant:
+                                    if round_instant_analyzer is None and round_payload:
+                                        try:
+                                            rp_data, rp_events = round_payload
+                                            norm_oya = False  # 离线样本扫描未传该选项，使用默认
+                                            round_instant_analyzer = RoundInstantDealInAnalyzer(
+                                                rp_data,
+                                                rp_events,
+                                                player_state.round_num,
+                                                player_state.oya,
+                                                normalize_oya_ron_to_ko=norm_oya,
                                             )
-                                            if not (min_count <= count <= max_count):
-                                                match_visible = False
-                                                break
-                                        if not match_visible:
-                                            continue
+                                        except Exception:
+                                            logger.exception("即时铳率引擎初始化失败（样本扫描本局跳过）")
 
-                                    # 排除：若未打出牌就是目标牌，不计入（与主统计逻辑一致）
-                                    mapped_target = matched_variant["target"]
-                                    sample_is_combo = matched_variant.get("is_combo", False)
-                                    if sample_is_combo:
-                                        target_equiv = set()
-                                        for t in mapped_target:
-                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
-                                        if discard.tile // 4 in target_equiv:
-                                            continue
-                                    else:
-                                        if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
-                                            continue
+                                    if round_instant_analyzer:
+                                        if isinstance(mapped_target, list):
+                                            # 多目标
+                                            orig_targets, _ = parse_target_tiles(target_tile)
+                                            for i, m_t in enumerate(mapped_target):
+                                                ev = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, m_t)
+                                                tk = orig_targets[i]
+                                                instant_eval_multi[tk] = ev
 
-                                    hh = (
-                                        player_state.hand_tiles_history[orig_i]
-                                        if orig_i < len(player_state.hand_tiles_history)
-                                        else player_state.hand_tiles
-                                    )
-                                    hand_at_turn = list(hh)  # 必须为 list 以保留同种牌枚数
-                                    if sample_is_combo:
-                                        target_codes = [
-                                            MjlogParser.string_to_tile(t) for t in mapped_target
-                                        ]
-                                        hand_bases = [t // 4 for t in hand_at_turn]
-                                        target_count = 1 if all(
-                                            any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                                            for c in target_codes
-                                        ) else 0
-                                    else:
-                                        mapped_target_code = MjlogParser.string_to_tile(mapped_target)
-                                        equiv = MjlogParser.get_count_equivalent_bases(mapped_target_code)
-                                        target_count = sum(
-                                            1 for tile in hand_at_turn
-                                            if tile // 4 in equiv
-                                        )
-                                        target_count = min(target_count, 3)
+                                            # 如果有 filter，取 filter 对应的结果；否则取第一个
+                                            if target_tile_filter and target_tile_filter in instant_eval_multi:
+                                                instant_eval = instant_eval_multi[target_tile_filter]
+                                            else:
+                                                instant_eval = list(instant_eval_multi.values())[0]
+                                        elif mapped_target_str:
+                                            instant_eval = round_instant_analyzer.evaluate(player_state.player_id, discard.turn, mapped_target_str)
 
-                                    if target_count_filter is not None and target_count != target_count_filter:
+                                if deal_in_filter:
+                                    if deal_in_filter == "hit" and not instant_eval.get("deal_in_hit"):
+                                        continue
+                                    if deal_in_filter == "miss" and instant_eval.get("deal_in_hit"):
+                                        continue
+                                    if deal_in_filter == "furiten" and (instant_eval.get("deal_in_hit") or str(instant_eval.get("furiten_state", "none")) == "none"):
                                         continue
 
-                                    dora_readable = "".join(
-                                        MjlogParser.tile_to_string(d)
-                                        for d in round_players[0].dora_indicators[:5]
-                                    ) if round_players[0].dora_indicators else "(none)"
+                                if prior_discard_exclusion:
+                                    excl_str = matched_variant.get("prior_discard_exclusion")
+                                    if excl_str:
+                                        forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
+                                        start_idx = matched_variant.get("matched_start_index")
+                                        if start_idx is not None:
+                                            prior_tiles = full_discards_up_to_now[:start_idx]
+                                            if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                                continue
+                                        elif turn_range:
+                                            prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                            if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                continue
 
-                                    visible_tiles_dict = dict(player_state.visible_tiles)
-                                    if sample_is_combo and isinstance(mapped_target, list):
-                                        visible_target = ", ".join(
-                                            f"{t}:{_visible_count(visible_tiles_dict, t)}"
-                                            for t in mapped_target
+                                if dora_constraint == "dora_unrelated" and dora_str:
+                                    pattern_suit = None
+                                    for elem in matched_variant["discard"]:
+                                        t = elem[0] if isinstance(elem, tuple) else elem
+                                        if len(t) >= 2 and t[-1] in "mps":
+                                            pattern_suit = t[-1]
+                                            break
+                                    if pattern_suit and dora_str[-1] == pattern_suit:
+                                        continue
+                                if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                    pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                    skip_match = False
+                                    for pos in dora_position_spec:
+                                        tile_at_pos = pos_to_tile.get(pos)
+                                        if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                            skip_match = True
+                                            break
+                                    if skip_match:
+                                        continue
+                                if riichi_constraint and riichi_constraint != "any":
+                                    if riichi_constraint == "has_riichi" and not discard.riichi_happened:
+                                        continue
+                                    if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
+                                        continue
+                                if call_constraint and call_constraint != "any":
+                                    if call_constraint == "has_call" and not discard.call_happened:
+                                        continue
+                                    if call_constraint == "no_call" and discard.call_happened:
+                                        continue
+
+                                vc = matched_variant["visible_constraints"]
+                                if vc:
+                                    match_visible = True
+                                    for tile_str, (min_count, max_count) in vc.items():
+                                        base_code = MjlogParser.string_to_tile(tile_str)
+                                        equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
+                                        count = sum(
+                                            c for t, c in player_state.visible_tiles.items()
+                                            if t // 4 in equiv_bases
                                         )
-                                    else:
-                                        t0 = mapped_target[0] if isinstance(mapped_target, list) else mapped_target
-                                        visible_target = str(_visible_count(visible_tiles_dict, t0))
-                                    call_area = _format_call_area_display(
-                                        getattr(player_state, "calls", []) or [], discard.turn
-                                    )
-                                    sp_entry = {
-                                        "log_id": log_id,
-                                        "round_num": player_state.round_num,
-                                        "honba": player_state.honba,
-                                        "oya": player_state.oya,
-                                        "player_id": player_state.player_id,
-                                        "turn": discard.turn,
-                                        "actual_pattern": hand_discard_strings.copy(),
-                                        "mapped_target": mapped_target,
-                                        "hand_tiles": list(hand_at_turn),
-                                        "visible_tiles": visible_tiles_dict,
-                                        "dora_indicators": list(player_state.dora_indicators),
-                                        "dora_readable": dora_readable,
-                                        "visible_target": visible_target,
-                                        "call_area": call_area,
-                                        "target_count": target_count,
-                                        "is_combo": sample_is_combo,
-                                        "outcome_won": bool(rw and player_state.player_id in rw),
-                                        "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
-                                    }
-                                    if use_deal_in_instant:
-                                        sp_entry.update({
-                                            "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                            "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
-                                            "furiten_state": instant_eval.get("furiten_state", "none"),
-                                            "furiten_reason": instant_eval.get("furiten_reason", ""),
-                                            "waits_snapshot": instant_eval.get("waits_snapshot", []),
-                                        })
-                                        if instant_eval_multi:
-                                            sp_entry["instant_eval_multi"] = instant_eval_multi
-                                    # 实时扫描匹配到的样本，无需再调用 verify_sample_consistency 校验，直接添加
-                                    samples.append(sp_entry)
-                                    if len(samples) >= sample_count:
-                                        break
+                                        if not (min_count <= count <= max_count):
+                                            match_visible = False
+                                            break
+                                    if not match_visible:
+                                        continue
 
+                                # 排除：若未打出牌就是目标牌，不计入（与主统计逻辑一致）
+                                mapped_target = matched_variant["target"]
+                                sample_is_combo = matched_variant.get("is_combo", False)
+                                if sample_is_combo:
+                                    target_equiv = set()
+                                    for t in mapped_target:
+                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                    if discard.tile // 4 in target_equiv:
+                                        continue
+                                else:
+                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                        continue
+
+                                hh = (
+                                    player_state.hand_tiles_history[orig_i]
+                                    if orig_i < len(player_state.hand_tiles_history)
+                                    else player_state.hand_tiles
+                                )
+                                hand_at_turn = list(hh)  # 必须为 list 以保留同种牌枚数
+                                if sample_is_combo:
+                                    target_codes = [
+                                        MjlogParser.string_to_tile(t) for t in mapped_target
+                                    ]
+                                    hand_bases = [t // 4 for t in hand_at_turn]
+                                    target_count = 1 if all(
+                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
+                                        for c in target_codes
+                                    ) else 0
+                                else:
+                                    mapped_target_code = MjlogParser.string_to_tile(mapped_target)
+                                    equiv = MjlogParser.get_count_equivalent_bases(mapped_target_code)
+                                    target_count = sum(
+                                        1 for tile in hand_at_turn
+                                        if tile // 4 in equiv
+                                    )
+                                    target_count = min(target_count, 3)
+
+                                if target_count_filter is not None and target_count != target_count_filter:
+                                    continue
+
+                                dora_readable = "".join(
+                                    MjlogParser.tile_to_string(d)
+                                    for d in round_players[0].dora_indicators[:5]
+                                ) if round_players[0].dora_indicators else "(none)"
+
+                                visible_tiles_dict = dict(player_state.visible_tiles)
+                                if sample_is_combo and isinstance(mapped_target, list):
+                                    visible_target = ", ".join(
+                                        f"{t}:{_visible_count(visible_tiles_dict, t)}"
+                                        for t in mapped_target
+                                    )
+                                else:
+                                    t0 = mapped_target[0] if isinstance(mapped_target, list) else mapped_target
+                                    visible_target = str(_visible_count(visible_tiles_dict, t0))
+                                call_area = _format_call_area_display(
+                                    getattr(player_state, "calls", []) or [], discard.turn
+                                )
+                                sp_entry = {
+                                    "log_id": log_id,
+                                    "round_num": player_state.round_num,
+                                    "honba": player_state.honba,
+                                    "oya": player_state.oya,
+                                    "player_id": player_state.player_id,
+                                    "turn": discard.turn,
+                                    "actual_pattern": hand_discard_strings.copy(),
+                                    "mapped_target": mapped_target,
+                                    "hand_tiles": list(hand_at_turn),
+                                    "visible_tiles": visible_tiles_dict,
+                                    "dora_indicators": list(player_state.dora_indicators),
+                                    "dora_readable": dora_readable,
+                                    "visible_target": visible_target,
+                                    "call_area": call_area,
+                                    "target_count": target_count,
+                                    "is_combo": sample_is_combo,
+                                    "outcome_won": bool(rw and player_state.player_id in rw),
+                                    "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
+                                }
+                                if use_deal_in_instant:
+                                    sp_entry.update({
+                                        "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
+                                        "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
+                                        "furiten_state": instant_eval.get("furiten_state", "none"),
+                                        "furiten_reason": instant_eval.get("furiten_reason", ""),
+                                        "waits_snapshot": instant_eval.get("waits_snapshot", []),
+                                    })
+                                    if instant_eval_multi:
+                                        sp_entry["instant_eval_multi"] = instant_eval_multi
+                                # 实时扫描匹配到的样本，无需再调用 verify_sample_consistency 校验，直接添加
+                                samples.append(sp_entry)
                                 if len(samples) >= sample_count:
                                     break
+
+                            if len(samples) >= sample_count:
+                                break
 
                 except Exception as e:
                     logger.debug(f"解析 {log_id} 失败: {e}")
