@@ -23,6 +23,8 @@ from .equivalent_variants import (
     generate_equivalent_variants,
     get_forbidden_bases_from_exclusion_str,
     match_discard_to_variant,
+    match_discard_pattern_contained,
+    prior_required_pattern_to_variants,
     parse_target_tiles,
     parse_multi_targets,
     split_discard_pattern,
@@ -608,17 +610,34 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         if prior_discard_exclusion:
                             excl_str = matched_variant.get("prior_discard_exclusion")
                             if excl_str:
-                                forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
+                                forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
                                 start_idx = matched_variant.get("matched_start_index")
                                 if start_idx is not None:
-                                    prior_tiles = full_discards_up_to_now[:start_idx]
-                                    if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                    prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                    # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                    if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
                                         continue
                                 elif turn_range:
                                     first_turn_in_range = in_range_for_cell[0][1].turn
                                     prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                    # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
                                     if any((d.tile // 4) in forbidden for d in prior_discards):
                                         continue
+                        if matched_variant.get("prior_discard_required"):
+                            prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                            if prior_req_variants:
+                                start_idx = matched_variant.get("matched_start_index")
+                                if start_idx is not None:
+                                    prior_tiles = full_discards_up_to_now[:start_idx]
+                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                        continue
+                                elif turn_range:
+                                    first_turn_in_range = in_range_for_cell[0][1].turn
+                                    prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
+                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                        continue
+                                else:
+                                    continue
                         if dora_constraint == "dora_unrelated" and dora_str:
                             pattern_suit = None
                             for elem in matched_variant["discard"]:
@@ -902,16 +921,32 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     if prior_discard_exclusion:
                         excl_str = matched_variant.get("prior_discard_exclusion")
                         if excl_str:
-                            forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
+                            forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
                             start_idx = matched_variant.get("matched_start_index")
                             if start_idx is not None:
-                                prior_tiles = full_discards_up_to_now[:start_idx]
-                                if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
                                     continue
                             elif turn_range:
                                 prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
                                 if any((d.tile // 4) in forbidden for d in prior_discards):
                                     continue
+                    if matched_variant.get("prior_discard_required"):
+                        prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                        if prior_req_variants:
+                            start_idx = matched_variant.get("matched_start_index")
+                            if start_idx is not None:
+                                prior_tiles = full_discards_up_to_now[:start_idx]
+                                if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                    continue
+                            elif turn_range:
+                                prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                    continue
+                            else:
+                                continue
                     if dora_constraint == "dora_unrelated" and dora_str:
                         pattern_suit = None
                         for elem in matched_variant["discard"]:
@@ -1298,7 +1333,8 @@ class LiveAnalyzer:
         analysis_batch_size: Optional[int] = None,  # 每批从数据库读取的对局数，None 用默认ANALYSIS_BATCH_SIZE
         exclude_south4: bool = False,  # 南四局打法随点数变化大，True 时跳过
         exclude_south3: bool = False,  # True 时跳过南三局，可与 exclude_south4 同选
-        prior_discard_exclusion: Optional[str] = None,  # 前段不可打，如NOTm。mOR2m锛屼笌舍牌模式同步等价变换
+        prior_discard_exclusion: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
+        prior_discard_required: Optional[str] = None,  # 前段有打：匹配前须出现过该舍牌模式，语法同舍牌模式
         hypothetical_furiten_tiles: Optional[str] = None,  # 假想振听牌，如 6p 或 6p,7p；若也会放铳则不计入主铳率
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
@@ -1385,7 +1421,7 @@ class LiveAnalyzer:
                 if len(multi_t) > 1
                 else _target_str_for_variant(first_t[0], first_t[1])
             )
-            vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints)
+            vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required)
             combo = first_t[1] if len(multi_t) == 1 else False
             item_variants.append((vars_p, t, combo))
 
@@ -1481,6 +1517,7 @@ class LiveAnalyzer:
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
             "prior_discard_exclusion": prior_discard_exclusion,
+            "prior_discard_required": prior_discard_required,
             "use_tenpai": use_tenpai,
             "use_deal_in_instant": use_deal_in_instant,
             "multi_target": multi_target,
@@ -1880,6 +1917,7 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
+        prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
     ) -> Dict:
         """
@@ -1906,6 +1944,7 @@ class LiveAnalyzer:
             exclude_south4=exclude_south4,
             exclude_south3=exclude_south3,
             prior_discard_exclusion=prior_discard_exclusion,
+            prior_discard_required=prior_discard_required,
             max_workers=max_workers,
         )
         n = max(1, result.get("total_matches", 0))
@@ -1940,6 +1979,7 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
+        prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
     ) -> Dict:
@@ -1964,6 +2004,7 @@ class LiveAnalyzer:
             exclude_south4=exclude_south4,
             exclude_south3=exclude_south3,
             prior_discard_exclusion=prior_discard_exclusion,
+            prior_discard_required=prior_discard_required,
             max_workers=max_workers,
             gc_interval_batches=gc_interval_batches,
         )
@@ -2004,6 +2045,7 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
+        prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
     ) -> Dict:
@@ -2032,7 +2074,7 @@ class LiveAnalyzer:
             first_t = multi_t[0]
             variant_target = ("".join(first_t[0]) if first_t[1] else first_t[0][0])
             vars_p = generate_equivalent_variants(
-                pattern, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints
+                pattern, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required
             )
             is_combo = first_t[1] and len(multi_t) == 1
             cs = get_consumed_search_patterns(pattern)
@@ -2100,6 +2142,7 @@ class LiveAnalyzer:
             "riichi_any": riichi_any,
             "use_tenpai": use_tenpai,
             "prior_discard_exclusion": prior_discard_exclusion,
+            "prior_discard_required": prior_discard_required,
         }
 
         conn = _connect_db_memory_efficient(self.db_path)
@@ -2278,17 +2321,34 @@ class LiveAnalyzer:
                                         if prior_discard_exclusion:
                                             excl_str = matched_variant.get("prior_discard_exclusion")
                                             if excl_str:
-                                                forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
+                                                forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
                                                 start_idx = matched_variant.get("matched_start_index")
                                                 if start_idx is not None:
-                                                    prior_tiles = full_discards_up_to_now[:start_idx]
-                                                    if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                                    prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                                    # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                                    if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
                                                         continue
                                                 elif turn_range:
                                                     first_turn_in_range = in_range_for_cell[0][1].turn
                                                     prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                                    # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
                                                     if any((d.tile // 4) in forbidden for d in prior_discards):
                                                         continue
+                                        if matched_variant.get("prior_discard_required"):
+                                            prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                                            if prior_req_variants:
+                                                start_idx = matched_variant.get("matched_start_index")
+                                                if start_idx is not None:
+                                                    prior_tiles = full_discards_up_to_now[:start_idx]
+                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                                        continue
+                                                elif turn_range:
+                                                    first_turn_in_range = in_range_for_cell[0][1].turn
+                                                    prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
+                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                                        continue
+                                                else:
+                                                    continue
                                         if dora_constraint == "dora_unrelated" and dora_str:
                                             pattern_suit = None
                                             for elem in matched_variant["discard"]:
@@ -2459,9 +2519,10 @@ class LiveAnalyzer:
         exclude_south4: bool = False,
         exclude_south3: bool = False,
         prior_discard_exclusion: Optional[str] = None,
+        prior_discard_required: Optional[str] = None,
         call_area_constraints: Optional[List[str]] = None,
         gc_interval_batches: Optional[int] = None,
-        outcome_filter: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
+        outcome_filter: Optional[str] = None,
         deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
         analysis_target: Optional[str] = None,
         pattern_index_filter: Optional[int] = None,  # 多模式时只保留 matched_pattern_idx == 此值的样本
@@ -2527,7 +2588,7 @@ class LiveAnalyzer:
             return candidates[:sample_count]
 
         variants = generate_equivalent_variants(
-            query_pattern, target_tile, visible_constraints, prior_discard_exclusion, call_area_constraints
+            query_pattern, target_tile, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
         riichi_search = pattern_has_riichi(query_pattern)
@@ -2732,16 +2793,33 @@ class LiveAnalyzer:
                                 if prior_discard_exclusion:
                                     excl_str = matched_variant.get("prior_discard_exclusion")
                                     if excl_str:
-                                        forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
+                                        forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
                                         start_idx = matched_variant.get("matched_start_index")
                                         if start_idx is not None:
-                                            prior_tiles = full_discards_up_to_now[:start_idx]
-                                            if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                            prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                            # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                            if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
                                                 continue
                                         elif turn_range:
                                             prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                            # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
                                             if any((d.tile // 4) in forbidden for d in prior_discards):
                                                 continue
+
+                                if matched_variant.get("prior_discard_required"):
+                                    prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                                    if prior_req_variants:
+                                        start_idx = matched_variant.get("matched_start_index")
+                                        if start_idx is not None:
+                                            prior_tiles = full_discards_up_to_now[:start_idx]
+                                            if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                                continue
+                                        elif turn_range:
+                                            prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                            if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                                continue
+                                        else:
+                                            continue
 
                                 if dora_constraint == "dora_unrelated" and dora_str:
                                     pattern_suit = None
@@ -3005,6 +3083,7 @@ def verify_sample_consistency(
     visible_constraints: Optional[Dict] = None,
     prior_discard_exclusion: Optional[str] = None,
     call_area_constraints: Optional[List[str]] = None,
+    prior_discard_required: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     验证样本的 actual_pattern 是否与查询模式在匹配逻辑下一致。
@@ -3024,7 +3103,7 @@ def verify_sample_consistency(
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
         variants = generate_equivalent_variants(
             query_pattern, variant_target, visible_constraints,
-            prior_discard_exclusion, call_area_constraints
+            prior_discard_exclusion, call_area_constraints, prior_discard_required
         )
         
         # 补充上下文，支持 r (立直) 及 zf/kf (自风/客风) 占位符校验

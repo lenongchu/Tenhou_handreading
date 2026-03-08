@@ -54,8 +54,10 @@ _SUIT_FORBIDDEN_BASES = {
 def get_forbidden_bases_from_exclusion_str(prior_str: str) -> frozenset:
     """
     前段不可打：从模式字符串解析禁止的 base 集合。
-    支持 OR 组合多元素（如 4mOR2m），与舍牌模式语法一致。
-    例：NOTm -> 万字全部；4mOR2m -> {4m,2m}；NOT[45]m -> {4m,5m}
+    支持 OR 组合多元素（如 4mOR2m）、数字范围 [39]p（3p~9p），与舍牌模式语法一致。
+    例：NOTm -> 万字全部；4mOR2m -> {4m,2m}；[39]p -> 3p~9p 共 7 张的 base。
+    返回：frozenset[int]，元素为 base 编码 0-36（与 MjlogParser.string_to_tile 返回值一致）。
+    调用处若用 prior_tiles [(tile_str, bool)] 比较，应用 string_to_tile(t[0]) in forbidden，勿用 // 4。
     """
     if not prior_str or not prior_str.strip():
         return frozenset()
@@ -65,7 +67,7 @@ def get_forbidden_bases_from_exclusion_str(prior_str: str) -> frozenset:
 
 
 def _forbidden_bases_from_parsed_tile(tile: str) -> frozenset:
-    """从解析后的单元素（@n:m、@o:4m,2m 等）计算禁止 base 集合"""
+    """从解析后的单元素（@n:m、@o:4m,2m 等）计算禁止 base 集合。返回 base 0-36（非 tile 码 0-147）。"""
     if tile.startswith(NOT_PREFIX):
         rest = tile[len(NOT_PREFIX):].strip()
         comps = [x.strip() for x in rest.split(",") if x.strip()]
@@ -1286,6 +1288,7 @@ def generate_equivalent_variants(
     visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
     prior_discard_exclusion: Optional[str] = None,
     call_area_constraints: Optional[List[str]] = None,
+    prior_discard_required: Optional[str] = None,
 ) -> List[Dict]:
     """
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
@@ -1324,6 +1327,7 @@ def generate_equivalent_variants(
     if not has_number:
         honor_variants = _expand_pure_honor_pattern(parsed_pattern)
         prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
+        prior_req = prior_discard_required.strip() if prior_discard_required else None
         call_area = list(call_area_constraints) if call_area_constraints else None
         # 从目标牌中收集花色（数牌、赤五）
         target_suits = set()
@@ -1341,18 +1345,20 @@ def generate_equivalent_variants(
                     target_new = target_new[0] if len(target_new) == 1 else target_new
                     visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
                     prior_mapped = _apply_suit_mapping_to_string(prior, mapping) if prior else None
+                    prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
                     call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in (call_area or [])]
                     result.append({
                         "discard": p, "target": target_new,
                         "visible_constraints": visible_new, "is_combo": is_combo,
-                        "prior_discard_exclusion": prior_mapped, "call_area_constraints": call_area_new,
+                        "prior_discard_exclusion": prior_mapped, "prior_discard_required": prior_req_mapped,
+                        "call_area_constraints": call_area_new,
                         "mapping": mapping,
                     })
             return result
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         mapping = {"m": "m", "p": "p", "s": "s"}
         return [
-            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "call_area_constraints": call_area, "mapping": mapping}
+            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "prior_discard_required": prior_req, "call_area_constraints": call_area, "mapping": mapping}
             for p in honor_variants
         ]
 
@@ -1369,6 +1375,8 @@ def generate_equivalent_variants(
         target_new = target_new[0] if len(target_new) == 1 else target_new
         visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
         prior_mapped = _apply_suit_mapping_to_string(prior_discard_exclusion.strip(), mapping) if prior_discard_exclusion else None
+        prior_req = prior_discard_required.strip() if prior_discard_required else None
+        prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
         call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in call_area_constraints] if call_area_constraints else None
         variants.append({
             "discard": discard_new,
@@ -1376,10 +1384,38 @@ def generate_equivalent_variants(
             "visible_constraints": visible_new,
             "is_combo": is_combo,
             "prior_discard_exclusion": prior_mapped,
+            "prior_discard_required": prior_req_mapped,
             "call_area_constraints": call_area_new,
             "mapping": mapping,
         })
     return variants
+
+
+def prior_required_pattern_to_variants(prior_str_mapped: str) -> List[Dict]:
+    """
+    将已映射的「前段有打」模式字符串转为供 match_discard_to_variant 使用的单变体列表。
+    语法与舍牌模式一致（如 [29]m-3pf），仅用于前段序列的「包含」匹配。
+    """
+    if not prior_str_mapped or not prior_str_mapped.strip():
+        return []
+    parts = split_discard_pattern(prior_str_mapped.strip())
+    parsed = [parse_discard_element(p) for p in parts]
+    return [{"discard": parsed, "target": None, "visible_constraints": {}, "is_combo": False}]
+
+
+def match_discard_pattern_contained(
+    full_discards: List[Tuple[str, bool]],
+    variants: List[Dict],
+    context: Optional[Dict] = None,
+) -> bool:
+    """
+    检查 full_discards 中是否存在某段连续子序列匹配任一变体（用于「前段有打」）。
+    即是否存在某个 i 使得 full_discards[i:] 的末尾匹配该模式。
+    """
+    for i in range(len(full_discards)):
+        if match_discard_to_variant(full_discards[i:], variants, context):
+            return True
+    return False
 
 
 def get_acceptable_last_tiles(variants: List[Dict]) -> frozenset:

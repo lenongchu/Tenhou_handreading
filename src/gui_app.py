@@ -676,7 +676,7 @@ class OutcomeQueryThread(QThread):
                 if k in ("query_pattern", "target_tile", "query_items", "dora_constraint", "dora_position_spec",
                          "visible_constraints", "riichi_constraint", "call_constraint",
                          "call_area_constraints", "turn_range", "sample_limit",
-                         "exclude_south4", "exclude_south3", "prior_discard_exclusion",
+                         "exclude_south4", "exclude_south3", "prior_discard_exclusion", "prior_discard_required",
                          "max_workers")
             }
             result = self.analyzer.compute_pattern_outcome_rates(
@@ -1020,6 +1020,13 @@ PATTERN_HELP_HTML = """
 <li><code>NOTm</code>：前段不能打出任何万字；<code>NOTmf</code> 同义且手摸切皆可；变体 1p-2p 时自动变为 NOTp</li>
 <li><code>4mOR2m</code>：前段不能打出 4m 或 2m；用 OR 组合多牌</li>
 <li>例：舍牌 <code>1m-3m</code> 目标 2m，前段 <code>NOTm</code> → 在 1m-3m 的手顺之前不能打过任何万字</li>
+</ul>
+
+<h3>十二、前段有打约束</h3>
+<p>在约束区域「前段有打」中输入舍牌模式，表示<u>舍牌模式开始前</u>（即匹配到的主舍牌手顺之前）该玩家<u>必须出现过</u>这一段舍牌。语法与主舍牌模式完全相同；与主模式串联为「前段有打 … 主舍牌模式」，中间发生了什么不要求。</p>
+<ul>
+<li><code>[29]m-3pf</code>：前段曾按顺序打出过 2m 或 9m，再打出 3m（手摸切皆可）；等价变体时同步映射</li>
+<li>例：主模式 <code>1s-3s</code> 目标 2s，前段有打 <code>[29]s-3sf</code> → 在 1s-3s 之前曾出现过 2s/9s 再 3s 的序列</li>
 </ul>
 """
 
@@ -1556,6 +1563,19 @@ class BatchChartDialog(QDialog):
         prior_excl_row.addStretch()
         cg_layout.addLayout(prior_excl_row)
 
+        prior_req_row = QHBoxLayout()
+        prior_req_row.addWidget(QLabel("前段有打:"))
+        self.batch_prior_discard_required_input = QLineEdit()
+        self.batch_prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
+        self.batch_prior_discard_required_input.setToolTip(
+            "巡目范围开始前须出现过该舍牌模式（语法同舍牌模式）。与主模式串联：前段有打 … 舍牌模式，中间不要求"
+        )
+        self.batch_prior_discard_required_input.setMinimumWidth(140)
+        self.batch_prior_discard_required_input.setMaximumWidth(200)
+        prior_req_row.addWidget(self.batch_prior_discard_required_input)
+        prior_req_row.addStretch()
+        cg_layout.addLayout(prior_req_row)
+
         # 场上可见枚数
         vc_row = QHBoxLayout()
         vc_row.addWidget(QLabel("场上可见枚数:"))
@@ -1656,17 +1676,20 @@ class BatchChartDialog(QDialog):
             if i < len(mw.call_area_inputs):
                 le.setText(mw.call_area_inputs[i].text())
         self.batch_prior_discard_exclusion_input.setText(mw.prior_discard_exclusion_input.text())
+        self.batch_prior_discard_required_input.setText(mw.prior_discard_required_input.text())
         QMessageBox.information(self, "已同步", "约束条件已从主界面同步")
 
     def _build_constraint_params(self) -> dict:
         """构建约束参数字典（本对话框或主界面）"""
         mw = self.main_window
         cached = _load_db_status_from_cache(mw.db_path)
-        # prior_discard_exclusion：勾选约束组时用本对话框，否则用主界面
+        # prior_discard_exclusion / prior_discard_required：勾选约束组时用本对话框，否则用主界面
         if self.constraint_group.isChecked():
             prior_excl = self.batch_prior_discard_exclusion_input.text().strip() or None
+            prior_req = self.batch_prior_discard_required_input.text().strip() or None
         else:
             prior_excl = mw.prior_discard_exclusion_input.text().strip() or None
+            prior_req = mw.prior_discard_required_input.text().strip() or None
         base = {
             "sample_limit": mw.sample_limit_input.value(),
             "total_logs_hint": cached.get("total_logs") if cached else None,
@@ -1675,6 +1698,7 @@ class BatchChartDialog(QDialog):
             "exclude_south4": mw.exclude_south4_check.isChecked(),
             "exclude_south3": mw.exclude_south3_check.isChecked(),
             "prior_discard_exclusion": prior_excl,
+            "prior_discard_required": prior_req,
             "max_workers": mw.max_workers_spin.value(),
             "gc_interval_batches": mw.gc_interval_batches_spin.value(),
         }
@@ -2212,6 +2236,19 @@ class MainWindow(QMainWindow):
         prior_excl_row.addStretch()
         right_layout.addLayout(prior_excl_row)
 
+        prior_req_row = QHBoxLayout()
+        prior_req_row.addWidget(QLabel("前段有打:"))
+        self.prior_discard_required_input = QLineEdit()
+        self.prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
+        self.prior_discard_required_input.setToolTip(
+            "匹配前须出现过该舍牌模式，语法同舍牌模式。前段有打 … 舍牌模式，中间不要求；与主模式同步等价变换"
+        )
+        self.prior_discard_required_input.setMinimumWidth(140)
+        self.prior_discard_required_input.setMaximumWidth(200)
+        prior_req_row.addWidget(self.prior_discard_required_input)
+        prior_req_row.addStretch()
+        right_layout.addLayout(prior_req_row)
+
         # 副露区域约束（目标玩家必须有这些副露，AND 关系，最多 4 个）
         call_area_row = QHBoxLayout()
         call_area_row.addWidget(QLabel("副露区域:"))
@@ -2604,6 +2641,19 @@ class MainWindow(QMainWindow):
         prior_excl_row.addStretch()
         c_layout.addLayout(prior_excl_row)
 
+        prior_req_row = QHBoxLayout()
+        prior_req_row.addWidget(QLabel("前段有打:"))
+        self.instant_prior_discard_required_input = QLineEdit()
+        self.instant_prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
+        self.instant_prior_discard_required_input.setToolTip(
+            "匹配前须出现过该舍牌模式，语法同舍牌模式。前段有打 … 舍牌模式，中间不要求；与主模式同步等价变换"
+        )
+        self.instant_prior_discard_required_input.setMinimumWidth(140)
+        self.instant_prior_discard_required_input.setMaximumWidth(200)
+        prior_req_row.addWidget(self.instant_prior_discard_required_input)
+        prior_req_row.addStretch()
+        c_layout.addLayout(prior_req_row)
+
         call_area_row = QHBoxLayout()
         call_area_row.addWidget(QLabel("副露区域:"))
         self.instant_call_area_inputs = []
@@ -2832,9 +2882,12 @@ class MainWindow(QMainWindow):
         self.exclude_south4_check.setChecked(self.instant_exclude_south4_check.isChecked())
         self.exclude_south3_check.setChecked(self.instant_exclude_south3_check.isChecked())
 
-        # 前段禁打
+        # 前段禁打 / 前段有打
         self.prior_discard_exclusion_input.setText(
             self.instant_prior_discard_exclusion_input.text().strip()
+        )
+        self.prior_discard_required_input.setText(
+            self.instant_prior_discard_required_input.text().strip()
         )
 
         # 副露区域
@@ -3805,6 +3858,9 @@ class MainWindow(QMainWindow):
         prior = self.prior_discard_exclusion_input.text().strip()
         if prior:
             lines.append("前段禁打=%s" % prior)
+        prior_req = self.prior_discard_required_input.text().strip()
+        if prior_req:
+            lines.append("前段有打=%s" % prior_req)
         for le in self.call_area_inputs:
             t = le.text().strip()
             if t:
@@ -3865,6 +3921,9 @@ class MainWindow(QMainWindow):
         prior = self.instant_prior_discard_exclusion_input.text().strip()
         if prior:
             lines.append("前段禁打=%s" % prior)
+        prior_req = self.instant_prior_discard_required_input.text().strip()
+        if prior_req:
+            lines.append("前段有打=%s" % prior_req)
         for le in self.instant_call_area_inputs:
             t = le.text().strip()
             if t:
@@ -4062,16 +4121,19 @@ class MainWindow(QMainWindow):
 
     def _apply_share_string_prior_call_area(self, data: Dict[str, Any], instant: bool):
         prior = (data.get("前段禁打") or "").strip()
+        prior_req = (data.get("前段有打") or "").strip()
         areas = data.get("副露区域")
         if not isinstance(areas, list):
             areas = [areas] if areas else []
         areas = [str(x).strip() for x in areas if x][:4]
         if instant:
             self.instant_prior_discard_exclusion_input.setText(prior)
+            self.instant_prior_discard_required_input.setText(prior_req)
             for i, le in enumerate(self.instant_call_area_inputs):
                 le.setText(areas[i] if i < len(areas) else "")
         else:
             self.prior_discard_exclusion_input.setText(prior)
+            self.prior_discard_required_input.setText(prior_req)
             for i, le in enumerate(self.call_area_inputs):
                 le.setText(areas[i] if i < len(areas) else "")
 
@@ -4296,6 +4358,7 @@ class MainWindow(QMainWindow):
             "exclude_south4": self.exclude_south4_check.isChecked(),
             "exclude_south3": self.exclude_south3_check.isChecked(),
             "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+            "prior_discard_required": self.prior_discard_required_input.text().strip() or None,
             "hypothetical_furiten_tiles": hypothetical_furiten,
             "max_workers": self.max_workers_spin.value(),
             "gc_interval_batches": self.gc_interval_batches_spin.value(),
@@ -4610,6 +4673,7 @@ class MainWindow(QMainWindow):
                 "exclude_south4": self.exclude_south4_check.isChecked(),
             "exclude_south3": self.exclude_south3_check.isChecked(),
                 "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+                "prior_discard_required": self.prior_discard_required_input.text().strip() or None,
                 "analysis_batch_size": self.analysis_batch_size_spin.value(),
                 "gc_interval_batches": self.gc_interval_batches_spin.value(),
             }
