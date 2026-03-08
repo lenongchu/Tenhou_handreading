@@ -988,6 +988,8 @@ PATTERN_HELP_HTML = """
 <tr><td><code>kf</code></td><td>任意一张客风</td></tr>
 <tr><td><code>z1</code> <code>z2</code> <code>z3</code></td><td>互不相同的字牌</td></tr>
 <tr><td><code>kf1</code> <code>kf2</code> <code>kf3</code></td><td>互不相同的客风</td></tr>
+<tr><td><code>ap</code></td><td>安牌（满足其一即可，不含本张：该字牌可见1-3枚；或非场风、非三元字牌可见0张）</td></tr>
+<tr><td><code>apr</code></td><td>立直宣言的安牌（该舍牌为立直宣言且满足安牌条件）</td></tr>
 </table>
 
 <h3>十、示例</h3>
@@ -1013,11 +1015,11 @@ PATTERN_HELP_HTML = """
 </ul>
 
 <h3>十一、前段禁打约束</h3>
-<p>在约束区域「前段禁打」中输入模式，表示<u>巡目范围开始前</u>该玩家不能打出这些牌。支持与舍牌模式相同的语法，并与主模式同步等价变换。</p>
+<p>在约束区域「前段禁打」中输入模式，表示<u>舍牌模式开始前</u>（即匹配到的舍牌手顺之前）该玩家不能打出这些牌。支持与舍牌模式相同的语法，并与主模式同步等价变换。</p>
 <ul>
 <li><code>NOTm</code>：前段不能打出任何万字；<code>NOTmf</code> 同义且手摸切皆可；变体 1p-2p 时自动变为 NOTp</li>
 <li><code>4mOR2m</code>：前段不能打出 4m 或 2m；用 OR 组合多牌</li>
-<li>例：舍牌 <code>1m-2m</code> 目标 4m、4-9 巡，前段 <code>NOTm</code> → 排除第 3 巡前已打过万字的样本</li>
+<li>例：舍牌 <code>1m-3m</code> 目标 2m，前段 <code>NOTm</code> → 在 1m-3m 的手顺之前不能打过任何万字</li>
 </ul>
 """
 
@@ -3390,8 +3392,13 @@ class MainWindow(QMainWindow):
         _clear_layout(self.multi_merge_layout)
 
         use_tenpai = self.last_query_result and self.last_query_result.get("analysis_target") == "tenpai"
+        use_instant = self.last_query_result and self.last_query_result.get("analysis_target") == "deal_in_instant"
         header_row = QHBoxLayout()
-        header_row.addWidget(QLabel("勾选合并（目标牌相同）:" if not use_tenpai else "勾选合并:"))
+        if use_instant:
+            header_lbl = "勾选参与合并的模式（按目标牌合并）:"
+        else:
+            header_lbl = "勾选合并（目标牌相同）:" if not use_tenpai else "勾选合并:"
+        header_row.addWidget(QLabel(header_lbl))
         header_row.addStretch()
         select_all_btn = QPushButton("全选")
         select_all_btn.setFixedWidth(44)
@@ -3453,6 +3460,49 @@ class MainWindow(QMainWindow):
             self._excel_clipboard_text = self._build_excel_text(result, pr_list, multi=True)
             return
         total_matches = sum(pr['matches'] for pr in checked)
+        use_instant = result.get("analysis_target") == "deal_in_instant"
+        if use_instant:
+            # 按目标牌合并：对每个目标牌汇总勾选模式的 hits/points
+            target_tiles = checked[0].get("target_tiles") or []
+            lines = [f"按目标牌合并：总匹配 {_fmt_int(total_matches)} 次"]
+            for tk in target_tiles:
+                hits_sum = 0
+                points_sum = 0
+                for pr in checked:
+                    mis = pr.get("multi_instant_stats") or {}
+                    s = mis.get(tk, {})
+                    hits_sum += s.get("hits", 0)
+                    points_sum += s.get("points", 0)
+                rate = hits_sum / total_matches if total_matches > 0 else 0.0
+                p_avg = points_sum / hits_sum if hits_sum > 0 else 0.0
+                intensity = rate * p_avg
+                lines.append(
+                    f"  {tk}: 铳率 {rate:.2%} ({_fmt_int(hits_sum)} 例) | 平均铳点 {p_avg:.1f} | 铳度 {intensity:.2f}"
+                )
+            self.merged_result_label.setText("\n".join(lines))
+            tr = result.get("turn_range")
+            turn_str = f"{tr[0]}-{tr[1]}巡" if tr else "不限"
+            header = "舍牌模式\t目标牌\t巡目范围\t铳率\t可铳样本\t平均铳点\t铳度"
+            excel_rows = [header]
+            for tk in target_tiles:
+                hits_sum = sum(
+                    (pr.get("multi_instant_stats") or {}).get(tk, {}).get("hits", 0) for pr in checked
+                )
+                points_sum = sum(
+                    (pr.get("multi_instant_stats") or {}).get(tk, {}).get("points", 0) for pr in checked
+                )
+                rate = hits_sum / total_matches if total_matches > 0 else 0.0
+                p_avg = points_sum / hits_sum if hits_sum > 0 else 0.0
+                intensity = rate * p_avg
+                pattern_merged = "【合并】"
+                excel_rows.append(
+                    f"{pattern_merged}\t{tk}\t{turn_str}\t{rate:.2%}\t{hits_sum}\t{p_avg:.1f}\t{intensity:.2f}"
+                )
+            excel_rows.append("")
+            excel_rows.append(f"分析半庄数\t{result.get('total_logs_analyzed', 0)}")
+            excel_rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
+            self._excel_clipboard_text = "\n".join(excel_rows)
+            return
         use_tenpai = result.get("analysis_target") == "tenpai"
         keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
         merged_dist = {k: 0 for k in keys}
@@ -4140,6 +4190,14 @@ class MainWindow(QMainWindow):
                     tcd = pr.get('target_count_distribution', {})
                     lines.append(f"  {pr_label}: {_fmt_int(pr['matches'])} 次")
                     if use_instant:
+                        mis = pr.get("multi_instant_stats") or {}
+                        for tk in pr.get("target_tiles") or []:
+                            s = mis.get(tk, {})
+                            if s:
+                                lines.append(
+                                    f"    {tk}: 铳率 {s.get('rate', 0):.2%} ({_fmt_int(s.get('hits', 0))} 例) | "
+                                    f"平均铳点 {s.get('point_avg', 0):.1f} | 铳度 {s.get('intensity', 0):.2f}"
+                                )
                         continue
                     elif use_tenpai:
                         lines.append(
@@ -4191,12 +4249,8 @@ class MainWindow(QMainWindow):
                             lines.append("  （按牌: " + "、".join(f"{t}: {_fmt_int(c)} 例" for t, c in sorted(by_tile.items())) + "）")
                 result_text = "\n".join(lines)
 
-                # 多模式：勾选与合并（_setup_multi_pattern_merge 内 _update_merged_result 已设置 _excel_clipboard_text 为合并结果）
-                if use_instant:
-                    self.multi_merge_widget.setVisible(False)
-                    self._excel_clipboard_text = self._build_excel_text(result, None, multi=False)
-                else:
-                    self._setup_multi_pattern_merge(result, pr_list)
+                # 多模式：勾选与合并（即时铳率也显示合并区，按目标牌合并；复制合并即复制按目标牌合并结果）
+                self._setup_multi_pattern_merge(result, pr_list)
             else:
                 use_tenpai = (result.get("analysis_target") == "tenpai")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")

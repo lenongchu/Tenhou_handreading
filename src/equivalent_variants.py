@@ -22,7 +22,7 @@ from itertools import product, permutations
 from .mjlog_parser import MjlogParser
 
 
-# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), ap=安牌(可见2-3枚或1枚非宝牌), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
+# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), ap=安牌(满足其一：该字牌可见1-3枚 或 非场风非三元可见0张，不含本张), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
 HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "yp", "ap", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
 HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
 # 1z-4z 风牌对应中文，用于 @p:kf 客风校验
@@ -548,6 +548,38 @@ def _is_honor_tile(tile_str: str) -> bool:
     if len(tile_str) == 2 and tile_str[0].isdigit() and tile_str[1] == "z":
         return 1 <= int(tile_str[0]) <= 7
     return False
+
+
+# 风牌 base 27-30（东=27,南=28,西=29,北=30），用于安牌「非场风、非三元」判定
+_WIND_BASES = {27, 28, 29, 30}
+
+
+def _ap_condition_met(visible_tiles, tile_str: str, bakaze: Optional[str]) -> bool:
+    """
+    安牌条件（OR）：(1) 场上可见1-3枚该字牌（不含本张） 或 (2) 可见0张的非场风、非三元字牌（不含本张）。
+    满足其一即为安牌，不会因额外条件减少样本。
+    """
+    if not visible_tiles or not _is_honor_tile(tile_str):
+        return False
+    tile_base = MjlogParser.string_to_tile(tile_str)
+    base = tile_base // 4
+    equiv = MjlogParser.get_count_equivalent_bases(tile_base)
+    count_this = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
+    count_this_excl = max(0, count_this - 1)
+    # (1) 该字牌场上可见1-3枚（不含本张）
+    if 1 <= count_this_excl <= 3:
+        return True
+    # (2) 非场风、非三元字牌可见0张（不含本张）
+    if not bakaze:
+        return False
+    bakaze_base = MjlogParser.string_to_tile(bakaze) // 4
+    non_bakaze_sangen_bases = _WIND_BASES - {bakaze_base}
+    for b in non_bakaze_sangen_bases:
+        count_b = sum(c for t, c in visible_tiles.items() if t // 4 == b)
+        count_b_excl = max(0, count_b - (1 if base == b else 0))
+        if count_b_excl != 0:
+            return False
+    return True
 
 
 def _tile_base_eq(a: str, b: str) -> bool:
@@ -1502,6 +1534,7 @@ def _match_pattern_at_end(
     pattern: List[Tuple[str, bool]],
     context: Optional[Dict] = None,
     out_position_to_tile: Optional[Dict[int, str]] = None,
+    out_match_start_index: Optional[List[int]] = None,
 ) -> bool:
     """
     检查完整舍牌序列末尾是否匹配模式。
@@ -1548,21 +1581,13 @@ def _match_pattern_at_end(
             riichi_flags = ctx.get("discard_riichi_flags") or []
             if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
                 return False
-            # @r:ap = 立直宣言的安牌：须为字牌且满足安牌条件
+            # @r:ap = 立直宣言的安牌：须为字牌且满足安牌条件（可见1-3枚+非场风非三元可见0张，不含本张舍牌）
             if want_tile == "ap":
                 if not _is_honor_tile(tile_str):
                     return False
                 visible_tiles = ctx.get("visible_tiles")
-                dora_indicators = ctx.get("dora_indicators")
-                if visible_tiles is None or dora_indicators is None:
-                    return False
-                tile_base = MjlogParser.string_to_tile(tile_str)
-                equiv = MjlogParser.get_count_equivalent_bases(tile_base)
-                count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
-                dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
-                is_dora = any(base == tile_base for base in dora_bases)
-                is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
-                if not is_ap:
+                bakaze = ctx.get("bakaze")
+                if not _ap_condition_met(visible_tiles, tile_str, bakaze):
                     return False
             elif tile_str != want_tile:
                 return False
@@ -1702,16 +1727,8 @@ def _match_pattern_at_end(
                         if not _is_honor_tile(tile_str):
                             continue
                         visible_tiles = ctx.get("visible_tiles")
-                        dora_indicators = ctx.get("dora_indicators")
-                        if visible_tiles is None or dora_indicators is None:
-                            continue
-                        tile_base = MjlogParser.string_to_tile(tile_str)
-                        equiv = MjlogParser.get_count_equivalent_bases(tile_base)
-                        count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
-                        dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
-                        is_dora = any(base == tile_base for base in dora_bases)
-                        is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
-                        if is_ap:
+                        bakaze = ctx.get("bakaze")
+                        if _ap_condition_met(visible_tiles, tile_str, bakaze):
                             matched_opt = opt
                             break
                     elif tile_part in ("kf", "kf1", "kf2", "kf3"):
@@ -1876,20 +1893,12 @@ def _match_pattern_at_end(
             p_idx -= 1
             continue
         if pat_tile == "ap":
-            # 安牌：字牌且满足：场上可见2-3枚；或场上可见1枚且非宝牌
+            # 安牌：场上可见1-3枚字牌+可见0张的非场风、非三元字牌（不含本张舍牌）
             if not _is_honor_tile(tile_str):
                 return False
             visible_tiles = ctx.get("visible_tiles")
-            dora_indicators = ctx.get("dora_indicators")
-            if visible_tiles is None or dora_indicators is None:
-                return False
-            tile_base = MjlogParser.string_to_tile(tile_str)
-            equiv = MjlogParser.get_count_equivalent_bases(tile_base)
-            count = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
-            dora_bases = [MjlogParser.indicator_to_dora(ind // 4) for ind in dora_indicators]
-            is_dora = any(base == tile_base for base in dora_bases)
-            is_ap = (2 <= count <= 3) or (count == 1 and not is_dora)
-            if not is_ap:
+            bakaze = ctx.get("bakaze")
+            if not _ap_condition_met(visible_tiles, tile_str, bakaze):
                 return False
             consumed_any_discard = True
             if out_position_to_tile is not None:
@@ -1998,7 +2007,10 @@ def _match_pattern_at_end(
     while p_idx >= 0 and pattern[p_idx][0] == "*":
         p_idx -= 1
 
-    return p_idx < 0
+    matched = p_idx < 0
+    if matched and out_match_start_index is not None:
+        out_match_start_index[:] = [d_idx + 1]
+    return matched
 
 
 def match_discard_to_variant(
@@ -2019,12 +2031,24 @@ def match_discard_to_variant(
         context: 可选，含 jikaze、kyokuze_list，用于 zf/kf 匹配
 
     Returns:
-        匹配到的变体，若都不匹配则返回 None
+        匹配到的变体（含 position_to_tile、matched_start_index 等），若都不匹配则返回 None。
+        matched_start_index: 0-based 索引，表示舍牌序列中模式匹配的起始位置（该位置及之后为模式，之前为「前段」）。
     """
     for v in variants:
         out_pt = {}
-        if _match_pattern_at_end(full_discards, v["discard"], context, out_position_to_tile=out_pt):
-            return {**v, "position_to_tile": out_pt}
+        out_start = []
+        if _match_pattern_at_end(
+            full_discards,
+            v["discard"],
+            context,
+            out_position_to_tile=out_pt,
+            out_match_start_index=out_start,
+        ):
+            return {
+                **v,
+                "position_to_tile": out_pt,
+                "matched_start_index": out_start[0] if out_start else None,
+            }
     return None
 
 

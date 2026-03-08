@@ -605,14 +605,20 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
                         if not matched_variant:
                             continue
-                        if prior_discard_exclusion and turn_range:
-                            first_turn_in_range = in_range_for_cell[0][1].turn
-                            prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                        if prior_discard_exclusion:
                             excl_str = matched_variant.get("prior_discard_exclusion")
                             if excl_str:
                                 forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
-                                if any((d.tile // 4) in forbidden for d in prior_discards):
-                                    continue
+                                start_idx = matched_variant.get("matched_start_index")
+                                if start_idx is not None:
+                                    prior_tiles = full_discards_up_to_now[:start_idx]
+                                    if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                        continue
+                                elif turn_range:
+                                    first_turn_in_range = in_range_for_cell[0][1].turn
+                                    prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                    if any((d.tile // 4) in forbidden for d in prior_discards):
+                                        continue
                         if dora_constraint == "dora_unrelated" and dora_str:
                             pattern_suit = None
                             for elem in matched_variant["discard"]:
@@ -770,6 +776,15 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     if use_deal_in_instant and multi_target:
         for tk in [_target_key(t[0], t[1]) for t in item_multi_targets[0]]:
             instant_deal_in_dist[tk] = {"hits": 0, "points": 0}
+    # 多模式 + 多目标即时铳率：按模式分别统计，供前端按模式展示各目标牌铳率/铳点/铳度
+    instant_deal_in_dist_per_pattern = []
+    if use_deal_in_instant and multi_target and len(items) > 1:
+        for idx in range(len(items)):
+            d = {}
+            for t in item_multi_targets[idx]:
+                tk = _target_key(t[0], t[1])
+                d[tk] = {"hits": 0, "points": 0}
+            instant_deal_in_dist_per_pattern.append(d)
 
     try:
         raw = _get_raw_content(log_content)
@@ -779,7 +794,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
                         "excluded_due_to_hypothetical_furiten_by_tile": {},
                         "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                        "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
+                        "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
+                        "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
         if consumed_search_list and _is_tenhou6_json(raw):
             if len(items) == 1:
                 if not log_contains_consumed(raw, consumed_search_list[0]):
@@ -787,14 +803,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
                             "excluded_due_to_hypothetical_furiten_by_tile": {},
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
+                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
+                            "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
             else:
                 if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
                     return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
                             "deal_in_hits": 0, "deal_in_point_sum": 0, "excluded_due_to_hypothetical_furiten": 0,
                             "excluded_due_to_hypothetical_furiten_by_tile": {},
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
-                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist}
+                            "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
+                            "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
         round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
         game_states = parse_log_to_game_states(raw)
         round_size = 4
@@ -881,13 +899,19 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     if not matched_variant:
                         continue
                     _, _, item_combo = item_variants[matched_idx]
-                    if prior_discard_exclusion and turn_range:
-                        prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                    if prior_discard_exclusion:
                         excl_str = matched_variant.get("prior_discard_exclusion")
                         if excl_str:
                             forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
-                            if any((d.tile // 4) in forbidden for d in prior_discards):
-                                continue
+                            start_idx = matched_variant.get("matched_start_index")
+                            if start_idx is not None:
+                                prior_tiles = full_discards_up_to_now[:start_idx]
+                                if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                    continue
+                            elif turn_range:
+                                prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                if any((d.tile // 4) in forbidden for d in prior_discards):
+                                    continue
                     if dora_constraint == "dora_unrelated" and dora_str:
                         pattern_suit = None
                         for elem in matched_variant["discard"]:
@@ -1053,6 +1077,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                             if ev.get("deal_in_hit"):
                                                 instant_deal_in_dist[tk]["hits"] += 1
                                                 instant_deal_in_dist[tk]["points"] += int(ev.get("deal_in_point", 0))
+                                                if instant_deal_in_dist_per_pattern and tk in instant_deal_in_dist_per_pattern[matched_idx]:
+                                                    instant_deal_in_dist_per_pattern[matched_idx][tk]["hits"] += 1
+                                                    instant_deal_in_dist_per_pattern[matched_idx][tk]["points"] += int(ev.get("deal_in_point", 0))
                                     first_tk = _target_key(mt_item[0][0], mt_item[0][1])
                                     instant_eval = instant_eval_multi.get(first_tk, {})
                                 else:
@@ -1202,6 +1229,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         "matched_states": matched_states,
         "sample_pool": sample_pool,
         "instant_deal_in_dist": instant_deal_in_dist,
+        "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern if instant_deal_in_dist_per_pattern else None,
     }
 
 
@@ -1407,6 +1435,15 @@ class LiveAnalyzer:
                 ({0: 0, 1: 0} if (use_tenpai or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
                 for iv in item_variants
             ]
+        # 多模式 + 多目标即时铳率：按模式分别统计，用于每个 pattern_results 的 multi_instant_stats
+        pattern_instant_dists: List[Dict[str, Dict[str, int]]] = []
+        if len(items) > 1 and use_deal_in_instant and multi_target:
+            for idx in range(len(items)):
+                d = {}
+                for t in item_multi_targets[idx]:
+                    tk = _target_key(t[0], t[1])
+                    d[tk] = {"hits": 0, "points": 0}
+                pattern_instant_dists.append(d)
         target_count_distribution = pattern_distributions[0]
 
         use_parallel = (max_workers is not None and max_workers > 1)
@@ -1528,6 +1565,14 @@ class LiveAnalyzer:
                             if tk in instant_deal_in_dist:
                                 instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
                                 instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
+                    if pattern_instant_dists:
+                        per_pat = per_log_result.get("instant_deal_in_dist_per_pattern") or []
+                        for idx, pat_dist in enumerate(per_pat):
+                            if idx < len(pattern_instant_dists):
+                                for tk, st in pat_dist.items():
+                                    if tk in pattern_instant_dists[idx]:
+                                        pattern_instant_dists[idx][tk]["hits"] += st.get("hits", 0)
+                                        pattern_instant_dists[idx][tk]["points"] += st.get("points", 0)
                     for i, n in enumerate(per_log_result["pattern_matches"]):
                         pattern_matches[i] += n
                     for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
@@ -1587,6 +1632,14 @@ class LiveAnalyzer:
                             if tk in instant_deal_in_dist:
                                 instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
                                 instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
+                    if pattern_instant_dists:
+                        per_pat = per_log_result.get("instant_deal_in_dist_per_pattern") or []
+                        for idx, pat_dist in enumerate(per_pat):
+                            if idx < len(pattern_instant_dists):
+                                for tk, st in pat_dist.items():
+                                    if tk in pattern_instant_dists[idx]:
+                                        pattern_instant_dists[idx][tk]["hits"] += st.get("hits", 0)
+                                        pattern_instant_dists[idx][tk]["points"] += st.get("points", 0)
                     for i, n in enumerate(per_log_result["pattern_matches"]):
                         pattern_matches[i] += n
                     for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
@@ -1669,7 +1722,7 @@ class LiveAnalyzer:
                 k = [0, 1] if (use_tenpai or item_variants[idx][2]) else [0, 1, 2, 3]
                 for c in k:
                     prob[c] = (dist.get(c, 0) / max(1, pattern_matches[idx]) * 100) if pattern_matches[idx] > 0 else 0
-            pattern_results.append({
+            pr_entry = {
                 'pattern': p,
                 'pattern_str': '-'.join(p),
                 'target': t,
@@ -1679,7 +1732,22 @@ class LiveAnalyzer:
                 'is_combo': item_variants[idx][2],
                 'multi_target': len(mt) > 1,
                 'target_tiles': [_target_key(x[0], x[1]) for x in mt] if len(mt) > 1 else None,
-            })
+            }
+            if pattern_instant_dists and idx < len(pattern_instant_dists) and len(mt) > 1:
+                n_idx = max(1, pattern_matches[idx])
+                multi_instant_stats_idx = {}
+                for tk, st in pattern_instant_dists[idx].items():
+                    hits = st["hits"]
+                    rate = hits / n_idx if n_idx > 0 else 0.0
+                    p_avg = st["points"] / hits if hits > 0 else 0.0
+                    multi_instant_stats_idx[tk] = {
+                        "hits": hits,
+                        "rate": rate,
+                        "point_avg": p_avg,
+                        "intensity": rate * p_avg,
+                    }
+                pr_entry["multi_instant_stats"] = multi_instant_stats_idx
+            pattern_results.append(pr_entry)
 
         n = max(1, total_matches)
         instant_deal_in_rate = (deal_in_hits_total / n) if total_matches > 0 else 0.0
@@ -2206,14 +2274,20 @@ class LiveAnalyzer:
                                         matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
                                         if not matched_variant:
                                             continue
-                                        if prior_discard_exclusion and turn_range:
-                                            first_turn_in_range = in_range_for_cell[0][1].turn
-                                            prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                        if prior_discard_exclusion:
                                             excl_str = matched_variant.get("prior_discard_exclusion")
                                             if excl_str:
                                                 forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
-                                                if any((d.tile // 4) in forbidden for d in prior_discards):
-                                                    continue
+                                                start_idx = matched_variant.get("matched_start_index")
+                                                if start_idx is not None:
+                                                    prior_tiles = full_discards_up_to_now[:start_idx]
+                                                    if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                                        continue
+                                                elif turn_range:
+                                                    first_turn_in_range = in_range_for_cell[0][1].turn
+                                                    prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                                    if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                        continue
                                         if dora_constraint == "dora_unrelated" and dora_str:
                                             pattern_suit = None
                                             for elem in matched_variant["discard"]:
@@ -2650,13 +2724,19 @@ class LiveAnalyzer:
                                         if deal_in_filter == "furiten" and (instant_eval.get("deal_in_hit") or str(instant_eval.get("furiten_state", "none")) == "none"):
                                             continue
 
-                                    if prior_discard_exclusion and turn_range:
-                                        prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                    if prior_discard_exclusion:
                                         excl_str = matched_variant.get("prior_discard_exclusion")
                                         if excl_str:
                                             forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
-                                            if any((d.tile // 4) in forbidden for d in prior_discards):
-                                                continue
+                                            start_idx = matched_variant.get("matched_start_index")
+                                            if start_idx is not None:
+                                                prior_tiles = full_discards_up_to_now[:start_idx]
+                                                if any(MjlogParser.string_to_tile(t[0]) // 4 in forbidden for t in prior_tiles):
+                                                    continue
+                                            elif turn_range:
+                                                prior_discards = [d for d in player_state.discards if d.turn < in_range[0][1].turn]
+                                                if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                    continue
 
                                     if dora_constraint == "dora_unrelated" and dora_str:
                                         pattern_suit = None
