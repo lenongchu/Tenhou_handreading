@@ -1006,15 +1006,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         if round_instant_analyzer is None and round_payload:
                             try:
                                 rp_data, rp_events = round_payload
+                                norm_oya = params.get("instant_normalize_oya_ron_to_ko", False)
                                 round_instant_analyzer = RoundInstantDealInAnalyzer(
                                     rp_data,
                                     rp_events,
                                     player_state.round_num,
                                     player_state.oya,
-                                    normalize_oya_ron_to_ko=analysis_params.get("instant_normalize_oya_ron_to_ko", False),
+                                    normalize_oya_ron_to_ko=norm_oya,
                                 )
-                            except Exception as e:
-                                logger.debug(f"即时铳率引擎初始化失败: {e}")
+                            except Exception:
+                                logger.exception("即时铳率引擎初始化失败（本局跳过）")
                                 round_instant_analyzer = None
                         excluded_this_match_by_hypothetical_furiten = False
                         if round_instant_analyzer:
@@ -1745,7 +1746,11 @@ class LiveAnalyzer:
             for s in sample_pool[:check_n]:
                 idx = s.get("matched_pattern_idx", 0)
                 qp, tt = items[idx]
-                ok, err = verify_sample_consistency(s, qp, tt, visible_constraints)
+                ok, err = verify_sample_consistency(
+                    s, qp, tt, visible_constraints,
+                    prior_discard_exclusion=prior_discard_exclusion,
+                    call_area_constraints=call_area_constraints,
+                )
                 if not ok:
                     fail_count += 1
                     logger.warning(f"样本一致性校验失败[{s.get('log_id','')}]: {err} | actual={s.get('actual_pattern', [])}")
@@ -1945,6 +1950,8 @@ class LiveAnalyzer:
             return "".join(sorted(tiles)) if is_combo else tiles[0]
 
         use_tenpai = (analysis_target == "tenpai")
+        # 是否为「即时铳率」分析模式；用于 _should_run_memory_maintenance 区分内存维护策略（即时铳率下不必每批都做 GC）
+        use_deal_in_instant = (analysis_target == "deal_in_instant")
         keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
         merge_keys_f = [k for k in merge_keys if k in keys] or keys[:2]
 
@@ -2607,15 +2614,16 @@ class LiveAnalyzer:
                                         if round_instant_analyzer is None and round_payload:
                                             try:
                                                 rp_data, rp_events = round_payload
+                                                norm_oya = False  # 离线样本扫描未传该选项，使用默认
                                                 round_instant_analyzer = RoundInstantDealInAnalyzer(
                                                     rp_data,
                                                     rp_events,
                                                     player_state.round_num,
                                                     player_state.oya,
-                                                    normalize_oya_ron_to_ko=analysis_params.get("instant_normalize_oya_ron_to_ko", False),
+                                                    normalize_oya_ron_to_ko=norm_oya,
                                                 )
-                                            except:
-                                                pass
+                                            except Exception:
+                                                logger.exception("即时铳率引擎初始化失败（样本扫描本局跳过）")
 
                                         if round_instant_analyzer:
                                             if isinstance(mapped_target, list):
@@ -2954,6 +2962,7 @@ def verify_sample_consistency(
             return (True, None)
         return (False, "重新匹配失败：actual_pattern 无法匹配任一等价变体")
     except Exception as e:
+        logger.exception("样本一致性校验异常")
         return (False, str(e))
 
 

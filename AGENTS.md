@@ -294,6 +294,20 @@
 - **等价变换**：假想振听牌与目标牌使用同一套等价：数牌/赤五按**当前变体的 pattern suit**（从 `matched_variant["discard"]` 取首个数牌花色）变换，即在该变体下检查「同数字、同变体花色」的牌是否也会放铳；字牌仍用 `mapping`。实现见 `_get_variant_pattern_suit` 与 `_get_hypothetical_furiten_deal_in_tiles`。
 - **结果展示**：当 `excluded_due_to_hypothetical_furiten > 0` 时，显示「因假想振听牌被排除的案列数」；若输入了多张假想振听牌（如 1p,2p），则同时按牌展示每张导致的排除数 `excluded_due_to_hypothetical_furiten_by_tile`（如「1p: 20 例、2p: 29 例」）。
 
+### 平均铳点口径选项
+
+- **不考虑里宝（平均铳点仅按理论点）**  
+  - 铳率分析页复选框，默认勾选。  
+  - 勾选时：平均铳点 = 可铳样本的**理论点**（仅表宝牌，不含里宝）求平均。  
+  - 不勾选时：预留「考虑里宝」逻辑（若已实现里宝随机模拟则用其求平均）；当前实现仍按理论点。  
+  - 参数：`instant_use_theory_point_only`；结果中为 True 时界面显示「平均铳点（仅理论点）」。
+
+- **亲家和牌以自家计算**  
+  - 铳率分析页复选框，默认不勾选。  
+  - 勾选时：亲家荣和时的铳点按**子家点**换算（库返回的放铳者支付额折半），统一统计口径，减少亲家样本带来的点数偏高偏差。  
+  - 实现：`RoundInstantDealInAnalyzer(normalize_oya_ron_to_ko=True)`；`_calculate_ron_point` 中若和牌者为亲家（`snapshot.player_id == self.oya`）则 `point = (point + 1) // 2`。  
+  - 参数：`instant_normalize_oya_ron_to_ko`；结果中为 True 时界面在平均铳点后追加「（亲家已按子家换算）」提示。
+
 ### 约束与限制
 
 - 支持主分析页全部约束：宝牌、立直、副露、南三南四、副露区域、场上可见枚数。

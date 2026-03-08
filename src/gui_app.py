@@ -2677,10 +2677,15 @@ class MainWindow(QMainWindow):
         self.instant_use_theory_point_only_check = QCheckBox("不考虑里宝（平均铳点仅按理论点）")
         self.instant_use_theory_point_only_check.setChecked(True)
         self.instant_use_theory_point_only_check.setToolTip(
-            "勾选时：平均铳点 = 可铳样本的理论点（仅表宝牌）求平均。不勾选时：可考虑里宝（若已实现里宝随机模拟则用其求平均）。"
+            "勾选时：平均铳点 = 可铳样本的理论点（仅表宝牌）求平均。不勾选时：可考虑里宝（若已实现里宝随机模拟则用其求平均）。\n"
+            "当前版本：勾选与不勾选效果相同（尚未实现里宝模拟，均按理论点）。"
         )
         row2.addWidget(self.instant_use_theory_point_only_check)
-        self.instant_normalize_oya_ron_to_ko_check = QCheckBox("亲家和牌以自家计算")
+        self.instant_use_theory_point_only_hint = QLabel("（当前效果相同）")
+        self.instant_use_theory_point_only_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self.instant_use_theory_point_only_hint.setToolTip("里宝随机模拟尚未实现，故勾选与不勾选均为理论点求平均。")
+        row2.addWidget(self.instant_use_theory_point_only_hint)
+        self.instant_normalize_oya_ron_to_ko_check = QCheckBox("亲家和牌以子家计算")
         self.instant_normalize_oya_ron_to_ko_check.setChecked(False)
         self.instant_normalize_oya_ron_to_ko_check.setToolTip(
             "勾选时：亲家荣和时的铳点按子家换算（折半），统一统计口径，减少亲家样本带来的偏差。"
