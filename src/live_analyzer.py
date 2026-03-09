@@ -577,7 +577,6 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
-                    "visible_tiles": player_state.visible_tiles,
                     "dora_indicators": player_state.dora_indicators,
                 }
 
@@ -598,8 +597,10 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                             discards_precomputed[idx] for idx, _ in in_range_for_cell
                         ]
                         riichi_flags_for_cell = [discard_riichi_flags[idx] for idx, _ in in_range_for_cell]
+                        visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
                         honor_ctx = {
                             **honor_ctx_base,
+                            "visible_tiles": visible_with_own,
                             "current_discard_turn": discard_turn,
                             "discard_riichi_flags": riichi_flags_for_cell,
                         }
@@ -920,21 +921,25 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 if not in_range:
                     continue
 
-                discards_precomputed = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for _, d in in_range]
+                all_discards_precomputed = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards]
+                all_riichi_flags = [getattr(d, "is_riichi_declaration", False) for d in player_state.discards]
                 honor_ctx_base = {
                     "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                     "calls": getattr(player_state, "calls", []),
-                    "visible_tiles": player_state.visible_tiles,
                     "dora_indicators": player_state.dora_indicators,
                 }
-                discard_riichi_flags = [getattr(in_range[i][1], "is_riichi_declaration", False) for i in range(len(in_range))]
 
                 for j, (orig_i, discard) in enumerate(in_range):
-                    full_discards_up_to_now = discards_precomputed[: j + 1]
-
-                    honor_ctx = {**honor_ctx_base, "current_discard_turn": discard.turn, "discard_riichi_flags": discard_riichi_flags[: j + 1]}
+                    full_discards_up_to_now = all_discards_precomputed[: orig_i + 1]
+                    visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                    honor_ctx = {
+                        **honor_ctx_base,
+                        "visible_tiles": visible_with_own,
+                        "current_discard_turn": discard.turn,
+                        "discard_riichi_flags": all_riichi_flags[: orig_i + 1],
+                    }
                     matched_variant = None
                     matched_idx = -1
                     for idx, (vars_p, _, _) in enumerate(item_variants):
@@ -1220,7 +1225,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     hand_discard_strings = None
                     if len(matched_states) < worker_matched_states_cap or len(sample_pool) < worker_sample_pool_cap:
                         hand_discard_strings = _format_actual_pattern(
-                            full_discards_up_to_now, discard_riichi_flags[: j + 1]
+                            full_discards_up_to_now, all_riichi_flags[: orig_i + 1]
                         )
 
                     if len(matched_states) < worker_matched_states_cap:
@@ -2351,7 +2356,6 @@ class LiveAnalyzer:
                                     "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                     "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                     "calls": getattr(player_state, "calls", []),
-                                    "visible_tiles": player_state.visible_tiles,
                                     "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
                                 }
 
@@ -2372,8 +2376,10 @@ class LiveAnalyzer:
                                             discards_precomputed[idx] for idx, _ in in_range_for_cell
                                         ]
                                         riichi_flags_for_cell = [discard_riichi_flags[idx] for idx, _ in in_range_for_cell]
+                                        visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
                                         honor_ctx = {
                                             **honor_ctx_base,
+                                            "visible_tiles": visible_with_own,
                                             "current_discard_turn": discard_turn,
                                             "discard_riichi_flags": riichi_flags_for_cell,
                                         }
@@ -2801,7 +2807,6 @@ class LiveAnalyzer:
                                 "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
-                                "visible_tiles": player_state.visible_tiles,
                                 "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
                             }
 
@@ -2811,9 +2816,11 @@ class LiveAnalyzer:
                                 full_discards_up_to_now = all_discards_precomputed[:orig_i + 1]
                                 current_riichi_flags = all_riichi_flags[:orig_i + 1]
                                 hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
+                                visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
 
                                 honor_ctx = {
                                     **honor_ctx_base,
+                                    "visible_tiles": visible_with_own,
                                     "current_discard_turn": discard.turn,
                                     "discard_riichi_flags": current_riichi_flags,
                                 }
@@ -3094,6 +3101,19 @@ class LiveAnalyzer:
         gc.collect()
         _trim_process_memory()
         return samples
+
+
+def _visible_tiles_with_own_discards(visible_tiles, full_discards_up_to_now):
+    """合并分析对象的舍牌到 visible_tiles，供 ap 安牌判定使用。tenhou6 的 visible_tiles 仅含其他玩家可见，不含本家舍牌。"""
+    merged = Counter(dict(visible_tiles or {}))
+    for tile_str, _ in (full_discards_up_to_now or []):
+        try:
+            base = MjlogParser.string_to_tile(tile_str)
+            tile_code = base * 4
+            merged[tile_code] = merged.get(tile_code, 0) + 1
+        except (ValueError, TypeError):
+            pass
+    return merged
 
 
 def _visible_count(visible_tiles: dict, tile_str: str) -> int:
