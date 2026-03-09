@@ -1280,7 +1280,7 @@ class GridQueryThread(QThread):
                       if k in ("dora_constraint", "dora_position_spec", "riichi_constraint", "call_constraint",
                                "call_area_constraints", "visible_constraints", "sample_limit",
                                "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
-                               "prior_discard_exclusion", "max_workers")}
+                               "prior_discard_exclusion", "prior_discard_required", "max_workers", "gc_interval_batches")}
 
             def progress_fn(c, t):
                 if t > 0:
@@ -1388,16 +1388,22 @@ class MatrixDisplayDialog(QDialog):
         header_col = self._header_col
         header_row = self._header_row
         rows = []
-        rows.append("巡目范围\t" + "\t".join(header_col))
+        header_two = []
+        for h in header_col:
+            header_two.append(h)
+            header_two.append(f"{h}(n)")
+        rows.append("巡目范围\t" + "\t".join(header_two))
         for tr_idx, tr_label in enumerate(header_row):
             cells = [tr_label]
             for pat_idx in range(len(header_col)):
                 v = tbl.get((tr_idx, pat_idx), "")
                 n = self._table_counts.get((tr_idx, pat_idx))
                 if isinstance(v, (int, float)) and n is not None:
-                    cells.append(f"{v} (n={n})")
+                    cells.append(str(v))
+                    cells.append(str(n))
                 else:
                     cells.append(str(v) if v != "" else "")
+                    cells.append(str(n) if n is not None else "")
             rows.append("\t".join(cells))
         self._preview.setPlainText("\n".join(rows))
 
@@ -1409,16 +1415,22 @@ class MatrixDisplayDialog(QDialog):
         header_col = self._header_col
         header_row = self._header_row
         rows = []
-        rows.append("巡目范围\t" + "\t".join(header_col))
+        header_two = []
+        for h in header_col:
+            header_two.append(h)
+            header_two.append(f"{h}(n)")
+        rows.append("巡目范围\t" + "\t".join(header_two))
         for tr_idx, tr_label in enumerate(header_row):
             cells = [tr_label]
             for pat_idx in range(len(header_col)):
                 v = tbl.get((tr_idx, pat_idx), "")
                 n = self._table_counts.get((tr_idx, pat_idx))
                 if isinstance(v, (int, float)) and n is not None:
-                    cells.append(f"{v} (n={n})")
+                    cells.append(str(v))
+                    cells.append(str(n))
                 else:
                     cells.append(str(v) if v != "" else "")
+                    cells.append(str(n) if n is not None else "")
             rows.append("\t".join(cells))
         QApplication.clipboard().setText("\n".join(rows))
         QMessageBox.information(self, "已复制", "表格已复制到剪贴板（含每格样本数），可粘贴到 Excel 中绘制折线图。")
@@ -1453,7 +1465,7 @@ class BatchChartThread(QThread):
                               if k in ("dora_constraint", "dora_position_spec", "riichi_constraint", "call_constraint",
                                        "call_area_constraints", "visible_constraints", "sample_limit",
                                        "total_logs_hint", "analysis_batch_size", "exclude_south4", "exclude_south3",
-                                       "prior_discard_exclusion", "max_workers", "gc_interval_batches")}
+                                       "prior_discard_exclusion", "prior_discard_required", "max_workers", "gc_interval_batches")}
             self.progress.emit(f"单次扫描分析 {len(self.patterns)} 模式 × {len(self.turn_ranges)} 巡目...")
 
             def progress_fn(c, t):
@@ -4713,16 +4725,22 @@ class MainWindow(QMainWindow):
                 for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
                     _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
                 _counts = result.get("table_counts", {})
-                _rows = ["巡目范围\t" + "\t".join(header_col)]
+                header_two = []
+                for h in header_col:
+                    header_two.append(h)
+                    header_two.append(f"{h}(n)")
+                _rows = ["巡目范围\t" + "\t".join(header_two)]
                 for tr_idx, lbl in enumerate(header_row):
                     _cells = [lbl]
                     for pat_idx in range(len(header_col)):
                         v = _tbl.get((tr_idx, pat_idx), "")
                         n = _counts.get((tr_idx, pat_idx))
                         if n is not None:
-                            _cells.append(f"{v} (n={n})" if v != "" and v is not None else f"(n={n})")
+                            _cells.append(str(v) if v != "" and v is not None else "")
+                            _cells.append(str(n))
                         else:
                             _cells.append(str(v) if v != "" else "")
+                            _cells.append("")
                     _rows.append("\t".join(_cells))
                 self._excel_clipboard_text = "\n".join(_rows)
                 self.copy_excel_btn.setEnabled(True)

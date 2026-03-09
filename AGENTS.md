@@ -363,6 +363,7 @@
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
 - **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径
 - **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）。铳率分析页支持**多条舍牌模式**（可添加多行“模式 + 目标牌”），满足任一即计入，与主分析页一致。
+- **矩阵分析与主分析同步**：主界面矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）均调用 `analyze_discard_pattern_grid`。新增主分析约束或参数时，必须同步更新两处传给 grid 的 shared/shared_filtered 白名单，确保 `prior_discard_exclusion`、`prior_discard_required`、`gc_interval_batches` 等与主分析一致。**性能优化也需同步**：若主分析新增 `BackgroundLogFetcher`、`POOL_RESTART_EVERY_BATCHES`、`_clamp_analysis_batch_size` 等优化，需在 `live_analyzer.analyze_discard_pattern_grid` 中同步实现。参考：`gui_app.GridQueryThread.run`、`gui_app.BatchChartThread.run`、`live_analyzer.analyze_discard_pattern`。
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
 - **本手册维护**：新增重要目录/脚本/模块时，同步更新本文件；`docs/项目文件夹结构说明.md` 保持为轻量索引并指向本文件
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处

@@ -634,16 +634,16 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                             prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
                             if prior_req_variants:
                                 start_idx = matched_variant.get("matched_start_index")
-                                if start_idx is not None:
+                                if start_idx is not None and start_idx > 0:
                                     prior_tiles = full_discards_up_to_now[:start_idx]
-                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                        continue
                                 elif turn_range:
                                     first_turn_in_range = in_range_for_cell[0][1].turn
                                     prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
-                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                        continue
                                 else:
+                                    prior_tiles = []
+                                if not prior_tiles:
+                                    continue
+                                if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
                                     continue
                         if dora_constraint == "dora_unrelated" and dora_str:
                             pattern_suit = None
@@ -976,15 +976,15 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
                         if prior_req_variants:
                             start_idx = matched_variant.get("matched_start_index")
-                            if start_idx is not None:
+                            if start_idx is not None and start_idx > 0:
                                 prior_tiles = full_discards_up_to_now[:start_idx]
-                                if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                    continue
                             elif turn_range:
                                 prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < in_range[0][1].turn]
-                                if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                    continue
                             else:
+                                prior_tiles = []
+                            if not prior_tiles:
+                                continue
+                            if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
                                 continue
                     if dora_constraint == "dora_unrelated" and dora_str:
                         pattern_suit = None
@@ -2220,358 +2220,348 @@ class LiveAnalyzer:
         }
 
         conn = _connect_db_memory_efficient(self.db_path)
-        cur = conn.cursor()
         _ensure_log_json_column(conn)
-        last_id = None
         processed = 0
         maintenance_batch_index = 0
 
-        while True:
-            if should_cancel and should_cancel():
-                logger.info("grid analysis cancelled")
-                break
-            if last_id is None:
-                cur.execute(
-                    """SELECT id, COALESCE(log_json, log) as content FROM logs
-                       WHERE (log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != '')
-                       ORDER BY id DESC LIMIT ?""",
-                    (batch_size,),
-                )
-            else:
-                cur.execute(
-                    """SELECT id, COALESCE(log_json, log) as content FROM logs
-                       WHERE ((log_json IS NOT NULL AND log_json != '') OR (log IS NOT NULL AND log != ''))
-                         AND id < ? ORDER BY id DESC LIMIT ?""",
-                    (last_id, batch_size),
-                )
-            logs = cur.fetchall()
-            if not logs:
-                break
+        # 后台预取，掩盖数据库 I/O 延迟（与主分析一致）
+        fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
 
-            if use_parallel:
-                task_iter = ((log_id, log_content, grid_params) for log_id, log_content in logs)
-                with ProcessPoolExecutor(max_workers=workers) as pool:
-                    for per_log_result in _iter_pool_results_bounded(
-                        pool,
-                        _process_one_log_grid,
-                        task_iter,
-                        max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
-                    ):
+        try:
+            while True:
+                if should_cancel and should_cancel():
+                    logger.info("grid analysis cancelled")
+                    break
+                logs = fetcher.next_batch()
+                if not logs:
+                    break
+
+                if use_parallel:
+                    task_iter = ((log_id, log_content, grid_params) for log_id, log_content in logs)
+                    with ProcessPoolExecutor(max_workers=workers) as pool:
+                        for per_log_result in _iter_pool_results_bounded(
+                            pool,
+                            _process_one_log_grid,
+                            task_iter,
+                            max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
+                        ):
+                            if should_cancel and should_cancel():
+                                fetcher.stop()
+                                conn.close()
+                                gc.collect()
+                                _trim_process_memory()
+                                return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
+                            for (tr_idx, pat_idx), delta in per_log_result.items():
+                                k = (tr_idx, pat_idx)
+                                for count, n in delta.items():
+                                    grid_dist[k][count] = grid_dist[k].get(count, 0) + n
+                            processed += 1
+                            if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                progress_callback(processed, total_logs)
+                            if sample_limit and processed >= sample_limit:
+                                break
+                else:
+                    call_area_constraint_sets = grid_call_area_sets
+                    for log_id, log_content in logs:
                         if should_cancel and should_cancel():
+                            fetcher.stop()
                             conn.close()
                             gc.collect()
                             _trim_process_memory()
                             return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
-                        for (tr_idx, pat_idx), delta in per_log_result.items():
-                            k = (tr_idx, pat_idx)
-                            for count, n in delta.items():
-                                grid_dist[k][count] = grid_dist[k].get(count, 0) + n
-                        processed += 1
-                        if progress_callback and (processed <= 10 or processed % 10 == 0):
-                            progress_callback(processed, total_logs)
-                        if sample_limit and processed >= sample_limit:
-                            break
-            else:
-                call_area_constraint_sets = grid_call_area_sets
-                for log_id, log_content in logs:
-                    if should_cancel and should_cancel():
-                        conn.close()
-                        gc.collect()
-                        _trim_process_memory()
-                        return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
-                    try:
-                        raw = _get_raw_content(log_content)
-                        if riichi_any and _is_tenhou6_json(raw):
-                            if "riichi" not in raw and "reach" not in raw:
-                                processed += 1
-                                if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                    progress_callback(processed, total_logs)
-                                continue
-                        if consumed_search_list and _is_tenhou6_json(raw):
-                            if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
-                                processed += 1
-                                if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                    progress_callback(processed, total_logs)
-                                continue
-                        game_states = parse_log_to_game_states(raw)
-                        round_size = 4
+                        try:
+                            raw = _get_raw_content(log_content)
+                            if riichi_any and _is_tenhou6_json(raw):
+                                if "riichi" not in raw and "reach" not in raw:
+                                    processed += 1
+                                    if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                        progress_callback(processed, total_logs)
+                                    continue
+                            if consumed_search_list and _is_tenhou6_json(raw):
+                                if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
+                                    processed += 1
+                                    if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                        progress_callback(processed, total_logs)
+                                    continue
+                            game_states = parse_log_to_game_states(raw)
+                            round_size = 4
 
-                        for round_start in range(0, len(game_states), round_size):
-                            round_players = game_states[round_start:round_start + round_size]
-                            if len(round_players) < round_size:
-                                break
-                            rn = getattr(round_players[0], "round_num", 0)
-                            if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
-                                continue
-                            oya = getattr(round_players[0], "oya", 0)
-                            dora_str = None
-                            if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
-                                dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                                if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
+                            for round_start in range(0, len(game_states), round_size):
+                                round_players = game_states[round_start:round_start + round_size]
+                                if len(round_players) < round_size:
+                                    break
+                                rn = getattr(round_players[0], "round_num", 0)
+                                if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
                                     continue
-                            if consumed_search_list:
-                                if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
-                                    continue
-                            if call_constraint or call_area_constraints or call_area_constraint_sets:
-                                if not round_could_satisfy_call_constraints(
-                                    round_players, call_constraint,
-                                    None if call_area_constraint_sets else call_area_constraints,
-                                    oya, call_area_constraint_sets=call_area_constraint_sets
-                                ):
-                                    continue
-                            if riichi_any:
-                                if not any(
-                                    any(getattr(d, "is_riichi_declaration", False) for d in p.discards)
-                                    for p in round_players
-                                ):
-                                    continue
-
-                            for player_state in round_players:
-                                if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
-                                    continue
-                                if call_area_constraint_sets:
-                                    if not player_could_satisfy_any_call_area_constraints(player_state, oya, call_area_constraint_sets):
+                                oya = getattr(round_players[0], "oya", 0)
+                                dora_str = None
+                                if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
+                                    dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
+                                    if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
                                         continue
-                                elif call_area_constraints and not player_could_satisfy_call_area_constraints(
-                                    player_state, oya, call_area_constraints
-                                ):
-                                    continue
+                                if consumed_search_list:
+                                    if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
+                                        continue
+                                if call_constraint or call_area_constraints or call_area_constraint_sets:
+                                    if not round_could_satisfy_call_constraints(
+                                        round_players, call_constraint,
+                                        None if call_area_constraint_sets else call_area_constraints,
+                                        oya, call_area_constraint_sets=call_area_constraint_sets
+                                    ):
+                                        continue
+                                if riichi_any:
+                                    if not any(
+                                        any(getattr(d, "is_riichi_declaration", False) for d in p.discards)
+                                        for p in round_players
+                                    ):
+                                        continue
 
-                                all_discards = [
-                                    (i, d) for i, d in enumerate(player_state.discards)
-                                    if hasattr(d, "turn") and hasattr(d, "tile")
-                                ]
-                                if not all_discards:
-                                    continue
-                                discards_precomputed = [
-                                    (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                    for _, d in all_discards
-                                ]
-                                discard_riichi_flags = [
-                                    getattr(all_discards[i][1], "is_riichi_declaration", False)
-                                    for i in range(len(all_discards))
-                                ]
-                                honor_ctx_base = {
-                                    "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                    "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
-                                    "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
-                                    "calls": getattr(player_state, "calls", []),
-                                    "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
-                                }
-
-                                for j, (orig_i, discard) in enumerate(all_discards):
-                                    discard_turn = discard.turn
-
-                                    for tr_idx, pat_idx, turn_range, vars_p, multi_t, is_combo in grid_meta:
-                                        min_turn, max_turn = turn_range
-                                        if not (min_turn <= discard_turn <= max_turn):
+                                for player_state in round_players:
+                                    if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
+                                        continue
+                                    if call_area_constraint_sets:
+                                        if not player_could_satisfy_any_call_area_constraints(player_state, oya, call_area_constraint_sets):
                                             continue
-                                        in_range_for_cell = [
-                                            (idx, dd) for idx, dd in all_discards
-                                            if min_turn <= dd.turn <= max_turn and dd.turn <= discard_turn
-                                        ]
-                                        if not in_range_for_cell or in_range_for_cell[-1][1] != discard:
-                                            continue
-                                        full_discards_up_to_now = [
-                                            discards_precomputed[idx] for idx, _ in in_range_for_cell
-                                        ]
-                                        riichi_flags_for_cell = [discard_riichi_flags[idx] for idx, _ in in_range_for_cell]
-                                        visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
-                                        honor_ctx = {
-                                            **honor_ctx_base,
-                                            "visible_tiles": visible_with_own,
-                                            "current_discard_turn": discard_turn,
-                                            "discard_riichi_flags": riichi_flags_for_cell,
-                                        }
-                                        pattern, target = patterns[pat_idx]
-                                        cs = get_consumed_search_patterns(pattern)
-                                        if cs:
-                                            if not round_has_matching_consumed(round_players, cs):
+                                    elif call_area_constraints and not player_could_satisfy_call_area_constraints(
+                                        player_state, oya, call_area_constraints
+                                    ):
+                                        continue
+
+                                    all_discards = [
+                                        (i, d) for i, d in enumerate(player_state.discards)
+                                        if hasattr(d, "turn") and hasattr(d, "tile")
+                                    ]
+                                    if not all_discards:
+                                        continue
+                                    discards_precomputed = [
+                                        (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
+                                        for _, d in all_discards
+                                    ]
+                                    discard_riichi_flags = [
+                                        getattr(all_discards[i][1], "is_riichi_declaration", False)
+                                        for i in range(len(all_discards))
+                                    ]
+                                    honor_ctx_base = {
+                                        "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                        "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
+                                        "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
+                                        "calls": getattr(player_state, "calls", []),
+                                        "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
+                                    }
+
+                                    for j, (orig_i, discard) in enumerate(all_discards):
+                                        discard_turn = discard.turn
+
+                                        for tr_idx, pat_idx, turn_range, vars_p, multi_t, is_combo in grid_meta:
+                                            min_turn, max_turn = turn_range
+                                            if not (min_turn <= discard_turn <= max_turn):
                                                 continue
-                                            if not player_has_matching_consumed(player_state, cs):
+                                            in_range_for_cell = [
+                                                (idx, dd) for idx, dd in all_discards
+                                                if min_turn <= dd.turn <= max_turn and dd.turn <= discard_turn
+                                            ]
+                                            if not in_range_for_cell or in_range_for_cell[-1][1] != discard:
                                                 continue
-                                        matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
-                                        if not matched_variant:
-                                            continue
-                                        if prior_discard_exclusion:
-                                            excl_str = matched_variant.get("prior_discard_exclusion")
-                                            if excl_str:
-                                                forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
-                                                start_idx = matched_variant.get("matched_start_index")
-                                                if start_idx is not None:
-                                                    prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
-                                                    # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
-                                                    if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
-                                                        continue
-                                                elif turn_range:
-                                                    first_turn_in_range = in_range_for_cell[0][1].turn
-                                                    prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
-                                                    # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
-                                                    if any((d.tile // 4) in forbidden for d in prior_discards):
-                                                        continue
-                                        if matched_variant.get("prior_discard_required"):
-                                            prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
-                                            if prior_req_variants:
-                                                start_idx = matched_variant.get("matched_start_index")
-                                                if start_idx is not None:
-                                                    prior_tiles = full_discards_up_to_now[:start_idx]
-                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                                        continue
-                                                elif turn_range:
-                                                    first_turn_in_range = in_range_for_cell[0][1].turn
-                                                    prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
-                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                                        continue
-                                                else:
+                                            # 与正常模式一致：使用从开局到当前舍牌的完整序列，否则会漏掉「模式前半在巡目外」的匹配
+                                            orig_i = in_range_for_cell[-1][0]
+                                            full_discards_up_to_now = discards_precomputed[: orig_i + 1]
+                                            riichi_flags_for_cell = discard_riichi_flags[: orig_i + 1]
+                                            visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                                            honor_ctx = {
+                                                **honor_ctx_base,
+                                                "visible_tiles": visible_with_own,
+                                                "current_discard_turn": discard_turn,
+                                                "discard_riichi_flags": riichi_flags_for_cell,
+                                            }
+                                            pattern, target = patterns[pat_idx]
+                                            cs = get_consumed_search_patterns(pattern)
+                                            if cs:
+                                                if not round_has_matching_consumed(round_players, cs):
                                                     continue
-                                        if dora_constraint == "dora_unrelated" and dora_str:
-                                            pattern_suit = None
-                                            for elem in matched_variant["discard"]:
-                                                t = elem[0] if isinstance(elem, tuple) else elem
-                                                if len(t) >= 2 and t[-1] in "mps":
-                                                    pattern_suit = t[-1]
-                                                    break
-                                            if pattern_suit and dora_str[-1] == pattern_suit:
+                                                if not player_has_matching_consumed(player_state, cs):
+                                                    continue
+                                            matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
+                                            if not matched_variant:
                                                 continue
-                                        if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
-                                            pos_to_tile = matched_variant.get("position_to_tile") or {}
-                                            skip_match = False
-                                            for pos in dora_position_spec:
-                                                tile_at_pos = pos_to_tile.get(pos)
-                                                if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
-                                                    skip_match = True
-                                                    break
-                                            if skip_match:
-                                                continue
-                                        if riichi_constraint and riichi_constraint != "any":
-                                            if riichi_constraint == "has_riichi" and not discard.riichi_happened:
-                                                continue
-                                            if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
-                                                continue
-                                        if call_constraint and call_constraint != "any":
-                                            if call_constraint == "has_call" and not discard.call_happened:
-                                                continue
-                                            if call_constraint == "no_call" and discard.call_happened:
-                                                continue
-                                        _ca = matched_variant.get("call_area_constraints") or call_area_constraints
-                                        if _ca:
-                                            if not player_satisfies_call_area_constraints(
-                                                player_state, round_players, player_state.oya, _ca,
-                                                current_discard_turn=discard.turn,
-                                            ):
-                                                continue
-                                        mapped_target = matched_variant["target"]
-                                        target_equiv = None
-                                        if not use_tenpai and not use_related_tile:
-                                            target_equiv = set()
-                                            if len(multi_t) == 1:
-                                                if is_combo:
-                                                    for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
-                                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                            if prior_discard_exclusion:
+                                                excl_str = matched_variant.get("prior_discard_exclusion")
+                                                if excl_str:
+                                                    forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
+                                                    start_idx = matched_variant.get("matched_start_index")
+                                                    if start_idx is not None:
+                                                        prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                                        # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                                        if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
+                                                            continue
+                                                    elif turn_range:
+                                                        first_turn_in_range = in_range_for_cell[0][1].turn
+                                                        prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                                        # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
+                                                        if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                            continue
+                                            if matched_variant.get("prior_discard_required"):
+                                                prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                                                if prior_req_variants:
+                                                    start_idx = matched_variant.get("matched_start_index")
+                                                    if start_idx is not None and start_idx > 0:
+                                                        prior_tiles = full_discards_up_to_now[:start_idx]
+                                                    elif turn_range:
+                                                        first_turn_in_range = in_range_for_cell[0][1].turn
+                                                        prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
+                                                    else:
+                                                        prior_tiles = []
+                                                    if not prior_tiles:
+                                                        continue
+                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
+                                                        continue
+                                            if dora_constraint == "dora_unrelated" and dora_str:
+                                                pattern_suit = None
+                                                for elem in matched_variant["discard"]:
+                                                    t = elem[0] if isinstance(elem, tuple) else elem
+                                                    if len(t) >= 2 and t[-1] in "mps":
+                                                        pattern_suit = t[-1]
+                                                        break
+                                                if pattern_suit and dora_str[-1] == pattern_suit:
+                                                    continue
+                                            if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                                pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                                skip_match = False
+                                                for pos in dora_position_spec:
+                                                    tile_at_pos = pos_to_tile.get(pos)
+                                                    if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                                        skip_match = True
+                                                        break
+                                                if skip_match:
+                                                    continue
+                                            if riichi_constraint and riichi_constraint != "any":
+                                                if riichi_constraint == "has_riichi" and not discard.riichi_happened:
+                                                    continue
+                                                if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
+                                                    continue
+                                            if call_constraint and call_constraint != "any":
+                                                if call_constraint == "has_call" and not discard.call_happened:
+                                                    continue
+                                                if call_constraint == "no_call" and discard.call_happened:
+                                                    continue
+                                            _ca = matched_variant.get("call_area_constraints") or call_area_constraints
+                                            if _ca:
+                                                if not player_satisfies_call_area_constraints(
+                                                    player_state, round_players, player_state.oya, _ca,
+                                                    current_discard_turn=discard.turn,
+                                                ):
+                                                    continue
+                                            mapped_target = matched_variant["target"]
+                                            target_equiv = None
+                                            if not use_tenpai and not use_related_tile:
+                                                target_equiv = set()
+                                                if len(multi_t) == 1:
+                                                    if is_combo:
+                                                        for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
+                                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                                    else:
+                                                        target_equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
                                                 else:
-                                                    target_equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
-                                            else:
+                                                    target_equiv = MjlogParser.get_count_equivalent_bases(
+                                                        MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                                                    )
+                                                    for tiles, ic in multi_t[1:]:
+                                                        for t in tiles:
+                                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                                if discard.tile // 4 in target_equiv:
+                                                    continue
+                                            elif use_related_tile:
                                                 target_equiv = MjlogParser.get_count_equivalent_bases(
                                                     MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
                                                 )
-                                                for tiles, ic in multi_t[1:]:
-                                                    for t in tiles:
-                                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
-                                            if discard.tile // 4 in target_equiv:
-                                                continue
-                                        elif use_related_tile:
-                                            target_equiv = MjlogParser.get_count_equivalent_bases(
-                                                MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
-                                            )
 
-                                        if orig_i < len(player_state.hand_tiles_history):
-                                            hand_at_turn = list(player_state.hand_tiles_history[orig_i])
-                                        else:
-                                            hand_at_turn = list(player_state.hand_tiles)
-                                        if use_tenpai:
-                                            target_count = 1 if is_tenpai(hand_at_turn) else 0
-                                        elif use_related_tile:
-                                            target_discard_idx = None
-                                            target_discard = None
-                                            for k in range(len(in_range_for_cell) - 1, -1, -1):
-                                                idx, dd = in_range_for_cell[k]
-                                                if dd.tile // 4 in target_equiv:
-                                                    target_discard_idx = idx
-                                                    target_discard = dd
-                                                    break
-                                            if target_discard_idx is not None and target_discard is not None:
-                                                if target_discard_idx < len(player_state.hand_tiles_history):
-                                                    hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
-                                                else:
-                                                    hand_at_target = list(player_state.hand_tiles)
-                                                num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
-                                                if num is not None and suit is not None:
-                                                    counts = hand_to_suit_counts(hand_at_target, suit)
-                                                    target_count = 1 if is_related_discard(num, counts) else 0
+                                            if orig_i < len(player_state.hand_tiles_history):
+                                                hand_at_turn = list(player_state.hand_tiles_history[orig_i])
+                                            else:
+                                                hand_at_turn = list(player_state.hand_tiles)
+                                            if use_tenpai:
+                                                target_count = 1 if is_tenpai(hand_at_turn) else 0
+                                            elif use_related_tile:
+                                                target_discard_idx = None
+                                                target_discard = None
+                                                for k in range(len(in_range_for_cell) - 1, -1, -1):
+                                                    idx, dd = in_range_for_cell[k]
+                                                    if dd.tile // 4 in target_equiv:
+                                                        target_discard_idx = idx
+                                                        target_discard = dd
+                                                        break
+                                                if target_discard_idx is not None and target_discard is not None:
+                                                    if target_discard_idx < len(player_state.hand_tiles_history):
+                                                        hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
+                                                    else:
+                                                        hand_at_target = list(player_state.hand_tiles)
+                                                    num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
+                                                    if num is not None and suit is not None:
+                                                        counts = hand_to_suit_counts(hand_at_target, suit)
+                                                        target_count = 1 if is_related_discard(num, counts) else 0
+                                                    else:
+                                                        target_count = 0
                                                 else:
                                                     target_count = 0
-                                            else:
-                                                target_count = 0
-                                        elif len(multi_t) > 1:
-                                            tk = _target_key(multi_t[0][0], multi_t[0][1])
-                                            mt_item = multi_t
-                                            if multi_t[0][1]:
-                                                target_codes = [MjlogParser.string_to_tile(t) for t in multi_t[0][0]]
+                                            elif len(multi_t) > 1:
+                                                tk = _target_key(multi_t[0][0], multi_t[0][1])
+                                                mt_item = multi_t
+                                                if multi_t[0][1]:
+                                                    target_codes = [MjlogParser.string_to_tile(t) for t in multi_t[0][0]]
+                                                    hand_bases = [t // 4 for t in hand_at_turn]
+                                                    target_count = 1 if all(
+                                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
+                                                        for c in target_codes
+                                                    ) else 0
+                                                else:
+                                                    equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(multi_t[0][0][0]))
+                                                    target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
+                                            elif is_combo:
+                                                target_codes = [MjlogParser.string_to_tile(t) for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target])]
                                                 hand_bases = [t // 4 for t in hand_at_turn]
                                                 target_count = 1 if all(
                                                     any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
                                                     for c in target_codes
                                                 ) else 0
                                             else:
-                                                equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(multi_t[0][0][0]))
+                                                equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
                                                 target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
-                                        elif is_combo:
-                                            target_codes = [MjlogParser.string_to_tile(t) for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target])]
-                                            hand_bases = [t // 4 for t in hand_at_turn]
-                                            target_count = 1 if all(
-                                                any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                                                for c in target_codes
-                                            ) else 0
-                                        else:
-                                            equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
-                                            target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
 
-                                        k = (tr_idx, pat_idx)
-                                        dist = grid_dist[k]
-                                        if target_count in dist:
-                                            dist[target_count] += 1
-                                        else:
-                                            dist[target_count] = 1
+                                            k = (tr_idx, pat_idx)
+                                            dist = grid_dist[k]
+                                            if target_count in dist:
+                                                dist[target_count] += 1
+                                            else:
+                                                dist[target_count] = 1
 
-                    except Exception as e:
-                        logger.error(f"解析对局 {log_id} 失败: {e}")
-                        continue
-                    processed += 1
-                    if progress_callback and (processed <= 10 or processed % 10 == 0):
-                        progress_callback(processed, total_logs)
-                    if sample_limit and processed >= sample_limit:
-                        break
+                        except Exception as e:
+                            logger.error(f"解析对局 {log_id} 失败: {e}")
+                            continue
+                        processed += 1
+                        if progress_callback and (processed <= 10 or processed % 10 == 0):
+                            progress_callback(processed, total_logs)
+                        if sample_limit and processed >= sample_limit:
+                            break
 
-            last_id = logs[-1][0]
-            del logs
-            maintenance_batch_index += 1
-            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
-                gc.collect()
-                try:
-                    conn.execute("PRAGMA shrink_memory")
-                except:
-                    pass
-                conn.close()
-                conn = _connect_db_memory_efficient(self.db_path)
-                cur = conn.cursor()
-                _ensure_log_json_column(conn)
-                _trim_process_memory()
-            if sample_limit and processed >= sample_limit:
-                break
+                del logs
+                maintenance_batch_index += 1
+                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                    gc.collect()
+                    try:
+                        conn.execute("PRAGMA shrink_memory")
+                    except Exception:
+                        pass
+                    conn.close()
+                    conn = _connect_db_memory_efficient(self.db_path)
+                    _ensure_log_json_column(conn)
+                    _trim_process_memory()
+                if sample_limit and processed >= sample_limit:
+                    break
 
-        conn.close()
-        gc.collect()
-        _trim_process_memory()
+        finally:
+            fetcher.stop()
+            conn.close()
+            gc.collect()
+            _trim_process_memory()
 
         # 按格计算合并概率、完整分布与样本数
         cell_combo = {(tr_idx, pat_idx): is_combo for tr_idx, pat_idx, _, _, _, is_combo in grid_meta}
@@ -2582,7 +2572,7 @@ class LiveAnalyzer:
             total_m = sum(dist.values())
             table_counts[(tr_idx, pat_idx)] = total_m
             is_combo_cell = cell_combo.get((tr_idx, pat_idx), False)
-            k_list = [0, 1] if (use_tenpai or is_combo_cell) else [0, 1, 2, 3]
+            k_list = [0, 1] if (use_tenpai or use_related_tile or is_combo_cell) else [0, 1, 2, 3]
             if total_m == 0:
                 prob = 0.0
                 table_dist[(tr_idx, pat_idx)] = {k: 0.0 for k in k_list}
@@ -2916,15 +2906,15 @@ class LiveAnalyzer:
                                     prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
                                     if prior_req_variants:
                                         start_idx = matched_variant.get("matched_start_index")
-                                        if start_idx is not None:
+                                        if start_idx is not None and start_idx > 0:
                                             prior_tiles = full_discards_up_to_now[:start_idx]
-                                            if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                                continue
                                         elif turn_range:
                                             prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < in_range[0][1].turn]
-                                            if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                                continue
                                         else:
+                                            prior_tiles = []
+                                        if not prior_tiles:
+                                            continue
+                                        if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
                                             continue
 
                                 if dora_constraint == "dora_unrelated" and dora_str:

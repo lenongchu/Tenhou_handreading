@@ -1412,13 +1412,17 @@ def match_discard_pattern_contained(
     检查 full_discards 中是否存在某段连续子序列匹配任一变体（用于「前段有打」）。
     需检查所有长度为 L 的连续子序列 full_discards[i:i+L]，而非仅后缀。
     否则单元素模式如 [37]mOR[37]s 会错误地只匹配「最后一张」而非「任一张」。
+    cd1/cd2 等拆搭占位符需在完整序列中查找搭子对，故传入 full_discards_for_cd 供 _discard_is_chaida 使用。
     """
+    ctx = dict(context) if context else {}
     for v in variants:
         L = len(v["discard"])
         if L == 0:
             return True
         for i in range(len(full_discards) - L + 1):
-            if match_discard_to_variant(full_discards[i : i + L], variants, context):
+            ctx["full_discards_for_cd"] = full_discards
+            ctx["slice_start_for_cd"] = i
+            if match_discard_to_variant(full_discards[i : i + L], variants, ctx):
                 return True
     return False
 
@@ -1545,23 +1549,32 @@ def _discard_is_chaida(
     d_idx: int,
     require_suit: Optional[str] = None,
     exclude_suit: Optional[str] = None,
+    search_list: Optional[List[Tuple[str, bool]]] = None,
+    check_idx_in_search: Optional[int] = None,
 ) -> bool:
     """
     检查 full_discards[d_idx] 是否为拆搭（与另一张手切构成搭子或对子）。
     require_suit: 必须为该花色（cdm/cdp/cds）
     exclude_suit: 不能为该花色（cd2 约束：拆搭花色≠目标牌花色）
+    search_list/check_idx_in_search: 前段有打时，在完整序列中查找搭子对（单元素切片无法找到另一张）
     """
-    if d_idx < 0 or d_idx >= len(full_discards):
+    if search_list is not None and check_idx_in_search is not None:
+        discards_to_search = search_list
+        idx_to_check = check_idx_in_search
+    else:
+        discards_to_search = full_discards
+        idx_to_check = d_idx
+    if idx_to_check < 0 or idx_to_check >= len(discards_to_search):
         return False
-    tile_str, is_tsumogiri = full_discards[d_idx]
+    tile_str, is_tsumogiri = discards_to_search[idx_to_check]
     if is_tsumogiri or not _is_number_tile(tile_str):
         return False
     if require_suit and tile_str[-1] != require_suit:
         return False
     if exclude_suit and tile_str[-1] == exclude_suit:
         return False
-    for i, (t2, ts2) in enumerate(full_discards):
-        if i == d_idx or ts2:
+    for i, (t2, ts2) in enumerate(discards_to_search):
+        if i == idx_to_check or ts2:
             continue
         if not _is_number_tile(t2):
             continue
@@ -1658,7 +1671,14 @@ def _match_pattern_at_end(
                         if isinstance(t, str) and len(t) >= 2 and t[-1] in "mps":
                             exclude_suit = t[-1]
                             break
-            if not _discard_is_chaida(full_discards, d_idx, require_suit, exclude_suit):
+            # 前段有打时，单元素切片无法找到搭子对，需在完整序列中查找
+            search_list = ctx.get("full_discards_for_cd")
+            slice_start = ctx.get("slice_start_for_cd", 0)
+            check_idx = (slice_start + d_idx) if search_list is not None else None
+            if not _discard_is_chaida(
+                full_discards, d_idx, require_suit, exclude_suit,
+                search_list=search_list, check_idx_in_search=check_idx,
+            ):
                 return False
             consumed_any_discard = True
             if out_position_to_tile is not None:
