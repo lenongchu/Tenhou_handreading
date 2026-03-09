@@ -1304,7 +1304,14 @@ class GridQueryThread(QThread):
             result["turn_ranges"] = self.turn_ranges
             result["analysis_target"] = self.analysis_target
             result["header_row"] = [f"{tmin}-{tmax}巡" for tmin, tmax in self.turn_ranges]
-            result["header_col"] = [f"{'-'.join(p)}→{t}" for p, t in self.patterns]
+            # 听牌/关联牌模式下目标为占位符 5z，表头显示为「听牌」「关联牌」
+            def _target_display(pat, tgt):
+                if self.analysis_target == "tenpai":
+                    return "听牌"
+                if self.analysis_target == "related_tile":
+                    return "关联牌"
+                return tgt
+            result["header_col"] = [f"{'-'.join(p)}→{_target_display(p, t)}" for p, t in self.patterns]
             self.finished.emit(True, result)
         except Exception as e:
             logger.exception("矩阵分析失败")
@@ -1323,19 +1330,25 @@ class MatrixDisplayDialog(QDialog):
         self._header_col = grid_result.get("header_col", [])
         self._analysis_target = grid_result.get("analysis_target", "target_count")
         self._use_tenpai = (self._analysis_target == "tenpai")
+        self._use_related_tile = (self._analysis_target == "related_tile")
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         use_tenpai = self._use_tenpai
-        labels = ["未听牌", "听牌"] if use_tenpai else ["0张", "1张", "2张", "3张"]
-        keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
+        use_related_tile = self._use_related_tile
+        if use_tenpai:
+            labels, keys = ["未听牌", "听牌"], [0, 1]
+        elif use_related_tile:
+            labels, keys = ["非关联", "关联"], [0, 1]
+        else:
+            labels, keys = ["0张", "1张", "2张", "3张"], [0, 1, 2, 3]
         cb_row = QHBoxLayout()
         cb_row.addWidget(QLabel("勾选展示（可多选合并）:"))
         self._checkboxes = []
         for k, lbl in zip(keys, labels):
             cb = QCheckBox(lbl)
-            cb.setChecked(k in (1, 2) if not use_tenpai else True)
+            cb.setChecked(k in (1, 2) if not (use_tenpai or use_related_tile) else True)
             cb.stateChanged.connect(self._update_preview)
             self._checkboxes.append((k, cb))
             cb_row.addWidget(cb)
@@ -1454,7 +1467,8 @@ class BatchChartThread(QThread):
                 return
             table = result.get("table", {})
             header_row = [f"{tmin}-{tmax}巡" for tmin, tmax in self.turn_ranges]
-            header_col = [f"{'-'.join(p)}→{t}" for p, t in self.patterns]
+            t_disp = "听牌" if self.analysis_target == "tenpai" else ("关联牌" if self.analysis_target == "related_tile" else None)
+            header_col = [f"{'-'.join(p)}→{t_disp or t}" for p, t in self.patterns]
             elapsed = result.get("elapsed_seconds", 0)
             self.finished.emit(True, (table, header_row, header_col, elapsed))
         except Exception as e:
@@ -1504,12 +1518,14 @@ class BatchChartDialog(QDialog):
         cg_layout = QVBoxLayout()
 
         dora_row = QHBoxLayout()
-        self.batch_dora_irrelevant = QRadioButton("宝牌无关")
+        self.batch_dora_any = QRadioButton("宝牌不问")
+        self.batch_dora_irrelevant = QRadioButton("宝牌无关目标牌")
         self.batch_dora_irrelevant.setChecked(True)
         self.batch_dora_specific = QRadioButton("宝牌为")
         self.batch_dora_input = QLineEdit()
         self.batch_dora_input.setPlaceholderText("例: 6s")
         self.batch_dora_input.setMaximumWidth(55)
+        dora_row.addWidget(self.batch_dora_any)
         dora_row.addWidget(self.batch_dora_irrelevant)
         dora_row.addWidget(self.batch_dora_specific)
         dora_row.addWidget(self.batch_dora_input)
@@ -1663,6 +1679,7 @@ class BatchChartDialog(QDialog):
     def _sync_constraints_from_main(self):
         """从主界面同步约束到本对话框"""
         mw = self.main_window
+        self.batch_dora_any.setChecked(getattr(mw, "dora_any_radio", None) and mw.dora_any_radio.isChecked())
         self.batch_dora_irrelevant.setChecked(mw.dora_irrelevant_radio.isChecked())
         self.batch_dora_specific.setChecked(mw.dora_specific_radio.isChecked())
         self.batch_dora_input.setText(mw.dora_tile_input.text())
@@ -1703,7 +1720,12 @@ class BatchChartDialog(QDialog):
             "gc_interval_batches": mw.gc_interval_batches_spin.value(),
         }
         if self.constraint_group.isChecked():
-            dora = "dora_unrelated" if self.batch_dora_irrelevant.isChecked() else (self.batch_dora_input.text().strip() or "any")
+            if self.batch_dora_any.isChecked():
+                dora = "any"
+            elif self.batch_dora_irrelevant.isChecked():
+                dora = "dora_unrelated"
+            else:
+                dora = self.batch_dora_input.text().strip() or "any"
             dora_pos = []  # Batch dialog has no dora_matches_position UI
             riichi = "any" if self.batch_riichi_any.isChecked() else ("has_riichi" if self.batch_riichi_has.isChecked() else "no_riichi")
             call = "any" if self.batch_call_any.isChecked() else ("has_call" if self.batch_call_has.isChecked() else "no_call")
@@ -1714,7 +1736,10 @@ class BatchChartDialog(QDialog):
             base.update(dora_constraint=dora, dora_position_spec=dora_pos, riichi_constraint=riichi, call_constraint=call,
                 call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
         else:
-            if mw.dora_irrelevant_radio.isChecked():
+            if getattr(mw, "dora_any_radio", None) and mw.dora_any_radio.isChecked():
+                dora = "any"
+                dora_pos = []
+            elif mw.dora_irrelevant_radio.isChecked():
                 dora = "dora_unrelated"
                 dora_pos = []
             elif getattr(mw, "dora_matches_position_radio", None) and mw.dora_matches_position_radio.isChecked():
@@ -2160,13 +2185,15 @@ class MainWindow(QMainWindow):
         dora_row = QHBoxLayout()
         dora_row.setSpacing(10)
         self.dora_group = QButtonGroup()
-        self.dora_irrelevant_radio = QRadioButton("宝牌无关")
+        self.dora_any_radio = QRadioButton("宝牌不问")
+        self.dora_group.addButton(self.dora_any_radio, 0)
+        self.dora_irrelevant_radio = QRadioButton("宝牌无关目标牌")
         self.dora_irrelevant_radio.setChecked(True)
-        self.dora_group.addButton(self.dora_irrelevant_radio, 0)
+        self.dora_group.addButton(self.dora_irrelevant_radio, 1)
         self.dora_specific_radio = QRadioButton("宝牌为")
-        self.dora_group.addButton(self.dora_specific_radio, 1)
+        self.dora_group.addButton(self.dora_specific_radio, 2)
         self.dora_matches_position_radio = QRadioButton("宝牌=模式第")
-        self.dora_group.addButton(self.dora_matches_position_radio, 2)
+        self.dora_group.addButton(self.dora_matches_position_radio, 3)
         self.dora_tile_input = QLineEdit()
         self.dora_tile_input.setPlaceholderText("例: 6s")
         self.dora_tile_input.setMinimumWidth(50)
@@ -2176,6 +2203,7 @@ class MainWindow(QMainWindow):
         self.dora_position_input.setMinimumWidth(50)
         self.dora_position_input.setMaximumWidth(70)
         self.dora_position_input.setToolTip("1-based，如 1 表示第1张，1,3 表示第1、3张必须为宝牌")
+        dora_row.addWidget(self.dora_any_radio)
         dora_row.addWidget(self.dora_irrelevant_radio)
         dora_row.addWidget(self.dora_specific_radio)
         dora_row.addWidget(self.dora_tile_input)
@@ -2303,11 +2331,13 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo = QComboBox()
         self.analysis_target_combo.addItem("目标牌存量", "target_count")
         self.analysis_target_combo.addItem("是否听牌", "tenpai")
+        self.analysis_target_combo.addItem("关联牌判断", "related_tile")
         self.analysis_target_combo.addItem("和铳率", "outcome")
         self.analysis_target_combo.setMinimumWidth(100)
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
+            "关联牌判断：判断模式最后一张舍牌是否为关联牌（与手牌搭子距离≤2）（无需输入目标牌）；"
             "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
@@ -2422,19 +2452,22 @@ class MainWindow(QMainWindow):
             self._pattern_row_widgets.remove(entry)
 
     def _on_analysis_target_changed(self):
-        """和铳率模式下隐藏目标牌输入（无需目标牌）"""
+        """和铳率/关联牌判断模式下隐藏目标牌输入（无需目标牌）"""
         if not hasattr(self, "analysis_target_combo"):
             return
-        is_outcome = (self.analysis_target_combo.currentData() or "") == "outcome"
+        data = self.analysis_target_combo.currentData() or ""
+        is_outcome = data == "outcome"
+        is_related_tile = data == "related_tile"
+        hide_target = is_outcome or is_related_tile
         for pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row in getattr(
             self, "_pattern_row_widgets", []
         ):
-            arrow_label.setVisible(not is_outcome)
-            target_edit.setVisible(not is_outcome)
-            target_help_btn.setVisible(not is_outcome)
-            if is_outcome:
+            arrow_label.setVisible(not hide_target)
+            target_edit.setVisible(not hide_target)
+            target_help_btn.setVisible(not hide_target)
+            if hide_target:
                 target_edit.clear()
-                target_edit.setPlaceholderText("（和铳率无需）")
+                target_edit.setPlaceholderText("（无需目标牌）")
             else:
                 target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
 
@@ -2561,13 +2594,15 @@ class MainWindow(QMainWindow):
         dora_row = QHBoxLayout()
         dora_row.setSpacing(8)
         self.instant_dora_group = QButtonGroup(self)
-        self.instant_dora_irrelevant_radio = QRadioButton("宝牌无关")
+        self.instant_dora_any_radio = QRadioButton("宝牌不问")
+        self.instant_dora_group.addButton(self.instant_dora_any_radio, 0)
+        self.instant_dora_irrelevant_radio = QRadioButton("宝牌无关目标牌")
         self.instant_dora_irrelevant_radio.setChecked(True)
-        self.instant_dora_group.addButton(self.instant_dora_irrelevant_radio, 0)
+        self.instant_dora_group.addButton(self.instant_dora_irrelevant_radio, 1)
         self.instant_dora_specific_radio = QRadioButton("宝牌为")
-        self.instant_dora_group.addButton(self.instant_dora_specific_radio, 1)
+        self.instant_dora_group.addButton(self.instant_dora_specific_radio, 2)
         self.instant_dora_matches_position_radio = QRadioButton("宝牌=模式第")
-        self.instant_dora_group.addButton(self.instant_dora_matches_position_radio, 2)
+        self.instant_dora_group.addButton(self.instant_dora_matches_position_radio, 3)
         self.instant_dora_tile_input = QLineEdit()
         self.instant_dora_tile_input.setPlaceholderText("例: 6s")
         self.instant_dora_tile_input.setMinimumWidth(50)
@@ -2577,6 +2612,7 @@ class MainWindow(QMainWindow):
         self.instant_dora_position_input.setMinimumWidth(50)
         self.instant_dora_position_input.setMaximumWidth(70)
         self.instant_dora_position_input.setToolTip("1-based，如 1 表示第1张，1,3 表示第1、3张必须为宝牌")
+        dora_row.addWidget(self.instant_dora_any_radio)
         dora_row.addWidget(self.instant_dora_irrelevant_radio)
         dora_row.addWidget(self.instant_dora_specific_radio)
         dora_row.addWidget(self.instant_dora_tile_input)
@@ -2864,6 +2900,7 @@ class MainWindow(QMainWindow):
     def _sync_instant_constraints_to_main(self):
         """将即时铳率页的约束与参数同步到主分析页控件。"""
         # 宝牌约束
+        self.dora_any_radio.setChecked(self.instant_dora_any_radio.isChecked())
         self.dora_irrelevant_radio.setChecked(self.instant_dora_irrelevant_radio.isChecked())
         self.dora_specific_radio.setChecked(self.instant_dora_specific_radio.isChecked())
         self.dora_matches_position_radio.setChecked(self.instant_dora_matches_position_radio.isChecked())
@@ -3609,7 +3646,8 @@ class MainWindow(QMainWindow):
             self._excel_clipboard_text = "\n".join(excel_rows)
             return
         use_tenpai = result.get("analysis_target") == "tenpai"
-        keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
+        use_related_tile = result.get("analysis_target") == "related_tile"
+        keys = [0, 1] if (use_tenpai or use_related_tile) else [0, 1, 2, 3]
         merged_dist = {k: 0 for k in keys}
         for pr in checked:
             d = pr.get('target_count_distribution', {})
@@ -3621,6 +3659,12 @@ class MainWindow(QMainWindow):
             txt = (
                 f"合并结果（分析目标 {target_label}）：总匹配 {_fmt_int(total_matches)} 次\n"
                 f"  未听牌: {probs[0]:.1f}%  听牌: {probs[1]:.1f}%"
+            )
+        elif use_related_tile:
+            target_label = "关联牌"
+            txt = (
+                f"合并结果（分析目标 {target_label}）：总匹配 {_fmt_int(total_matches)} 次\n"
+                f"  非关联: {probs[0]:.1f}%  关联: {probs[1]:.1f}%"
             )
         else:
             target = checked[0]['target']
@@ -3635,10 +3679,10 @@ class MainWindow(QMainWindow):
         turn_str = f"{tr[0]}-{tr[1]}巡" if tr else "不限"
         header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
         base_rows = [header]
-        target = "听牌" if use_tenpai else checked[0]['target']
+        target = "听牌" if use_tenpai else ("关联牌" if use_related_tile else checked[0]['target'])
         for pr in checked:
             prob = pr.get('probability_distribution', {})
-            pt = "听牌" if use_tenpai else pr.get('target', '')
+            pt = "听牌" if use_tenpai else ("关联牌" if use_related_tile else pr.get('target', ''))
             base_rows.append(f"{pr['pattern_str']}\t{pt}\t{turn_str}\t"
                 f"{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}\t{prob.get(2, 0):.2f}\t{prob.get(3, 0):.2f}")
         p0, p1 = probs[0], probs[1]
@@ -3815,7 +3859,7 @@ class MainWindow(QMainWindow):
                 continue
             lines.append("模式=%s→%s" % (pt, tg or ""))
         analysis = self.analysis_target_combo.currentData() or "target_count"
-        analysis_map = {"target_count": "目标牌存量", "tenpai": "是否听牌", "outcome": "和铳率"}
+        analysis_map = {"target_count": "目标牌存量", "tenpai": "是否听牌", "related_tile": "关联牌判断", "outcome": "和铳率"}
         lines.append("分析=%s" % analysis_map.get(analysis, "目标牌存量"))
         turn_ranges = self._get_turn_ranges_from_ui()
         if turn_ranges:
@@ -3826,8 +3870,10 @@ class MainWindow(QMainWindow):
             lo, hi = self.turn_range_slider.getRange()
             if lo != 1 or hi != 18:
                 lines.append("巡目=%d-%d" % (lo, hi))
-        if self.dora_irrelevant_radio.isChecked():
-            lines.append("宝牌=无关")
+        if self.dora_any_radio.isChecked():
+            lines.append("宝牌=不问")
+        elif self.dora_irrelevant_radio.isChecked():
+            lines.append("宝牌=无关目标牌")
         elif self.dora_matches_position_radio.isChecked():
             lines.append("宝牌=模式第")
             pos = self.dora_position_input.text().strip()
@@ -3838,7 +3884,7 @@ class MainWindow(QMainWindow):
             if tile:
                 lines.append("宝牌=%s" % tile)
             else:
-                lines.append("宝牌=无关")
+                lines.append("宝牌=无关目标牌")
         riichi_map = {"any": "任意", "has_riichi": "有人", "no_riichi": "无人"}
         rv = "any"
         if self.riichi_has_radio.isChecked():
@@ -3889,8 +3935,10 @@ class MainWindow(QMainWindow):
         t_max = self.instant_turn_max.value()
         if t_min != 1 or t_max != 18:
             lines.append("巡目=%d-%d" % (t_min, t_max))
-        if self.instant_dora_irrelevant_radio.isChecked():
-            lines.append("宝牌=无关")
+        if self.instant_dora_any_radio.isChecked():
+            lines.append("宝牌=不问")
+        elif self.instant_dora_irrelevant_radio.isChecked():
+            lines.append("宝牌=无关目标牌")
         elif self.instant_dora_matches_position_radio.isChecked():
             lines.append("宝牌=模式第")
             pos = self.instant_dora_position_input.text().strip()
@@ -3901,7 +3949,7 @@ class MainWindow(QMainWindow):
             if tile:
                 lines.append("宝牌=%s" % tile)
             else:
-                lines.append("宝牌=无关")
+                lines.append("宝牌=无关目标牌")
         riichi_map = {"any": "任意", "has_riichi": "有人", "no_riichi": "无人"}
         rv = "any"
         if self.instant_riichi_has_radio.isChecked():
@@ -4041,7 +4089,7 @@ class MainWindow(QMainWindow):
                 else:
                     pattern_edit.clear()
                     target_edit.clear()
-            analysis_map = {"目标牌存量": "target_count", "是否听牌": "tenpai", "和铳率": "outcome"}
+            analysis_map = {"目标牌存量": "target_count", "是否听牌": "tenpai", "关联牌判断": "related_tile", "和铳率": "outcome"}
             target = analysis_map.get(data.get("分析", "目标牌存量"), "target_count")
             for i in range(self.analysis_target_combo.count()):
                 if self.analysis_target_combo.itemData(i) == target:
@@ -4076,15 +4124,19 @@ class MainWindow(QMainWindow):
 
     def _apply_share_string_dora(self, data: Dict[str, Any], instant: bool):
         if instant:
-            ir, isp, ipos = self.instant_dora_irrelevant_radio, self.instant_dora_specific_radio, self.instant_dora_position_input
+            iany, ir, isp, ipos = self.instant_dora_any_radio, self.instant_dora_irrelevant_radio, self.instant_dora_specific_radio, self.instant_dora_position_input
             itile = self.instant_dora_tile_input
             imatch = self.instant_dora_matches_position_radio
         else:
-            ir, isp, ipos = self.dora_irrelevant_radio, self.dora_specific_radio, self.dora_position_input
+            iany, ir, isp, ipos = self.dora_any_radio, self.dora_irrelevant_radio, self.dora_specific_radio, self.dora_position_input
             itile = self.dora_tile_input
             imatch = self.dora_matches_position_radio
         dora = data.get("宝牌", "无关")
-        if dora == "无关":
+        if dora == "不问":
+            iany.setChecked(True)
+            itile.clear()
+            ipos.clear()
+        elif dora in ("无关", "无关目标牌"):
             ir.setChecked(True)
             itile.clear()
             ipos.clear()
@@ -4240,20 +4292,24 @@ class MainWindow(QMainWindow):
         use_tenpai = (analysis_target == "tenpai")
         use_instant = (analysis_target == "deal_in_instant")
         use_outcome = (analysis_target == "outcome")
-        require_target = not (use_tenpai or use_outcome)
+        use_related_tile = (analysis_target == "related_tile")
+        require_target = not (use_tenpai or use_outcome or use_related_tile)
         query_items = self._get_pattern_items(require_target=require_target)
         if not query_items:
             msg = "请至少输入一个舍牌模式"
             if require_target:
                 msg += "和对应的目标牌"
             elif use_outcome:
-                msg += "（和铳率无需目标牌）"
+                msg += "（和铳率/关联牌判断无需目标牌）"
             QMessageBox.warning(self, "输入错误", msg)
             return
         first_pattern, first_target = query_items[0]
         
         # 宝牌约束
-        if self.dora_irrelevant_radio.isChecked():
+        if self.dora_any_radio.isChecked():
+            dora_constraint = "any"
+            dora_position_spec = []
+        elif self.dora_irrelevant_radio.isChecked():
             dora_constraint = "dora_unrelated"
             dora_position_spec = []
         elif self.dora_matches_position_radio.isChecked():
@@ -4399,8 +4455,9 @@ class MainWindow(QMainWindow):
         if not self.last_query_params:
             QMessageBox.warning(self, "提示", "请先执行查询")
             return
-        # 听牌模式：全部/未听牌/听牌；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
+        # 听牌模式：全部/未听牌/听牌；关联牌模式：全部/非关联/关联；搭子模式：全部/没有/有；单张模式：全部/有0张~有3张；和铳率模式：全部/和牌/放铳/两者皆没有
         use_tenpai = self.last_query_params.get("analysis_target") == "tenpai"
+        use_related_tile = self.last_query_params.get("analysis_target") == "related_tile"
         use_instant = self.last_query_params.get("analysis_target") == "deal_in_instant"
         use_outcome = self.last_query_params.get("analysis_target") == "outcome"
         is_combo = self.last_query_params.get("is_combo", False)
@@ -4416,6 +4473,10 @@ class MainWindow(QMainWindow):
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "未听牌":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
+        elif use_related_tile:
+            if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "非关联":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(["全部", "非关联", "关联"])
         elif is_combo:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "没有":
                 self.sample_target_combo.clear()
@@ -4434,6 +4495,10 @@ class MainWindow(QMainWindow):
             deal_in_filter = None
             outcome_filter = None if idx == 0 else ["win", "deal_in", "neither"][idx - 1]
             target_count_filter = None
+        elif use_related_tile:
+            deal_in_filter = None
+            outcome_filter = None
+            target_count_filter = None if idx == 0 else (1 if idx == 2 else 0)  # 0=非关联 1=关联
         else:
             deal_in_filter = None
             outcome_filter = None
@@ -4604,7 +4669,7 @@ class MainWindow(QMainWindow):
                 self.matrix_display_btn.setEnabled(True)
                 header_col = result.get("header_col", [])
                 header_row = result.get("header_row", [])
-                _merge_keys = [1, 2] if result.get("analysis_target") != "tenpai" else [1]
+                _merge_keys = [1] if result.get("analysis_target") in ("tenpai", "related_tile") else [1, 2]
                 _tbl = {}
                 for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
                     _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
@@ -4630,8 +4695,12 @@ class MainWindow(QMainWindow):
             if not query_items:
                 query_items = [(result.get("query_pattern", []), result.get("target_tile", ""))]
             first_pattern, first_target = query_items[0]
-            if self.dora_irrelevant_radio.isChecked():
+            if self.dora_any_radio.isChecked():
+                dora_constraint = "any"
+            elif self.dora_irrelevant_radio.isChecked():
                 dora_constraint = "dora_unrelated"
+            elif self.dora_matches_position_radio.isChecked():
+                dora_constraint = "dora_matches_position"
             else:
                 dora_constraint = self.dora_tile_input.text().strip() or "any"
             if self.riichi_any_radio.isChecked():
@@ -4682,14 +4751,15 @@ class MainWindow(QMainWindow):
             self.sample_pattern_combo.clear()
             pr_list = result.get("pattern_results", []) if result.get("multi_pattern") else []
             use_tenpai = (result.get("analysis_target") == "tenpai")
+            use_related_tile = (result.get("analysis_target") == "related_tile")
             use_instant = (result.get("analysis_target") == "deal_in_instant")
             if result.get("multi_pattern") and pr_list:
                 for pr in pr_list:
-                    lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
+                    lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else (f"{pr['pattern_str']} → 关联牌" if use_related_tile else f"{pr['pattern_str']} → {pr['target']}")
                     self.sample_pattern_combo.addItem(lbl)
             else:
                 first_pattern, first_target = query_items[0]
-                lbl = "-".join(first_pattern) + (" → 听牌" if use_tenpai else f" → {first_target}")
+                lbl = "-".join(first_pattern) + (" → 听牌" if use_tenpai else (" → 关联牌" if use_related_tile else f" → {first_target}"))
                 self.sample_pattern_combo.addItem(lbl)
             # 多目标时：目标牌下拉（全部/6s/2m/5p）
             self.sample_target_tile_combo.clear()
@@ -4706,6 +4776,8 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "可铳", "不可铳", "振听过滤掉"])
             elif use_tenpai:
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
+            elif use_related_tile:
+                self.sample_target_combo.addItems(["全部", "非关联", "关联"])
             else:
                 any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
                 if result.get("multi_pattern") and any_single:
@@ -4721,10 +4793,11 @@ class MainWindow(QMainWindow):
 
             if multi and pr_list:
                 use_tenpai = (result.get("analysis_target") == "tenpai")
+                use_related_tile = (result.get("analysis_target") == "related_tile")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")
                 lines = ["查询完成！\n", f"总匹配数: {_fmt_int(result['total_matches'])}\n"]
                 for pr in pr_list:
-                    pr_label = f"{pr['pattern_str']} → 听牌" if use_tenpai else f"{pr['pattern_str']} → {pr['target']}"
+                    pr_label = f"{pr['pattern_str']} → 听牌" if use_tenpai else (f"{pr['pattern_str']} → 关联牌" if use_related_tile else f"{pr['pattern_str']} → {pr['target']}")
                     tcd = pr.get('target_count_distribution', {})
                     lines.append(f"  {pr_label}: {_fmt_int(pr['matches'])} 次")
                     if use_instant:
@@ -4741,6 +4814,11 @@ class MainWindow(QMainWindow):
                         lines.append(
                             f"    未听牌: {pr['probability_distribution'][0]:.1f}% ({_fmt_int(tcd.get(0, 0))} 例)  "
                             f"听牌: {pr['probability_distribution'][1]:.1f}% ({_fmt_int(tcd.get(1, 0))} 例)"
+                        )
+                    elif use_related_tile:
+                        lines.append(
+                            f"    非关联: {pr['probability_distribution'][0]:.1f}% ({_fmt_int(tcd.get(0, 0))} 例)  "
+                            f"关联: {pr['probability_distribution'][1]:.1f}% ({_fmt_int(tcd.get(1, 0))} 例)"
                         )
                     elif pr.get('multi_target') and pr.get('target_tiles'):
                         for tk in pr['target_tiles']:
@@ -4791,6 +4869,7 @@ class MainWindow(QMainWindow):
                 self._setup_multi_pattern_merge(result, pr_list)
             else:
                 use_tenpai = (result.get("analysis_target") == "tenpai")
+                use_related_tile = (result.get("analysis_target") == "related_tile")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")
                 multi_target = result.get("multi_target", False)
                 if use_instant and multi_target and result.get("multi_instant_stats"):
@@ -4838,6 +4917,12 @@ class MainWindow(QMainWindow):
                         f"  听牌: {result['probability_distribution'][1]:.2f}% ({_fmt_int(result['target_count_distribution'][1])} 例)"
                     )
                     target_label = "分析目标: 听牌"
+                elif use_related_tile:
+                    dist_text = (
+                        f"  非关联: {result['probability_distribution'][0]:.2f}% ({_fmt_int(result['target_count_distribution'][0])} 例)\n"
+                        f"  关联: {result['probability_distribution'][1]:.2f}% ({_fmt_int(result['target_count_distribution'][1])} 例)"
+                    )
+                    target_label = "分析目标: 关联牌"
                 elif multi_target:
                     tcd = result.get('target_count_distribution', {})
                     prob_d = result.get('probability_distribution', {})

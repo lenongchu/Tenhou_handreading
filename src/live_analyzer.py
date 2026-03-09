@@ -19,6 +19,11 @@ import logging
 
 from .mjlog_parser import MjlogParser, GameState
 from .tenpai_utils import is_tenpai
+from .related_tile_utils import (
+    is_related_discard,
+    hand_to_suit_counts,
+    base_to_discard_num_and_suit,
+)
 from .equivalent_variants import (
     generate_equivalent_variants,
     get_forbidden_bases_from_exclusion_str,
@@ -492,6 +497,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
     exclude_south3 = params.get("exclude_south3", False)
     riichi_any = params.get("riichi_any", False)
     use_tenpai = params.get("use_tenpai", False)
+    use_related_tile = params.get("use_related_tile", False)
     prior_discard_exclusion = params.get("prior_discard_exclusion")
 
     def _target_key(tiles: List[str], is_combo: bool) -> str:
@@ -675,7 +681,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                             ):
                                 continue
                         mapped_target = matched_variant["target"]
-                        if not use_tenpai:
+                        if not use_tenpai and not use_related_tile:
                             target_equiv = set()
                             if len(multi_t) == 1:
                                 if is_combo:
@@ -699,6 +705,13 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                             hand_at_turn = list(player_state.hand_tiles)
                         if use_tenpai:
                             target_count = 1 if is_tenpai(hand_at_turn) else 0
+                        elif use_related_tile:
+                            num, suit = base_to_discard_num_and_suit(discard.tile // 4)
+                            if num is not None and suit is not None:
+                                counts = hand_to_suit_counts(hand_at_turn, suit)
+                                target_count = 1 if is_related_discard(num, counts) else 0
+                            else:
+                                target_count = 0
                         elif len(multi_t) > 1:
                             if multi_t[0][1]:
                                 target_codes = [MjlogParser.string_to_tile(t) for t in multi_t[0][0]]
@@ -723,7 +736,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
 
                         k = (tr_idx, pat_idx)
                         if k not in result:
-                            result[k] = {0: 0, 1: 0, 2: 0, 3: 0} if not (use_tenpai or is_combo) else {0: 0, 1: 0}
+                            result[k] = {0: 0, 1: 0, 2: 0, 3: 0} if not (use_tenpai or use_related_tile or is_combo) else {0: 0, 1: 0}
                         if target_count in result[k]:
                             result[k][target_count] += 1
                         else:
@@ -756,6 +769,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     riichi_any = params.get("riichi_any", False)
     prior_discard_exclusion = params.get("prior_discard_exclusion")
     use_tenpai = params.get("use_tenpai", False)
+    use_related_tile = params.get("use_related_tile", False)
     use_deal_in_instant = params.get("use_deal_in_instant", False)
     multi_target = params.get("multi_target", False)
     cap = params.get("cap", MATCHED_STATES_CAP)
@@ -777,13 +791,13 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     pattern_matches = [0] * len(items)
     if params.get("multi_target"):
         pattern_distributions = [
-            {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
+            {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or use_related_tile or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
              for t in item_multi_targets[idx]}
             for idx in range(len(items))
         ]
     else:
         pattern_distributions = [
-            ({0: 0, 1: 0} if (use_tenpai or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
+            ({0: 0, 1: 0} if (use_tenpai or use_related_tile or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
             for iv in item_variants
         ]
     matched_states = []
@@ -998,7 +1012,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     mapped_target = matched_variant["target"]
                     mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
                     mt_for_item = item_multi_targets[matched_idx]
-                    if not use_tenpai and not use_deal_in_instant:
+                    if not use_tenpai and not use_deal_in_instant and not use_related_tile:
                         target_equiv = set()
                         if len(mt_for_item) == 1:
                             if item_combo:
@@ -1030,6 +1044,14 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     mt_item = item_multi_targets[matched_idx]
                     if use_tenpai:
                         target_count = 1 if is_tenpai(hand_at_turn) else 0
+                        target_counts = None
+                    elif use_related_tile:
+                        num, suit = base_to_discard_num_and_suit(discard.tile // 4)
+                        if num is not None and suit is not None:
+                            counts = hand_to_suit_counts(hand_at_turn, suit)
+                            target_count = 1 if is_related_discard(num, counts) else 0
+                        else:
+                            target_count = 0  # 字牌不参与关联牌判断
                         target_counts = None
                     elif len(mt_item) > 1:
                         target_counts = {}
@@ -1394,6 +1416,7 @@ class LiveAnalyzer:
             consumed_search_list = [consumed_search] if consumed_search else []
         riichi_any = any(pattern_has_riichi(p) for p, _ in items)
         use_deal_in_instant = (analysis_target == "deal_in_instant")
+        use_related_tile = (analysis_target == "related_tile")
         hypothetical_furiten_list: List[str] = []
         if hypothetical_furiten_tiles and hypothetical_furiten_tiles.strip():
             hypothetical_furiten_list = [x.strip() for x in hypothetical_furiten_tiles.replace(",", " ").split() if x.strip()]
@@ -1462,13 +1485,13 @@ class LiveAnalyzer:
         pattern_matches = [0] * len(items)
         if multi_target:
             pattern_distributions = [
-                {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
+                {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or use_related_tile or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
                  for t in item_multi_targets[idx]}
                 for idx in range(len(items))
             ]
         else:
             pattern_distributions = [
-                ({0: 0, 1: 0} if (use_tenpai or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
+                ({0: 0, 1: 0} if (use_tenpai or use_related_tile or iv[2]) else {0: 0, 1: 0, 2: 0, 3: 0})
                 for iv in item_variants
             ]
         # 多模式 + 多目标即时铳率：按模式分别统计，用于每个 pattern_results 的 multi_instant_stats
@@ -1519,6 +1542,7 @@ class LiveAnalyzer:
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
             "use_tenpai": use_tenpai,
+            "use_related_tile": use_related_tile,
             "use_deal_in_instant": use_deal_in_instant,
             "multi_target": multi_target,
             "hypothetical_furiten_list": hypothetical_furiten_list,
@@ -1738,7 +1762,7 @@ class LiveAnalyzer:
                     prob_t[c] = (dist_t.get(c, 0) / max(1, pattern_matches[0]) * 100) if pattern_matches[0] > 0 else 0
                 probability_distribution[tk] = prob_t
         else:
-            keys = [0, 1] if (use_tenpai or is_combo) else [0, 1, 2, 3]
+            keys = [0, 1] if (use_tenpai or use_related_tile or is_combo) else [0, 1, 2, 3]
             for count in keys:
                 prob = (target_count_distribution.get(count, 0) / max(1, pattern_matches[0]) * 100) if pattern_matches[0] > 0 else 0
                 probability_distribution[count] = prob
@@ -1756,7 +1780,7 @@ class LiveAnalyzer:
                     prob[tk] = prob_t
             else:
                 prob = {}
-                k = [0, 1] if (use_tenpai or item_variants[idx][2]) else [0, 1, 2, 3]
+                k = [0, 1] if (use_tenpai or use_related_tile or item_variants[idx][2]) else [0, 1, 2, 3]
                 for c in k:
                     prob[c] = (dist.get(c, 0) / max(1, pattern_matches[idx]) * 100) if pattern_matches[idx] > 0 else 0
             pr_entry = {
@@ -2061,9 +2085,10 @@ class LiveAnalyzer:
             return "".join(sorted(tiles)) if is_combo else tiles[0]
 
         use_tenpai = (analysis_target == "tenpai")
+        use_related_tile = (analysis_target == "related_tile")
         # 是否为「即时铳率」分析模式；用于 _should_run_memory_maintenance 区分内存维护策略（即时铳率下不必每批都做 GC）
         use_deal_in_instant = (analysis_target == "deal_in_instant")
-        keys = [0, 1] if use_tenpai else [0, 1, 2, 3]
+        keys = [0, 1] if (use_tenpai or use_related_tile) else [0, 1, 2, 3]
         merge_keys_f = [k for k in merge_keys if k in keys] or keys[:2]
 
         # 棰勬瀯寤烘瘡鏍肩殑变体与元数据
@@ -2105,7 +2130,7 @@ class LiveAnalyzer:
         for tr_idx, pat_idx, _, _, multi_t, is_combo in grid_meta:
             k = (tr_idx, pat_idx)
             if k not in grid_dist:
-                if use_tenpai or is_combo:
+                if use_tenpai or use_related_tile or is_combo:
                     grid_dist[k] = {0: 0, 1: 0}
                 else:
                     grid_dist[k] = {0: 0, 1: 0, 2: 0, 3: 0}
@@ -2141,6 +2166,7 @@ class LiveAnalyzer:
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
             "use_tenpai": use_tenpai,
+            "use_related_tile": use_related_tile,
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
         }
@@ -3155,11 +3181,17 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     use_tenpai = (analysis_target == "tenpai")
     use_outcome = (analysis_target == "outcome")
     use_instant = (analysis_target == "deal_in_instant")
-    is_combo = False if use_tenpai else (samples[0].get("is_combo", False) if samples else False)
+    use_related_tile = (analysis_target == "related_tile")
+    is_combo = False if (use_tenpai or use_related_tile) else (samples[0].get("is_combo", False) if samples else False)
     has_multi = bool(samples and samples[0].get("target_counts"))
-    target_label = "即时铳率" if use_instant else ("和铳率" if use_outcome else (target_tile if use_tenpai else (
-        f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
-    )))
+    target_label = (
+        "即时铳率" if use_instant
+        else "和铳率" if use_outcome
+        else "关联牌" if use_related_tile
+        else (target_tile if use_tenpai else (
+            f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
+        ))
+    )
     lines = [
         "=" * 80,
         f"Verification Samples: {query_pattern_str} -> {target_label}",
@@ -3173,7 +3205,7 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         elif has_multi and s.get("target_counts"):
             mt_set = _target_counts_display_set(s["target_counts"])
         else:
-            mt_set = _target_display_set(mt) if not use_tenpai and mt else set()
+            mt_set = _target_display_set(mt) if not (use_tenpai or use_related_tile) and mt else set()
         hand_parts = []
         for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
             ts = MjlogParser.tile_to_string(t)
@@ -3183,6 +3215,8 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
         if use_outcome:
             target_line = f"  结局:        {_outcome_label(s)}"
+        elif use_related_tile:
+            target_line = f"  关联牌:      {'是' if s.get('target_count') else '否'}"
         elif use_instant:
             hit = bool(s.get("deal_in_hit"))
             point = int(s.get("deal_in_point", 0))

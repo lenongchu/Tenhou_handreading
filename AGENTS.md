@@ -155,7 +155,7 @@
 | **序列与逻辑** | `-` 或 `AND` | 顺序分隔 | `3s-1s`, `3sAND1s` |
 | | `*` | 任意数量摸切 | `3s-*-1s` |
 | | `$` | 任意一张手切 | `c0p6p-$` |
-| | `[xy]suit` | **数字范围**：x 到 y 连续（含两端），共 (y−x+1) 张 | `[39]p`=3p~9p 共 7 张；`[17]z`=1z~7z |
+| | `[xy]suit` | **数字范围**：x 到 y 连续（含两端），共 (y−x+1) 张；与单张相同，**无后缀默认手切**，可加 `t`（摸切）或 `f`（手摸切皆可），如 `[29]mf` | `[39]p`=3p~9p 共 7 张（仅手切）；`[17]z`=1z~7z；`[29]mf`=2m~9m 手摸切皆可 |
 | | `OR` | 逻辑或 | `3mOR5m`, `[25]m`（[25]m 即 2m~5m 其一） |
 | | `NOT` | 逻辑非 | `NOTm`, `zNOT1z`, `NOT[45]m`（排除 4m,5m） |
 | **占位符** | `z`/`zt` | 任意字牌/摸切字牌 | `z-zt` |
@@ -168,7 +168,7 @@
 | **拆搭** | `cd1`/`cd2` | 任意拆搭/拆搭花色≠下一张 | `cd1`, `cd2-3m` |
 | | `cdm`/`cdp`/`cds` | 拆指定花色搭子 | `cdm` |
 
-> `r` 与 `c/p` 不能同现（立直不可副露）；`*` 仅匹配连续摸切；`cd2` 自动检查下一张花色。
+> `r` 与 `c/p` 不能同现（立直不可副露）；`*` 仅匹配连续摸切；`cd2` 自动检查下一张花色。数字范围 `[xy]suit` 无后缀时仅匹配手切，需手摸切皆可请写 `[xy]suitf`（如 `[29]mf`）。
 
 ---
 
@@ -212,6 +212,14 @@
 
 - 舍牌模式**仅含字牌占位符**（如 `apr`、`z-ap`）而**目标牌为数牌或赤五**（如 `3p`）时，仍按目标牌花色生成 **3 个等价变体**（3m / 3p / 3s），以扩大样本。实现见 `generate_equivalent_variants` 中「纯字牌模式」分支对 `target_suits` 的处理。
 
+### 3.6 关联牌判断与等价变换
+
+- **使用等价变换**：关联牌分析（analysis_target=`related_tile`）与目标牌存量、听牌等模式相同，舍牌模式参与等价变换。如 `1p-2p` 生成 3 个变体（1m-2m、1p-2p、1s-2s），扩大样本池。
+- **目标牌占位**：关联牌无需目标牌，传入 `5z` 占位；`generate_equivalent_variants` 仅对舍牌模式做花色映射，变体 `target` 为 `5z` 不变。
+- **判定逻辑**：匹配时取**实际舍牌**的最后一张（`discard.tile`），按该牌的花色与点数从 `hand_at_turn` 提取该花色 1-9 枚数，调用 `related_tile_utils.is_related_discard(num, counts)` 判断是否关联。
+- **字牌不参与**：舍牌为字牌时视为非关联（target_count=0）。
+- **实现**：`related_tile_utils` 模块；`live_analyzer` 主分析、并行 worker、网格分析均支持。
+
 ---
 
 ## 四、核心模块
@@ -225,6 +233,7 @@
 | `instant_deal_in` | 即时铳率引擎：事件重放、完整振听、理论点 | RoundInstantDealInAnalyzer, extract_tenhou6_rounds |
 | `database` | SQLite：logs, game_states, visible_tile_stats | Database.create_tables, insert_game_state |
 | `tenpai_utils` | 听牌判断 | is_tenpai (mahjong 库) |
+| `related_tile_utils` | 关联牌判断 | is_related_discard, hand_to_suit_counts |
 | `gui_app` | PyQt5 桌面界面 | 入口 |
 | `data_downloader` | 调用 houou-logs 下载牌谱 | DataDownloader |
 | `tile_illustration` | 舍牌示意图渲染 | render_illustration_to_qimage |
