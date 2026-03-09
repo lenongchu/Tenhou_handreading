@@ -1319,13 +1319,14 @@ class GridQueryThread(QThread):
 
 
 class MatrixDisplayDialog(QDialog):
-    """矩阵展示窗口：勾选 0/1/2/3 张，动态预览并复制 Excel 格式"""
+    """矩阵展示窗口：勾选 0/1/2/3 张，动态预览并复制 Excel 格式；每格显示样本数"""
     def __init__(self, parent, grid_result: dict):
         super().__init__(parent)
         self.setWindowTitle("矩阵数据展示")
         self.setMinimumSize(560, 420)
         self._result = grid_result
         self._table_dist = grid_result.get("table_dist", {})
+        self._table_counts = grid_result.get("table_counts", {})
         self._header_row = grid_result.get("header_row", [])
         self._header_col = grid_result.get("header_col", [])
         self._analysis_target = grid_result.get("analysis_target", "target_count")
@@ -1392,7 +1393,11 @@ class MatrixDisplayDialog(QDialog):
             cells = [tr_label]
             for pat_idx in range(len(header_col)):
                 v = tbl.get((tr_idx, pat_idx), "")
-                cells.append(str(v))
+                n = self._table_counts.get((tr_idx, pat_idx))
+                if isinstance(v, (int, float)) and n is not None:
+                    cells.append(f"{v} (n={n})")
+                else:
+                    cells.append(str(v) if v != "" else "")
             rows.append("\t".join(cells))
         self._preview.setPlainText("\n".join(rows))
 
@@ -1409,10 +1414,14 @@ class MatrixDisplayDialog(QDialog):
             cells = [tr_label]
             for pat_idx in range(len(header_col)):
                 v = tbl.get((tr_idx, pat_idx), "")
-                cells.append(str(v))
+                n = self._table_counts.get((tr_idx, pat_idx))
+                if isinstance(v, (int, float)) and n is not None:
+                    cells.append(f"{v} (n={n})")
+                else:
+                    cells.append(str(v) if v != "" else "")
             rows.append("\t".join(cells))
         QApplication.clipboard().setText("\n".join(rows))
-        QMessageBox.information(self, "已复制", "表格已复制到剪贴板，可粘贴到 Excel 中绘制折线图。")
+        QMessageBox.information(self, "已复制", "表格已复制到剪贴板（含每格样本数），可粘贴到 Excel 中绘制折线图。")
 
 
 class BatchChartThread(QThread):
@@ -4691,7 +4700,7 @@ class MainWindow(QMainWindow):
                     f"矩阵分析完成：{n_pat} 模式 × {n_tr} 巡目，共 {n_pat * n_tr} 格\n"
                     f"分析半庄数: {_fmt_int(result.get('total_logs_analyzed', 0))}\n"
                     f"分析耗时: {result.get('elapsed_seconds', 0):.1f} 秒\n\n"
-                    "点击「展示矩阵」查看并可勾选 0/1/2/3 张后复制 Excel 格式。"
+                    "点击「展示矩阵」查看每格样本数，并可勾选 0/1/2/3 张后复制 Excel 格式。"
                 )
                 self.result_text.setText(summary)
                 self.multi_merge_widget.setVisible(False)
@@ -4703,11 +4712,17 @@ class MainWindow(QMainWindow):
                 _tbl = {}
                 for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
                     _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
+                _counts = result.get("table_counts", {})
                 _rows = ["巡目范围\t" + "\t".join(header_col)]
                 for tr_idx, lbl in enumerate(header_row):
                     _cells = [lbl]
                     for pat_idx in range(len(header_col)):
-                        _cells.append(str(_tbl.get((tr_idx, pat_idx), "")))
+                        v = _tbl.get((tr_idx, pat_idx), "")
+                        n = _counts.get((tr_idx, pat_idx))
+                        if n is not None:
+                            _cells.append(f"{v} (n={n})" if v != "" and v is not None else f"(n={n})")
+                        else:
+                            _cells.append(str(v) if v != "" else "")
                     _rows.append("\t".join(_cells))
                 self._excel_clipboard_text = "\n".join(_rows)
                 self.copy_excel_btn.setEnabled(True)

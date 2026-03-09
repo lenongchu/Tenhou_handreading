@@ -12,7 +12,7 @@
 摸切符号：牌后加 t 表示必须摸切，f 表示手切或摸切皆可；如 "3mt-1m" = 3m 摸切、1m 手切；"3mf" = 3m 手摸切皆可。
 * : 任意数量的摸切
 $ : 任意一张手切（吃/碰之后的牌必为手切，如 c0p6p-$）
-cd1/cd2 : 拆搭（两张同花色数值差1-2的手切，如1m3m、4s5s；1s9s不是搭子）。cd2 约束：拆搭花色≠下一张舍牌花色
+cd1/cd2 : 拆搭（两张同花色数值差0-2的手切，含对子1m-1m、两面1m-2m、嵌张1m-3m等；1s9s不是搭子）。cd2 约束：拆搭花色≠目标牌花色
 cdm/cdp/cds : 拆万字/饼/索搭
 """
 import re
@@ -37,7 +37,7 @@ SUIT_WILDCARDS = frozenset({"m", "p", "s"})
 # 吃碰占位符前缀：解析后为 @c:... 或 @p:...；语义为具体吃的/碰的牌（如 4mc3m5m=用3m5m吃4m）
 # 含副露时也应用全局花色映射（4mc3m5m→4pc3p5p 等）；字牌不参与映射，不影响变体生成
 CALL_PREFIX = "@"
-# 拆搭占位符：@cd:1 任意拆搭、@cd:2 拆搭花色≠下一张、@cd:m/p/s 拆万/饼/索搭
+# 拆搭占位符：@cd:1 任意拆搭、@cd:2 拆搭花色≠目标牌花色、@cd:m/p/s 拆万/饼/索搭
 CD_PREFIX = "@cd:"
 # 逻辑符号：@n:base,excl 表示 NOT（base 但排除 excl）；@o:a,b,c 表示 OR（匹配其一）
 NOT_PREFIX = "@n:"
@@ -1528,7 +1528,7 @@ def _number_tile_value(tile_str: str) -> Optional[int]:
 
 
 def _is_meld(t1: str, t2: str) -> bool:
-    """两数牌是否构成搭子（同花色，数值差1或2）。1s9s 不是搭子。"""
+    """两数牌是否构成搭子或对子（同花色，数值差0-2）。0=对子如1m-1m，1=两面/边张，2=嵌张。1s9s 不是搭子。"""
     if not _is_number_tile(t1) or not _is_number_tile(t2):
         return False
     if t1[-1] != t2[-1]:
@@ -1537,7 +1537,7 @@ def _is_meld(t1: str, t2: str) -> bool:
     if v1 is None or v2 is None:
         return False
     diff = abs(v1 - v2)
-    return diff in (1, 2)
+    return diff in (0, 1, 2)
 
 
 def _discard_is_chaida(
@@ -1547,9 +1547,9 @@ def _discard_is_chaida(
     exclude_suit: Optional[str] = None,
 ) -> bool:
     """
-    检查 full_discards[d_idx] 是否为拆搭（与另一张手切构成搭子）。
+    检查 full_discards[d_idx] 是否为拆搭（与另一张手切构成搭子或对子）。
     require_suit: 必须为该花色（cdm/cdp/cds）
-    exclude_suit: 不能为该花色（cd2 约束）
+    exclude_suit: 不能为该花色（cd2 约束：拆搭花色≠目标牌花色）
     """
     if d_idx < 0 or d_idx >= len(full_discards):
         return False
@@ -1642,7 +1642,7 @@ def _match_pattern_at_end(
             p_idx -= 1
             continue
 
-        # 拆搭 @cd:1/2/m/p/s：消耗一张舍牌，须为手切且与另一手切构成搭子
+        # 拆搭 @cd:1/2/m/p/s：消耗一张舍牌，须为手切且与另一手切构成搭子或对子
         if pat_tile.startswith(CD_PREFIX):
             if is_tsumogiri:
                 return False
@@ -1650,11 +1650,14 @@ def _match_pattern_at_end(
             require_suit = cd_suffix if cd_suffix in "mps" else None
             exclude_suit = None
             if cd_suffix == "2":
-                next_tile = None
-                if d_idx + 1 < len(full_discards):
-                    next_tile = full_discards[d_idx + 1][0]
-                if next_tile and _is_number_tile(next_tile):
-                    exclude_suit = next_tile[-1]
+                # cd2：拆搭花色≠目标牌花色（从 context 获取）
+                target_tile = ctx.get("target_tile")
+                if target_tile:
+                    tiles = target_tile if isinstance(target_tile, list) else [target_tile]
+                    for t in tiles:
+                        if isinstance(t, str) and len(t) >= 2 and t[-1] in "mps":
+                            exclude_suit = t[-1]
+                            break
             if not _discard_is_chaida(full_discards, d_idx, require_suit, exclude_suit):
                 return False
             consumed_any_discard = True
@@ -2078,10 +2081,13 @@ def match_discard_to_variant(
     for v in variants:
         out_pt = {}
         out_start = []
+        ctx = dict(context) if context else {}
+        if v.get("target") is not None:
+            ctx["target_tile"] = v["target"]
         if _match_pattern_at_end(
             full_discards,
             v["discard"],
-            context,
+            ctx,
             out_position_to_tile=out_pt,
             out_match_start_index=out_start,
         ):

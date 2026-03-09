@@ -1950,8 +1950,11 @@ class LiveAnalyzer:
                 td = target_count_distribution.get(tk, {})
                 logger.info(f"  {tk}: 0寮?{pd.get(0,0):.2f}% 1寮?{pd.get(1,0):.2f}% 2寮?{pd.get(2,0):.2f}% 3寮?{pd.get(3,0):.2f}%")
         elif use_tenpai:
-            logger.info(f"  鏈惉牌 {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例")
+            logger.info(f"  未听牌: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例")
             logger.info(f"  听牌: {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例")
+        elif use_related_tile:
+            logger.info(f"  非关联: {probability_distribution.get(0, 0):.2f}% ({target_count_distribution.get(0, 0):,} 例)")
+            logger.info(f"  关联: {probability_distribution.get(1, 0):.2f}% ({target_count_distribution.get(1, 0):,} 例)")
         elif is_combo:
             logger.info(f"  娌℃湁: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例")
             logger.info(f"  鏈? {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例")
@@ -2564,12 +2567,14 @@ class LiveAnalyzer:
         gc.collect()
         _trim_process_memory()
 
-        # 按格计算合并概率与完整分布
+        # 按格计算合并概率、完整分布与样本数
         cell_combo = {(tr_idx, pat_idx): is_combo for tr_idx, pat_idx, _, _, _, is_combo in grid_meta}
         table = {}
-        table_dist = {}  # 姣忔牸完整分布 {(tr_idx, pat_idx): {0: pct, 1: pct, ...}}
+        table_dist = {}  # 每格完整分布 {(tr_idx, pat_idx): {0: pct, 1: pct, ...}}
+        table_counts = {}  # 每格样本数 {(tr_idx, pat_idx): n}
         for (tr_idx, pat_idx), dist in grid_dist.items():
             total_m = sum(dist.values())
+            table_counts[(tr_idx, pat_idx)] = total_m
             is_combo_cell = cell_combo.get((tr_idx, pat_idx), False)
             k_list = [0, 1] if (use_tenpai or is_combo_cell) else [0, 1, 2, 3]
             if total_m == 0:
@@ -2582,10 +2587,11 @@ class LiveAnalyzer:
                 }
             table[(tr_idx, pat_idx)] = round(prob, 2)
 
-        logger.info(f"批量分析瀹屾垚: 处理 {processed:,} 场对局")
+        logger.info(f"批量分析完成: 处理 {processed:,} 场对局")
         return {
             "table": table,
             "table_dist": table_dist,
+            "table_counts": table_counts,
             "total_logs_analyzed": processed,
             "elapsed_seconds": round(time.perf_counter() - t0, 1),
         }
