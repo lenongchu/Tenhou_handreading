@@ -1410,11 +1410,16 @@ def match_discard_pattern_contained(
 ) -> bool:
     """
     检查 full_discards 中是否存在某段连续子序列匹配任一变体（用于「前段有打」）。
-    即是否存在某个 i 使得 full_discards[i:] 的末尾匹配该模式。
+    需检查所有长度为 L 的连续子序列 full_discards[i:i+L]，而非仅后缀。
+    否则单元素模式如 [37]mOR[37]s 会错误地只匹配「最后一张」而非「任一张」。
     """
-    for i in range(len(full_discards)):
-        if match_discard_to_variant(full_discards[i:], variants, context):
+    for v in variants:
+        L = len(v["discard"])
+        if L == 0:
             return True
+        for i in range(len(full_discards) - L + 1):
+            if match_discard_to_variant(full_discards[i : i + L], variants, context):
+                return True
     return False
 
 

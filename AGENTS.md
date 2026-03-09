@@ -214,10 +214,10 @@
 
 ### 3.6 关联牌判断与等价变换
 
-- **使用等价变换**：关联牌分析（analysis_target=`related_tile`）与目标牌存量、听牌等模式相同，舍牌模式参与等价变换。如 `1p-2p` 生成 3 个变体（1m-2m、1p-2p、1s-2s），扩大样本池。
-- **目标牌占位**：关联牌无需目标牌，传入 `5z` 占位；`generate_equivalent_variants` 仅对舍牌模式做花色映射，变体 `target` 为 `5z` 不变。
-- **判定逻辑**：匹配时取**实际舍牌**的最后一张（`discard.tile`），按该牌的花色与点数从 `hand_at_turn` 提取该花色 1-9 枚数，调用 `related_tile_utils.is_related_discard(num, counts)` 判断是否关联。
-- **字牌不参与**：舍牌为字牌时视为非关联（target_count=0）。
+- **使用等价变换**：关联牌分析（analysis_target=`related_tile`）与目标牌存量、听牌等模式相同，舍牌模式参与等价变换。如 `1m-2p-ap` 目标 `2p` 生成 3 个变体，扩大样本池。
+- **目标牌必填**：目标牌指定要分析关联度的舍牌，须在模式中出现。如 `1m-2p-ap` 目标 `2p` 表示分析 2p 的关联度。
+- **判定逻辑**：匹配时在序列中找**最后一次出现目标牌**的舍牌，取该时点 `hand_at_turn`，按该牌花色提取 1-9 枚数，调用 `related_tile_utils.is_related_discard(num, counts)` 判断是否关联。
+- **字牌不参与**：目标牌为字牌时视为非关联（target_count=0）。
 - **实现**：`related_tile_utils` 模块；`live_analyzer` 主分析、并行 worker、网格分析均支持。
 
 ---

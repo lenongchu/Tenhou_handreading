@@ -681,6 +681,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                             ):
                                 continue
                         mapped_target = matched_variant["target"]
+                        target_equiv = None
                         if not use_tenpai and not use_related_tile:
                             target_equiv = set()
                             if len(multi_t) == 1:
@@ -698,6 +699,10 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                                         target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
                             if discard.tile // 4 in target_equiv:
                                 continue
+                        elif use_related_tile:
+                            target_equiv = MjlogParser.get_count_equivalent_bases(
+                                MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                            )
 
                         if orig_i < len(player_state.hand_tiles_history):
                             hand_at_turn = list(player_state.hand_tiles_history[orig_i])
@@ -706,10 +711,25 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         if use_tenpai:
                             target_count = 1 if is_tenpai(hand_at_turn) else 0
                         elif use_related_tile:
-                            num, suit = base_to_discard_num_and_suit(discard.tile // 4)
-                            if num is not None and suit is not None:
-                                counts = hand_to_suit_counts(hand_at_turn, suit)
-                                target_count = 1 if is_related_discard(num, counts) else 0
+                            target_discard_idx = None
+                            target_discard = None
+                            for k in range(len(in_range_for_cell) - 1, -1, -1):
+                                idx, dd = in_range_for_cell[k]
+                                if dd.tile // 4 in target_equiv:
+                                    target_discard_idx = idx
+                                    target_discard = dd
+                                    break
+                            if target_discard_idx is not None and target_discard is not None:
+                                if target_discard_idx < len(player_state.hand_tiles_history):
+                                    hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
+                                else:
+                                    hand_at_target = list(player_state.hand_tiles)
+                                num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
+                                if num is not None and suit is not None:
+                                    counts = hand_to_suit_counts(hand_at_target, suit)
+                                    target_count = 1 if is_related_discard(num, counts) else 0
+                                else:
+                                    target_count = 0
                             else:
                                 target_count = 0
                         elif len(multi_t) > 1:
@@ -1012,6 +1032,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     mapped_target = matched_variant["target"]
                     mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
                     mt_for_item = item_multi_targets[matched_idx]
+                    target_equiv = None
                     if not use_tenpai and not use_deal_in_instant and not use_related_tile:
                         target_equiv = set()
                         if len(mt_for_item) == 1:
@@ -1028,6 +1049,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                                     target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
                         if discard.tile // 4 in target_equiv:
                             continue
+                    elif use_related_tile:
+                        target_equiv = MjlogParser.get_count_equivalent_bases(
+                            MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0]))
 
                     total_matches += 1
                     pattern_matches[matched_idx] += 1
@@ -1046,12 +1070,28 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         target_count = 1 if is_tenpai(hand_at_turn) else 0
                         target_counts = None
                     elif use_related_tile:
-                        num, suit = base_to_discard_num_and_suit(discard.tile // 4)
-                        if num is not None and suit is not None:
-                            counts = hand_to_suit_counts(hand_at_turn, suit)
-                            target_count = 1 if is_related_discard(num, counts) else 0
+                        # 目标牌指定要判断的舍牌，在匹配序列中找最后一次出现目标牌的舍牌，用该时点手牌判断
+                        target_discard_orig_i = None
+                        target_discard = None
+                        for idx in range(j, -1, -1):
+                            oi, d = in_range[idx]
+                            if d.tile // 4 in target_equiv:
+                                target_discard_orig_i = oi
+                                target_discard = d
+                                break
+                        if target_discard_orig_i is not None and target_discard is not None:
+                            if target_discard_orig_i < len(player_state.hand_tiles_history):
+                                hand_at_target = list(player_state.hand_tiles_history[target_discard_orig_i])
+                            else:
+                                hand_at_target = list(player_state.hand_tiles)
+                            num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
+                            if num is not None and suit is not None:
+                                counts = hand_to_suit_counts(hand_at_target, suit)
+                                target_count = 1 if is_related_discard(num, counts) else 0
+                            else:
+                                target_count = 0  # 字牌不参与关联牌判断
                         else:
-                            target_count = 0  # 字牌不参与关联牌判断
+                            target_count = 0  # 目标牌未在匹配序列中出现
                         target_counts = None
                     elif len(mt_item) > 1:
                         target_counts = {}
@@ -2412,7 +2452,8 @@ class LiveAnalyzer:
                                             ):
                                                 continue
                                         mapped_target = matched_variant["target"]
-                                        if not use_tenpai:
+                                        target_equiv = None
+                                        if not use_tenpai and not use_related_tile:
                                             target_equiv = set()
                                             if len(multi_t) == 1:
                                                 if is_combo:
@@ -2429,6 +2470,10 @@ class LiveAnalyzer:
                                                         target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
                                             if discard.tile // 4 in target_equiv:
                                                 continue
+                                        elif use_related_tile:
+                                            target_equiv = MjlogParser.get_count_equivalent_bases(
+                                                MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                                            )
 
                                         if orig_i < len(player_state.hand_tiles_history):
                                             hand_at_turn = list(player_state.hand_tiles_history[orig_i])
@@ -2436,6 +2481,28 @@ class LiveAnalyzer:
                                             hand_at_turn = list(player_state.hand_tiles)
                                         if use_tenpai:
                                             target_count = 1 if is_tenpai(hand_at_turn) else 0
+                                        elif use_related_tile:
+                                            target_discard_idx = None
+                                            target_discard = None
+                                            for k in range(len(in_range_for_cell) - 1, -1, -1):
+                                                idx, dd = in_range_for_cell[k]
+                                                if dd.tile // 4 in target_equiv:
+                                                    target_discard_idx = idx
+                                                    target_discard = dd
+                                                    break
+                                            if target_discard_idx is not None and target_discard is not None:
+                                                if target_discard_idx < len(player_state.hand_tiles_history):
+                                                    hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
+                                                else:
+                                                    hand_at_target = list(player_state.hand_tiles)
+                                                num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
+                                                if num is not None and suit is not None:
+                                                    counts = hand_to_suit_counts(hand_at_target, suit)
+                                                    target_count = 1 if is_related_discard(num, counts) else 0
+                                                else:
+                                                    target_count = 0
+                                            else:
+                                                target_count = 0
                                         elif len(multi_t) > 1:
                                             tk = _target_key(multi_t[0][0], multi_t[0][1])
                                             mt_item = multi_t

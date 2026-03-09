@@ -1304,11 +1304,11 @@ class GridQueryThread(QThread):
             result["turn_ranges"] = self.turn_ranges
             result["analysis_target"] = self.analysis_target
             result["header_row"] = [f"{tmin}-{tmax}巡" for tmin, tmax in self.turn_ranges]
-            # 听牌/关联牌模式下目标为占位符 5z，表头显示为「听牌」「关联牌」
+            # 听牌模式目标为占位符 5z 时表头显示「听牌」；关联牌有真实目标则显示目标
             def _target_display(pat, tgt):
                 if self.analysis_target == "tenpai":
                     return "听牌"
-                if self.analysis_target == "related_tile":
+                if self.analysis_target == "related_tile" and tgt == "5z":
                     return "关联牌"
                 return tgt
             result["header_col"] = [f"{'-'.join(p)}→{_target_display(p, t)}" for p, t in self.patterns]
@@ -1467,8 +1467,13 @@ class BatchChartThread(QThread):
                 return
             table = result.get("table", {})
             header_row = [f"{tmin}-{tmax}巡" for tmin, tmax in self.turn_ranges]
-            t_disp = "听牌" if self.analysis_target == "tenpai" else ("关联牌" if self.analysis_target == "related_tile" else None)
-            header_col = [f"{'-'.join(p)}→{t_disp or t}" for p, t in self.patterns]
+            def _hd_tgt(p, t):
+                if self.analysis_target == "tenpai":
+                    return "听牌"
+                if self.analysis_target == "related_tile" and t == "5z":
+                    return "关联牌"
+                return t
+            header_col = [f"{'-'.join(p)}→{_hd_tgt(p, t)}" for p, t in self.patterns]
             elapsed = result.get("elapsed_seconds", 0)
             self.finished.emit(True, (table, header_row, header_col, elapsed))
         except Exception as e:
@@ -2177,6 +2182,8 @@ class MainWindow(QMainWindow):
         add_tr_btn.setFixedWidth(28)
         add_tr_btn.setToolTip("添加一组巡目范围")
         add_tr_btn.clicked.connect(lambda: self._add_turn_range_pair(turn_ranges_row, add_tr_btn))
+        self._turn_ranges_row_layout = turn_ranges_row
+        self._add_turn_range_btn = add_tr_btn
         turn_ranges_row.addWidget(add_tr_btn)
         turn_ranges_row.addStretch()
         right_layout.addLayout(turn_ranges_row)
@@ -2337,7 +2344,7 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
-            "关联牌判断：判断模式最后一张舍牌是否为关联牌（与手牌搭子距离≤2）（无需输入目标牌）；"
+            "关联牌判断：判断目标牌（须在模式中出现）是否为关联牌（与手牌搭子距离≤2）；"
             "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
@@ -2452,13 +2459,12 @@ class MainWindow(QMainWindow):
             self._pattern_row_widgets.remove(entry)
 
     def _on_analysis_target_changed(self):
-        """和铳率/关联牌判断模式下隐藏目标牌输入（无需目标牌）"""
+        """和铳率模式下隐藏目标牌输入（无需目标牌）；关联牌判断需目标牌（分析该牌的关联度）"""
         if not hasattr(self, "analysis_target_combo"):
             return
         data = self.analysis_target_combo.currentData() or ""
         is_outcome = data == "outcome"
-        is_related_tile = data == "related_tile"
-        hide_target = is_outcome or is_related_tile
+        hide_target = is_outcome
         for pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row in getattr(
             self, "_pattern_row_widgets", []
         ):
@@ -2468,6 +2474,8 @@ class MainWindow(QMainWindow):
             if hide_target:
                 target_edit.clear()
                 target_edit.setPlaceholderText("（无需目标牌）")
+            elif data == "related_tile":
+                target_edit.setPlaceholderText("例: 2p（分析该牌的关联度，须在模式中出现）")
             else:
                 target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
 
@@ -3863,9 +3871,8 @@ class MainWindow(QMainWindow):
         lines.append("分析=%s" % analysis_map.get(analysis, "目标牌存量"))
         turn_ranges = self._get_turn_ranges_from_ui()
         if turn_ranges:
-            t_min = min(r[0] for r in turn_ranges)
-            t_max = max(r[1] for r in turn_ranges)
-            lines.append("巡目=%d-%d" % (t_min, t_max))
+            for t_min, t_max in turn_ranges:
+                lines.append("巡目范围=%d-%d" % (t_min, t_max))
         else:
             lo, hi = self.turn_range_slider.getRange()
             if lo != 1 or hi != 18:
@@ -4014,11 +4021,11 @@ class MainWindow(QMainWindow):
                 continue
             k, _, v = line.partition("=")
             k, v = k.strip(), v.strip()
-            if k in ("模式", "副露区域", "可见"):
+            if k in ("模式", "副露区域", "可见", "巡目范围"):
                 data.setdefault(k, []).append(v)
             else:
                 data[k] = v
-        for k in ("模式", "副露区域", "可见"):
+        for k in ("模式", "副露区域", "可见", "巡目范围"):
             if k in data and isinstance(data[k], str):
                 data[k] = [data[k]]
         return data if data else None
@@ -4095,15 +4102,38 @@ class MainWindow(QMainWindow):
                 if self.analysis_target_combo.itemData(i) == target:
                     self.analysis_target_combo.setCurrentIndex(i)
                     break
-            turn = data.get("巡目", "")
-            if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
-                a, b = turn.split("-")
-                t_min, t_max = int(a), int(b)
-                self.turn_range_slider.setRange(t_min, t_max)
-                for edit in self._turn_range_edits:
-                    edit.clear()
-                if self._turn_range_edits:
-                    self._turn_range_edits[0].setText("%d-%d" % (t_min, t_max))
+            turn_range_strs = data.get("巡目范围") or []
+            if isinstance(turn_range_strs, str):
+                turn_range_strs = [turn_range_strs]
+            turn_range_strs = [s for s in turn_range_strs if isinstance(s, str) and _parse_turn_range(s)]
+            if turn_range_strs:
+                n_needed = len(turn_range_strs)
+                row_layout = getattr(self, "_turn_ranges_row_layout", None)
+                add_btn = getattr(self, "_add_turn_range_btn", None)
+                while len(self._turn_range_edits) < n_needed and row_layout and add_btn:
+                    self._add_turn_range_pair(row_layout, add_btn)
+                for i, s in enumerate(turn_range_strs):
+                    if i < len(self._turn_range_edits):
+                        tr = _parse_turn_range(s)
+                        self._turn_range_edits[i].setText("%d-%d" % (tr[0], tr[1]) if tr else s)
+                for i in range(n_needed, len(self._turn_range_edits)):
+                    self._turn_range_edits[i].clear()
+                all_ok = [_parse_turn_range(s) for s in turn_range_strs]
+                all_ok = [x for x in all_ok if x]
+                if all_ok:
+                    t_min = min(r[0] for r in all_ok)
+                    t_max = max(r[1] for r in all_ok)
+                    self.turn_range_slider.setRange(t_min, t_max)
+            else:
+                turn = data.get("巡目", "")
+                if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
+                    a, b = turn.split("-")
+                    t_min, t_max = int(a), int(b)
+                    self.turn_range_slider.setRange(t_min, t_max)
+                    for edit in self._turn_range_edits:
+                        edit.clear()
+                    if self._turn_range_edits:
+                        self._turn_range_edits[0].setText("%d-%d" % (t_min, t_max))
             self._apply_share_string_dora(data, instant=False)
             self._apply_share_string_riichi_call_south(data, instant=False)
             self._apply_share_string_prior_call_area(data, instant=False)
@@ -4265,7 +4295,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("请粘贴之前生成的分享串（多行 key=value 格式）："))
         te = QTextEdit()
-        te.setPlaceholderText("例：\nRHM1\n模式=7s-9s→6s\n分析=目标牌存量\n巡目=1-6\n...")
+        te.setPlaceholderText("例：\nRHM1\n模式=7s-9s→6s\n分析=目标牌存量\n巡目=1-6\n或 巡目范围=1-3\n巡目范围=4-6\n巡目范围=7-9\n...")
         te.setMinimumSize(420, 200)
         layout.addWidget(te)
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4293,14 +4323,14 @@ class MainWindow(QMainWindow):
         use_instant = (analysis_target == "deal_in_instant")
         use_outcome = (analysis_target == "outcome")
         use_related_tile = (analysis_target == "related_tile")
-        require_target = not (use_tenpai or use_outcome or use_related_tile)
+        require_target = not (use_tenpai or use_outcome)  # 关联牌判断需目标牌（分析该牌的关联度）
         query_items = self._get_pattern_items(require_target=require_target)
         if not query_items:
             msg = "请至少输入一个舍牌模式"
             if require_target:
                 msg += "和对应的目标牌"
             elif use_outcome:
-                msg += "（和铳率/关联牌判断无需目标牌）"
+                msg += "（和铳率无需目标牌）"
             QMessageBox.warning(self, "输入错误", msg)
             return
         first_pattern, first_target = query_items[0]
