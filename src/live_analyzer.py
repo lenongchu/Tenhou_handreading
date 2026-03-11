@@ -598,11 +598,16 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         ]
                         riichi_flags_for_cell = [discard_riichi_flags[idx] for idx, _ in in_range_for_cell]
                         visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                        hand_after_by_index = [
+                            list(player_state.hand_tiles_history[idx]) if idx < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
+                            for idx, _ in in_range_for_cell
+                        ]
                         honor_ctx = {
                             **honor_ctx_base,
                             "visible_tiles": visible_with_own,
                             "current_discard_turn": discard_turn,
                             "discard_riichi_flags": riichi_flags_for_cell,
+                            "hand_after_by_index": hand_after_by_index,
                         }
                         pattern, target = patterns[pat_idx]
                         cs = get_consumed_search_patterns(pattern)
@@ -841,7 +846,13 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             instant_deal_in_dist_per_pattern.append(d)
 
     try:
+        # 把数据库里的 log 内容转成可解析的原始文本/JSON 字符串（raw content）。
         raw = _get_raw_content(log_content)
+
+        # 【快速过滤（fast prefilter）】如果用户勾选“任意立直（riichi_any）”，
+        # 且该 log 是 tenhou6 JSON，那么可以先做一次纯字符串判断：
+        # tenhou6 JSON 完全不包含 "riichi"/"reach" 时，后续也不可能命中“存在立直宣言”的约束，
+        # 直接 early return 避免 parse 成 GameState（性能优化）。
         if riichi_any and _is_tenhou6_json(raw):
             if "riichi" not in raw and "reach" not in raw:
                 return {"total_matches": 0, "outcome_wins": 0, "outcome_deal_ins": 0,
@@ -850,6 +861,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                         "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                         "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
                         "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
+
+        # 【快速过滤（fast prefilter）】consumed_search_list 是从“消耗牌约束”衍生出的关键字搜索串。
+        # 对 tenhou6 JSON 可以先在 raw 里做轻量 contains 检查，不通过则整局必不可能满足约束，直接 early return。
         if consumed_search_list and _is_tenhou6_json(raw):
             if len(items) == 1:
                 if not log_contains_consumed(raw, consumed_search_list[0]):
@@ -867,7 +881,12 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "pattern_matches": pattern_matches, "pattern_distributions": pattern_distributions,
                             "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
                             "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
+
+        # 即时铳率（instant deal-in）需要 tenhou6 的事件流载荷（round payload）。
+        # 只在 use_deal_in_instant=True 时提取，避免无谓的解析成本。
         round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
+
+        # 将整局日志解析成逐玩家的 GameState 序列（每小局 4 个玩家状态为一组）。
         game_states = parse_log_to_game_states(raw)
         round_size = 4
 
@@ -934,11 +953,16 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 for j, (orig_i, discard) in enumerate(in_range):
                     full_discards_up_to_now = all_discards_precomputed[: orig_i + 1]
                     visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                    hand_after_by_index = [
+                        list(player_state.hand_tiles_history[i]) if i < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
+                        for i in range(len(full_discards_up_to_now))
+                    ]
                     honor_ctx = {
                         **honor_ctx_base,
                         "visible_tiles": visible_with_own,
                         "current_discard_turn": discard.turn,
                         "discard_riichi_flags": all_riichi_flags[: orig_i + 1],
+                        "hand_after_by_index": hand_after_by_index,
                     }
                     matched_variant = None
                     matched_idx = -1
@@ -2367,11 +2391,16 @@ class LiveAnalyzer:
                                             full_discards_up_to_now = discards_precomputed[: orig_i + 1]
                                             riichi_flags_for_cell = discard_riichi_flags[: orig_i + 1]
                                             visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                                            hand_after_by_index = [
+                                                list(player_state.hand_tiles_history[i]) if i < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
+                                                for i in range(len(full_discards_up_to_now))
+                                            ]
                                             honor_ctx = {
                                                 **honor_ctx_base,
                                                 "visible_tiles": visible_with_own,
                                                 "current_discard_turn": discard_turn,
                                                 "discard_riichi_flags": riichi_flags_for_cell,
+                                                "hand_after_by_index": hand_after_by_index,
                                             }
                                             pattern, target = patterns[pat_idx]
                                             cs = get_consumed_search_patterns(pattern)
@@ -2807,12 +2836,16 @@ class LiveAnalyzer:
                                 current_riichi_flags = all_riichi_flags[:orig_i + 1]
                                 hand_discard_strings = _format_actual_pattern(full_discards_up_to_now, current_riichi_flags)
                                 visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
-
+                                hand_after_by_index = [
+                                    list(player_state.hand_tiles_history[i]) if i < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
+                                    for i in range(len(full_discards_up_to_now))
+                                ]
                                 honor_ctx = {
                                     **honor_ctx_base,
                                     "visible_tiles": visible_with_own,
                                     "current_discard_turn": discard.turn,
                                     "discard_riichi_flags": current_riichi_flags,
+                                    "hand_after_by_index": hand_after_by_index,
                                 }
                                 matched_variant = match_discard_to_variant(full_discards_up_to_now, variants, honor_ctx)
                                 if not matched_variant:

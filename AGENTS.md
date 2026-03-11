@@ -149,13 +149,14 @@
 | | `t` | 必须摸切 | `3mt` |
 | | `f` | 手切或摸切皆可 | `3mf` |
 | | `r` | 立直宣言牌 | `3mr` (手切), `3mtr` (摸切) |
+| | `k` | 关联牌（手牌中存在数字差≤2的搭子或对子） | `2pk` |
 | **立直细分** | `r` | **手切**立直宣言 (Tedashi Riichi) | `3mr` |
 | | `tr` 或 `rt` | **摸切**立直宣言 (Tsumogiri Riichi) | `3mtr` |
 | | `fr` | **手/摸皆可**立直宣言 | `3mfr` |
 | **序列与逻辑** | `-` 或 `AND` | 顺序分隔 | `3s-1s`, `3sAND1s` |
 | | `*` | 任意数量摸切 | `3s-*-1s` |
 | | `$` | 任意一张手切 | `c0p6p-$` |
-| | `[xy]suit` | **数字范围**：x 到 y 连续（含两端），共 (y−x+1) 张；与单张相同，**无后缀默认手切**，可加 `t`（摸切）或 `f`（手摸切皆可），如 `[29]mf` | `[39]p`=3p~9p 共 7 张（仅手切）；`[17]z`=1z~7z；`[29]mf`=2m~9m 手摸切皆可 |
+| | `[xy]suit` | **数字范围**：x 到 y 连续（含两端），共 (y−x+1) 张；与单张相同，**无后缀默认手切**，可加 `t`（摸切）、`f`（手摸切皆可）或 `k`（关联牌），如 `[29]mf`、`[25]mk` | `[39]p`=3p~9p 共 7 张（仅手切）；`[17]z`=1z~7z；`[25]mk`=2m~5m 其一且为关联牌 |
 | | `OR` | 逻辑或 | `3mOR5m`, `[25]m`（[25]m 即 2m~5m 其一） |
 | | `NOT` | 逻辑非 | `NOTm`, `zNOT1z`, `NOT[45]m`（排除 4m,5m） |
 | **占位符** | `z`/`zt` | 任意字牌/摸切字牌 | `z-zt` |
@@ -357,6 +358,7 @@
 
 ## 七、维护约定
 
+- **代码注释**：编写或修改代码时，在每一段有逻辑意义的代码旁增加注释；注释用中文，技术术语附英文括注。详见 `.cursor/skills/code-comments/SKILL.md`。
 - **修改牌编码逻辑**：改 `mjlog_parser.TileUtils` 与 `tenhou6_adapter.TENHOU6_TO_BASE`
 - **修改舍牌模式语法**：改 `equivalent_variants`，与 `docs/dora_constraint_equivalence.md`、`docs/honor_tile_variants_design.md` 一致
 - **修改等价/映射逻辑**：确保 `generate_equivalent_variants` 与 `_dora_matches_constraint` 语义一致

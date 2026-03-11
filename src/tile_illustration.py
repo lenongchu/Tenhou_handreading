@@ -275,6 +275,11 @@ def _parse_notation_to_tiles(notation: str) -> Optional[List[str]]:
             elif re.fullmatch(r"[0-9][mps]|\d?z|[东南西北白发中]", p):
                 tiles.append(p)
             elif len(p) >= 2:
+                # strip t/f/r/k suffixes for display (2pk -> 2p, 3mt -> 3m, 东r -> 东)
+                if p[-1] in "tfrk" and len(p) >= 2 and (p[-2] in "mpsz" or (len(p) == 2 and p[0] in "东南西北白发中")):
+                    tiles.append(p[:-1])
+                else:
+                    tiles.append(p)
                 tiles.append(p)
     else:
         tiles = re.findall(r"[0-9][mps]|\d?z|[东南西北白发中]", notation.replace(" ", ""))

@@ -10,6 +10,7 @@
 3. 顺序敏感：3s-1s ≠ 1s-3s
 
 摸切符号：牌后加 t 表示必须摸切，f 表示手切或摸切皆可；如 "3mt-1m" = 3m 摸切、1m 手切；"3mf" = 3m 手摸切皆可。
+k 后缀：牌后加 k 表示该牌为关联牌（手牌中存在与打出牌数字差 ≤ 2 的搭子或对子），如 "2pk"。
 * : 任意数量的摸切
 $ : 任意一张手切（吃/碰之后的牌必为手切，如 c0p6p-$）
 cd1/cd2 : 拆搭（两张同花色数值差0-2的手切，含对子1m-1m、两面1m-2m、嵌张1m-3m等；1s9s不是搭子）。cd2 约束：拆搭花色≠目标牌花色
@@ -20,6 +21,7 @@ from typing import List, Dict, Tuple, Optional, Union
 from itertools import product, permutations
 
 from .mjlog_parser import MjlogParser
+from .related_tile_utils import is_related_discard, hand_to_suit_counts, base_to_discard_num_and_suit
 
 
 # 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), ap=安牌(满足其一：该字牌可见1-3枚 或 非场风非三元可见0张，不含本张), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
@@ -42,6 +44,8 @@ CD_PREFIX = "@cd:"
 # 逻辑符号：@n:base,excl 表示 NOT（base 但排除 excl）；@o:a,b,c 表示 OR（匹配其一）
 NOT_PREFIX = "@n:"
 OR_PREFIX = "@o:"
+# 关联牌：@k:tile 表示该舍牌须为关联牌（手牌中存在数字差≤2的搭子或对子）
+RELATED_PREFIX = "@k:"
 
 # 各花色 base 集合（含赤五）：用于 prior_discard_exclusion NOTm/p/s
 _SUIT_FORBIDDEN_BASES = {
@@ -83,11 +87,13 @@ def _forbidden_bases_from_parsed_tile(tile: str) -> frozenset:
             for e in comps[1:]:
                 out.add(MjlogParser.string_to_tile(e))
             return frozenset(out)
+    if tile.startswith(RELATED_PREFIX):
+        return _forbidden_bases_from_parsed_tile(tile[len(RELATED_PREFIX):])
     if tile.startswith(OR_PREFIX):
         parts = [x.strip() for x in tile[len(OR_PREFIX):].split(",") if x.strip()]
         out = set()
         for p in parts:
-            tp = p[:-1] if (p.endswith("t") or p.endswith("f")) else p
+            tp = p[len(RELATED_PREFIX):] if p.startswith(RELATED_PREFIX) else (p[:-1] if (p.endswith("t") or p.endswith("f")) else p)
             if tp.startswith(NOT_PREFIX) or tp.startswith(OR_PREFIX):
                 out |= _forbidden_bases_from_parsed_tile(tp)
             else:
@@ -634,6 +640,9 @@ def _is_simple_tile_or_placeholder(t: str) -> bool:
     # 带 t 摸切或 f 手摸切皆可：3mt、3mf
     if (t.endswith("t") or t.endswith("f")) and len(t) >= 3:
         return _is_simple_tile_or_placeholder(t[:-1])
+    # 带 k 关联牌：2pk、[25]mk
+    if t.startswith(RELATED_PREFIX):
+        return _is_simple_tile_or_placeholder(t[len(RELATED_PREFIX):])
     return False
 
 
@@ -663,8 +672,8 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
         return (s[0], None)
     if s in SUIT_WILDCARDS:
         return (s, False)
-    # [xy] 数字范围：[25]m = 2m,3m,4m,5m 其一；[17]z = 1z..7z；支持 t/r/f 后缀
-    m_range = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f)?$", s, re.IGNORECASE)
+    # [xy] 数字范围：[25]m = 2m,3m,4m,5m 其一；[17]z = 1z..7z；支持 t/r/f/k 后缀
+    m_range = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f|k)?$", s, re.IGNORECASE)
     if m_range:
         x, y, suit_or_z, suffix = m_range.group(1), m_range.group(2), m_range.group(3).lower(), m_range.group(4)
         lo, hi = int(x), int(y)
@@ -677,6 +686,10 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
                 for n in range(lo, hi + 1):
                     tiles.append(f"{n}{suit_or_z}" + (suffix or ""))
             tsumo_val = True if suffix == "t" else (None if suffix == "f" else False)
+            if suffix == "k" and suit_or_z != "z":
+                # [25]mk -> @o:@k:2m,@k:3m,@k:4m,@k:5m（仅数牌支持关联牌）
+                k_tiles = [f"{RELATED_PREFIX}{t}" for t in tiles]
+                return (f"{OR_PREFIX}{','.join(k_tiles)}", False)
             return (f"{OR_PREFIX}{','.join(tiles)}", tsumo_val)
     # NOT[xy] 排除范围：NOT[45]m = 4m,5m 之外均可；NOT[17]z = 1z..7z 之外均可
     m_not_range = re.match(r"^[Nn][Oo][Tt]\[(\d)(\d)\]([mpsz])$", s)
@@ -696,13 +709,17 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
         parts = [p.strip() for p in parts if p.strip()]
         expanded = []
         for p in parts:
-            m_r = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f)?$", p, re.IGNORECASE)
+            m_r = re.match(r"^\[(\d)(\d)\]([mpsz])(t|r|f|k)?$", p, re.IGNORECASE)
             if m_r:
                 x, y, suit_or_z, suffix = m_r.group(1), m_r.group(2), m_r.group(3).lower(), m_r.group(4)
                 lo, hi = int(x), int(y)
                 if lo <= hi:
-                    for n in range(lo, hi + 1):
-                        expanded.append(f"{n}{suit_or_z}" + (suffix or ""))
+                    if suffix == "k" and suit_or_z != "z":
+                        for n in range(lo, hi + 1):
+                            expanded.append(f"{RELATED_PREFIX}{n}{suit_or_z}")
+                    else:
+                        for n in range(lo, hi + 1):
+                            expanded.append(f"{n}{suit_or_z}" + (suffix or ""))
                     continue
             expanded.append(p)
         if len(expanded) >= 2 and all(_is_simple_tile_or_placeholder(p) for p in expanded):
@@ -775,6 +792,36 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
         if base in RED_FIVES:
             return (base, True)  # 赤五摸切
         return (base, True)  # 普通牌摸切
+    # k 后缀：关联牌（手牌中存在数字差≤2的搭子或对子）；仅数牌有效，可与 t/f/r 组合
+    if s.endswith("k") and len(s) >= 2:
+        base = s[:-1]
+        is_tsumo = False
+        inner = base
+        if base.endswith("t"):
+            is_tsumo = True
+            inner = base[:-1]
+        elif base.endswith("f"):
+            is_tsumo = None
+            inner = base[:-1]
+        # inner 可能含 r：2pr -> @r:2p
+        if inner.endswith("r") and len(inner) >= 2:
+            r_inner = inner[:-1]
+            if r_inner.endswith("t"):
+                is_tsumo = True
+                r_inner = r_inner[:-1]
+            elif r_inner.endswith("f"):
+                is_tsumo = None
+                r_inner = r_inner[:-1]
+            if r_inner in RED_FIVES or (len(r_inner) >= 2 and r_inner[-1] in "mps" and (r_inner[0].isdigit() or r_inner in RED_FIVES)):
+                return (f"{RELATED_PREFIX}{CALL_PREFIX}r:{r_inner}", is_tsumo)
+            if r_inner in HONOR_PLACEHOLDERS:
+                return (f"{RELATED_PREFIX}{CALL_PREFIX}r:{r_inner}", is_tsumo)
+        if inner in RED_FIVES or (len(inner) >= 2 and inner[-1] in "mps" and (inner[0].isdigit() or inner in RED_FIVES)):
+            return (f"{RELATED_PREFIX}{inner}", is_tsumo)
+        if len(inner) == 2 and inner[0] in "1-7" and inner[1] == "z":
+            return (f"{RELATED_PREFIX}{inner}", is_tsumo)
+        if inner in HONOR_PLACEHOLDERS:
+            return (f"{RELATED_PREFIX}{inner}", is_tsumo)
     return (s, False)
 
 
@@ -927,6 +974,9 @@ def _apply_suit_mapping_to_tile(tile: str, mapping: Dict[str, str]) -> str:
     """对单张牌/占位符应用花色映射 mapping: {m,p,s} -> {m,p,s}"""
     if tile in ("*", "$"):
         return tile
+    if tile.startswith(RELATED_PREFIX):
+        inner = _apply_suit_mapping_to_tile(tile[len(RELATED_PREFIX):], mapping)
+        return f"{RELATED_PREFIX}{inner}"
     if tile.startswith(CD_PREFIX):
         suf = tile[len(CD_PREFIX):]
         if suf in "mps":
@@ -1310,9 +1360,19 @@ def generate_equivalent_variants(
     def _is_red_five(tile: str) -> bool:
         return tile in RED_FIVES
 
-    has_number = any(_is_number_tile(tile) for tile, _ in parsed_pattern) or any(
-        tile.startswith("@r:") and _is_number_tile(tile[3:]) for tile, _ in parsed_pattern
-    )
+    def _pattern_has_number_tile(tile: str) -> bool:
+        if _is_number_tile(tile):
+            return True
+        if tile.startswith("@r:"):
+            return _is_number_tile(tile[3:])
+        if tile.startswith(RELATED_PREFIX):
+            inner = tile[len(RELATED_PREFIX):]
+            if inner.startswith("@r:"):
+                return _is_number_tile(inner[3:])
+            return _is_number_tile(inner)
+        return False
+
+    has_number = any(_pattern_has_number_tile(tile) for tile, _ in parsed_pattern)
     has_chi = any(tile.startswith("@c:") for tile, _ in parsed_pattern)
     has_pon = any(tile.startswith("@p:") for tile, _ in parsed_pattern)
     has_riichi = any(tile.startswith("@r:") for tile, _ in parsed_pattern)
@@ -1629,6 +1689,49 @@ def _match_pattern_at_end(
         tile_str, is_tsumogiri = full_discards[d_idx]
         pat_tile, pat_want_tsumogiri = pattern[p_idx]
 
+        # 关联牌 @k:：消耗一张舍牌，该舍牌须为关联牌（手牌中存在数字差≤2的搭子或对子）
+        if pat_tile.startswith(RELATED_PREFIX):
+            inner = pat_tile[len(RELATED_PREFIX):]
+            # 内层可为 @r:2p 或 2p
+            if inner.startswith(f"{CALL_PREFIX}r:"):
+                want_tile = inner[3:]
+                riichi_flags = ctx.get("discard_riichi_flags") or []
+                if d_idx >= len(riichi_flags) or not riichi_flags[d_idx]:
+                    return False
+                if want_tile != "ap" and tile_str != want_tile:
+                    return False
+                if want_tile == "ap" and (not _is_honor_tile(tile_str) or not _ap_condition_met(
+                    ctx.get("visible_tiles") or {}, tile_str, ctx.get("bakaze"))):
+                    return False
+            else:
+                tile_canon = _honor_tile_to_z(tile_str) if _is_honor_tile(tile_str) else tile_str
+                inner_canon = _honor_tile_to_z(inner) if _is_honor_tile(inner) else inner
+                if tile_canon != inner_canon:
+                    return False
+            if pat_want_tsumogiri is not None and is_tsumogiri != pat_want_tsumogiri:
+                return False
+            hand_after_by_index = ctx.get("hand_after_by_index")
+            slice_start = ctx.get("slice_start_for_cd", 0)
+            if hand_after_by_index is not None:
+                try:
+                    base = MjlogParser.string_to_tile(tile_str)
+                    num, suit = base_to_discard_num_and_suit(base)
+                    if num is not None and suit is not None:
+                        hand_after = hand_after_by_index[slice_start + d_idx]
+                        counts = hand_to_suit_counts(hand_after, suit)
+                        if not is_related_discard(num, counts):
+                            return False
+                except (IndexError, KeyError, TypeError):
+                    return False
+            else:
+                return False
+            consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
+            d_idx -= 1
+            p_idx -= 1
+            continue
+
         # 立直宣言牌 @r:：消耗一张舍牌，该舍牌须为立直宣言
         if pat_tile.startswith("@r:"):
             want_tile = pat_tile[3:]
@@ -1755,7 +1858,7 @@ def _match_pattern_at_end(
             matched_opt = None
             for opt in options:
                 want_tsumogiri_opt = True if opt.endswith("t") else (None if opt.endswith("f") else False)
-                tile_part = opt[:-1] if (opt.endswith("t") or opt.endswith("f")) else opt
+                tile_part = opt[len(RELATED_PREFIX):] if opt.startswith(RELATED_PREFIX) else (opt[:-1] if (opt.endswith("t") or opt.endswith("f")) else opt)
                 if tile_part in ("$", "*"):
                     # $=手切 *＝摸切，不比较牌面，只比较摸切状态
                     want_hand = tile_part == "$"
@@ -1809,6 +1912,24 @@ def _match_pattern_at_end(
                         break
             if matched_opt is None:
                 return False
+            if matched_opt.startswith(RELATED_PREFIX):
+                hand_after_by_index = ctx.get("hand_after_by_index")
+                slice_start = ctx.get("slice_start_for_cd", 0)
+                if hand_after_by_index is not None:
+                    try:
+                        base = MjlogParser.string_to_tile(tile_str)
+                        num, suit = base_to_discard_num_and_suit(base)
+                        if num is not None and suit is not None:
+                            hand_after = hand_after_by_index[slice_start + d_idx]
+                            counts = hand_to_suit_counts(hand_after, suit)
+                            if not is_related_discard(num, counts):
+                                return False
+                        else:
+                            return False
+                    except (IndexError, KeyError, TypeError):
+                        return False
+                else:
+                    return False
             consumed_any_discard = True
             if out_position_to_tile is not None:
                 out_position_to_tile[p_idx] = tile_str
