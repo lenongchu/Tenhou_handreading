@@ -3197,11 +3197,12 @@ def _actual_pattern_to_full_discards(actual_pattern: List[str]) -> Tuple[List[Tu
     "1mt" -> (1m, True), riichi=False
     "1mr" -> (1m, False), riichi=True (手切立直)
     "1mtr" -> (1m, True), riichi=True (摸切立直)
+    单字符字牌（东/南/西/北/白/发/中）走 else 分支，解析为 (s, False)。
     """
     result = []
     riichi_flags = []
     for s in actual_pattern:
-        if not s or len(s) < 2:
+        if not s:
             continue
         if s.endswith("tr") or s.endswith("rt"):
             result.append((s[:-2], True))

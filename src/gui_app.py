@@ -3528,7 +3528,7 @@ class MainWindow(QMainWindow):
                     rows.append(_row(pattern, target, prob))
 
         rows.append("")
-        rows.append(f"分析半庄数\t{result.get('total_logs_analyzed', 0)}")
+        rows.append(f"总匹配样本数\t{result.get('total_matches', 0)}")
         rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
         return "\n".join(rows)
 
@@ -3670,7 +3670,7 @@ class MainWindow(QMainWindow):
                     f"{pattern_merged}\t{tk}\t{turn_str}\t{rate:.2%}\t{hits_sum}\t{p_avg:.1f}\t{intensity:.2f}"
                 )
             excel_rows.append("")
-            excel_rows.append(f"分析半庄数\t{result.get('total_logs_analyzed', 0)}")
+            excel_rows.append(f"总匹配样本数\t{total_matches}")
             excel_rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
             self._excel_clipboard_text = "\n".join(excel_rows)
             return
@@ -3719,7 +3719,7 @@ class MainWindow(QMainWindow):
         p3 = probs[3] if len(probs) > 3 else 0
         base_rows.append(f"【合并】\t{target}\t{turn_str}\t{p0:.2f}\t{p1:.2f}\t{p2:.2f}\t{p3:.2f}")
         base_rows.append("")
-        base_rows.append(f"分析半庄数\t{result.get('total_logs_analyzed', 0)}")
+        base_rows.append(f"总匹配样本数\t{total_matches}")
         base_rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
         self._excel_clipboard_text = "\n".join(base_rows)
 
