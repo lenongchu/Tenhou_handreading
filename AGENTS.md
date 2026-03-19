@@ -73,6 +73,20 @@
  database (tenhou.db): logs | game_states | visible_tile_stats
 ```
 
+### 1.3.1 live_analyzer 内部架构（2025-03 重构）
+
+主界面分析（Analyze）与矩阵分析（Grid）共用同一套匹配逻辑，由以下组件构成：
+
+| 组件 | 职责 |
+|------|------|
+| `iter_valid_discards` | 生成器：扁平化遍历局→玩家→舍牌，统一前置过滤（南三南四、宝牌、消耗牌、副露、立直、巡目等） |
+| `MatchValidator` | 匹配后统一约束校验（禁打、前段有打、宝牌、立直、副露、可见牌、目标牌排除） |
+| `_core_match_engine` | 核心匹配引擎：预检 → 解析 → `iter_valid_discards` → 变体匹配 → `MatchValidator`，产出匹配样本迭代器 |
+| `_process_one_log_analyze` | 主界面 per-log worker：调用 `_core_match_engine(is_grid=False)`，聚合统计（target_count、即时铳率、sample_pool 等） |
+| `_process_one_log_grid` | 矩阵 per-log worker：调用 `_core_match_engine(is_grid=True)`，按 cell 聚合 target_count 分布 |
+
+Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` 及返回结构不可变更。
+
 ### 1.4 舍牌示意图（tile_illustration）
 
 ```
@@ -256,7 +270,7 @@
 | `mjlog_parser` | 牌谱数据结构、牌编码工具 | GameState, Discard, CallInfo, TileUtils |
 | `tenhou6_adapter` | tenhou6 JSON → GameState | _parse_round_from_tenhou6 |
 | `equivalent_variants` | 舍牌模式解析、等价变体、约束匹配 | generate_equivalent_variants, parse_target_tiles, match_discard_to_variant |
-| `live_analyzer` | 实时分析：模式匹配 + 概率计算 | LiveAnalyzer.analyze, get_database_stats |
+| `live_analyzer` | 实时分析：模式匹配 + 概率计算 | LiveAnalyzer.analyze, get_database_stats；内部：iter_valid_discards, MatchValidator, _core_match_engine, _process_one_log_analyze/grid |
 | `instant_deal_in` | 即时铳率引擎：事件重放、完整振听、理论点 | RoundInstantDealInAnalyzer, extract_tenhou6_rounds |
 | `database` | SQLite：logs, game_states, visible_tile_stats | Database.create_tables, insert_game_state |
 | `tenpai_utils` | 听牌判断 | is_tenpai (mahjong 库) |
