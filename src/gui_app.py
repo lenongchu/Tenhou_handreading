@@ -2197,6 +2197,7 @@ class MainWindow(QMainWindow):
         turn_ranges_row = QHBoxLayout()
         turn_ranges_row.setSpacing(6)
         self._turn_range_edits: List[QLineEdit] = []
+        self._turn_range_containers: List[Tuple[QWidget, QLineEdit]] = []
         for _ in range(5):
             self._add_turn_range_pair(turn_ranges_row, None)
         add_tr_btn = QPushButton("+")
@@ -2409,18 +2410,38 @@ class MainWindow(QMainWindow):
         return group
 
     def _add_turn_range_pair(self, layout: QHBoxLayout, add_btn: Optional[QPushButton] = None):
-        """添加一个巡目范围输入框，支持 1-12 格式，默认留空时用上方滑块"""
+        """添加一组巡目范围（输入框 + 删除按钮），支持 1-12 格式，默认留空时用上方滑块"""
+        container = QWidget()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
         edit = QLineEdit()
         edit.setPlaceholderText("1-12")
         edit.setFixedWidth(56)
         edit.setMaxLength(6)
         edit.setToolTip("输入 最小-最大，如 1-6、4-9")
+        row.addWidget(edit)
+        del_btn = QPushButton("×")
+        del_btn.setFixedSize(22, 22)
+        del_btn.setToolTip("删除此组巡目范围")
+        row.addWidget(del_btn)
         if add_btn is not None:
             idx = layout.indexOf(add_btn)
-            layout.insertWidget(idx, edit)
+            layout.insertWidget(idx, container)
         else:
-            layout.addWidget(edit)
+            layout.addWidget(container)
         self._turn_range_edits.append(edit)
+        self._turn_range_containers.append((container, edit))
+
+        def do_remove():
+            # 从布局移除并销毁容器，同步移除 _turn_range_edits 中的引用
+            layout.removeWidget(container)
+            container.deleteLater()
+            self._turn_range_edits.remove(edit)
+            self._turn_range_containers.remove((container, edit))
+
+        del_btn.clicked.connect(do_remove)
 
     def _get_turn_ranges_from_ui(self) -> List[Tuple[int, int]]:
         """从巡目范围输入框读取有效范围列表（去重保留顺序）。留空则跳过，全部留空时由滑块决定"""
@@ -2609,11 +2630,16 @@ class MainWindow(QMainWindow):
         row1b = QHBoxLayout()
         row1b.addWidget(QLabel("假想振听牌:"))
         self.instant_hypothetical_furiten_input = QLineEdit()
-        self.instant_hypothetical_furiten_input.setPlaceholderText("例: 6p 或 6p,7p（若也会放铳则不计入主铳率）")
+        self.instant_hypothetical_furiten_input.setPlaceholderText("例: 6p 或 6p,7p")
         self.instant_hypothetical_furiten_input.setToolTip(
             "若假想振听牌在该时点也会放铳，则该匹配不计入主铳率，而是计入「因假想振听牌被排除的案列数」"
         )
         row1b.addWidget(self.instant_hypothetical_furiten_input, 1)
+        # 功能区旁说明：多张用逗号分隔，若该牌也会放铳则不计入主铳率
+        furiten_hint = QLabel("多张用逗号分隔，如 6p,7p；若该牌也会放铳则不计入主铳率")
+        furiten_hint.setStyleSheet("color: gray; font-size: 11px;")
+        furiten_hint.setWordWrap(True)
+        row1b.addWidget(furiten_hint, 0)
         layout.addLayout(row1b)
 
         # 约束区
