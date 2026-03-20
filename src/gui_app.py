@@ -255,6 +255,8 @@ class MainWindow(QMainWindow):
         self._forced_analysis_target = None  # 由铳率分析页强制指定 analysis_target
         self._excel_clipboard_text = ""  # 当前结果的 Excel 格式文本
         self._pattern_checkboxes = []  # 多模式勾选框列表
+        self.visible_constraint_row_refs = []  # 场上可见枚数约束引用
+        self.hand_visible_constraint_row_refs = []  # 手牌可见枚数约束引用
         self._archive_entries: List[Dict[str, Any]] = []  # 存档条目列表
         self._archive_folders: List[Dict[str, Any]] = []  # 文件夹列表 [{id, name}, ...]
 
@@ -620,6 +622,7 @@ class MainWindow(QMainWindow):
         self.visible_constraint_scroll.setMaximumHeight(100)
         self.visible_constraint_rows_widget = QWidget()
         self.visible_constraint_rows_widget.setMinimumWidth(596)
+        # QGridLayout(parent) 已自动安装到 parent，勿再 setLayout 以免重复安装
         self.visible_constraint_rows_layout = QGridLayout(self.visible_constraint_rows_widget)
         self.visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
         self.visible_constraint_rows_layout.setSpacing(2)
@@ -631,6 +634,40 @@ class MainWindow(QMainWindow):
         self.visible_constraint_row_refs = []
         right_layout.addWidget(self.visible_constraint_scroll)
         self._add_visible_constraint_row()
+        
+        # 手牌可见枚数（延伸手牌：手牌+牌山，对除目标玩家外的三名玩家分别判断）
+        right_layout.addSpacing(4)
+        hvc_header = QHBoxLayout()
+        hvc_header.addWidget(QLabel("手牌可见枚数 (延伸手牌)"))
+        self.add_hand_visible_constraint_btn = QPushButton("+ 添加")
+        self.add_hand_visible_constraint_btn.setFixedWidth(72)
+        self.add_hand_visible_constraint_btn.clicked.connect(self._add_hand_visible_constraint_row)
+        hvc_header.addWidget(self.add_hand_visible_constraint_btn)
+        hvc_help_btn = QPushButton("?")
+        hvc_help_btn.setFixedWidth(24)
+        hvc_help_btn.setToolTip("手牌可见枚数说明")
+        hvc_help_btn.clicked.connect(self._show_hand_visible_help)
+        hvc_header.addWidget(hvc_help_btn)
+        hvc_header.addStretch()
+        right_layout.addLayout(hvc_header)
+        self.hand_visible_constraint_scroll = QScrollArea()
+        self.hand_visible_constraint_scroll.setWidgetResizable(True)
+        self.hand_visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.hand_visible_constraint_scroll.setMinimumHeight(52)
+        self.hand_visible_constraint_scroll.setMaximumHeight(100)
+        self.hand_visible_constraint_rows_widget = QWidget()
+        self.hand_visible_constraint_rows_widget.setMinimumWidth(596)
+        self.hand_visible_constraint_rows_layout = QGridLayout(self.hand_visible_constraint_rows_widget)
+        self.hand_visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.hand_visible_constraint_rows_layout.setSpacing(2)
+        self.hand_visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.hand_visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.hand_visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.hand_visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.hand_visible_constraint_scroll.setWidget(self.hand_visible_constraint_rows_widget)
+        self.hand_visible_constraint_row_refs = []
+        right_layout.addWidget(self.hand_visible_constraint_scroll)
+        self._add_hand_visible_constraint_row()
         
         # 分析目标 + 样本上限 + 匹配状态保留条数
         opts_row = QHBoxLayout()
@@ -1080,6 +1117,39 @@ class MainWindow(QMainWindow):
         c_layout.addWidget(self.instant_visible_constraint_scroll)
         self._instant_add_visible_constraint_row()
 
+        c_layout.addSpacing(4)
+        hvc_header = QHBoxLayout()
+        hvc_header.addWidget(QLabel("手牌可见枚数 (延伸手牌)"))
+        self.instant_add_hand_visible_constraint_btn = QPushButton("+ 添加")
+        self.instant_add_hand_visible_constraint_btn.setFixedWidth(72)
+        self.instant_add_hand_visible_constraint_btn.clicked.connect(self._instant_add_hand_visible_constraint_row)
+        hvc_header.addWidget(self.instant_add_hand_visible_constraint_btn)
+        hvc_help_btn = QPushButton("?")
+        hvc_help_btn.setFixedWidth(24)
+        hvc_help_btn.setToolTip("手牌可见枚数说明")
+        hvc_help_btn.clicked.connect(self._show_hand_visible_help)
+        hvc_header.addWidget(hvc_help_btn)
+        hvc_header.addStretch()
+        c_layout.addLayout(hvc_header)
+        self.instant_hand_visible_constraint_scroll = QScrollArea()
+        self.instant_hand_visible_constraint_scroll.setWidgetResizable(True)
+        self.instant_hand_visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.instant_hand_visible_constraint_scroll.setMinimumHeight(52)
+        self.instant_hand_visible_constraint_scroll.setMaximumHeight(100)
+        self.instant_hand_visible_constraint_rows_widget = QWidget()
+        self.instant_hand_visible_constraint_rows_widget.setMinimumWidth(596)
+        self.instant_hand_visible_constraint_rows_layout = QGridLayout(self.instant_hand_visible_constraint_rows_widget)
+        self.instant_hand_visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.instant_hand_visible_constraint_rows_layout.setSpacing(2)
+        self.instant_hand_visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.instant_hand_visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.instant_hand_visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.instant_hand_visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.instant_hand_visible_constraint_scroll.setWidget(self.instant_hand_visible_constraint_rows_widget)
+        self.instant_hand_visible_constraint_row_refs = []
+        c_layout.addWidget(self.instant_hand_visible_constraint_scroll)
+        self._instant_add_hand_visible_constraint_row()
+
         constraints_group.setLayout(c_layout)
         layout.addWidget(constraints_group)
 
@@ -1187,18 +1257,21 @@ class MainWindow(QMainWindow):
             self._instant_pattern_row_widgets.remove(entry)
 
     def _instant_rebuild_visible_constraint_grid(self):
-        """将即时铳率页的场上可见枚数条目按 2 列重新排列。"""
+        """将即时铳率页场上可见枚数条目按 2 列重新排列（删除行后调用）。"""
         layout = self.instant_visible_constraint_rows_layout
+        parent = self.instant_visible_constraint_rows_widget
+        if not layout or not parent:
+            return
         while layout.count():
-            item = layout.takeAt(0)
-            if item and item.widget():
-                item.widget().setParent(None)
+            layout.takeAt(0)
         for i, (_, _, row_widget) in enumerate(self.instant_visible_constraint_row_refs):
+            row_widget.setParent(parent)
             layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
 
     def _instant_add_visible_constraint_row(self):
         """即时铳率页：添加一行场上可见枚数输入。"""
-        row_widget = QWidget()
+        row_widget = QWidget(self.instant_visible_constraint_rows_widget)
         row_widget.setFixedWidth(292)
         row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         row_layout = QHBoxLayout(row_widget)
@@ -1217,7 +1290,9 @@ class MainWindow(QMainWindow):
         remove_btn.setToolTip("删除此行")
         row_layout.addWidget(remove_btn)
         self.instant_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
-        self._instant_rebuild_visible_constraint_grid()
+        idx = len(self.instant_visible_constraint_row_refs) - 1
+        self.instant_visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
 
         def do_remove():
             self.instant_visible_constraint_rows_layout.removeWidget(row_widget)
@@ -1239,6 +1314,68 @@ class MainWindow(QMainWindow):
                 continue
             visible_constraints[tile] = (min_count, max_count)
         return visible_constraints
+
+    def _instant_rebuild_hand_visible_constraint_grid(self):
+        """将即时铳率页手牌可见枚数条目按 2 列重新排列（删除行后调用）。"""
+        layout = self.instant_hand_visible_constraint_rows_layout
+        parent = self.instant_hand_visible_constraint_rows_widget
+        if not layout or not parent:
+            return
+        while layout.count():
+            layout.takeAt(0)
+        for i, (_, _, row_widget) in enumerate(self.instant_hand_visible_constraint_row_refs):
+            row_widget.setParent(parent)
+            layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
+
+    def _instant_add_hand_visible_constraint_row(self):
+        """即时铳率页：添加一行手牌可见枚数输入。"""
+        row_widget = QWidget(self.instant_hand_visible_constraint_rows_widget)
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 8m")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("可见"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.instant_hand_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        idx = len(self.instant_hand_visible_constraint_row_refs) - 1
+        self.instant_hand_visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
+
+        def do_remove():
+            if self.instant_hand_visible_constraint_rows_layout:
+                self.instant_hand_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.instant_hand_visible_constraint_row_refs = [
+                r for r in self.instant_hand_visible_constraint_row_refs if r[2] != row_widget
+            ]
+            self._instant_rebuild_hand_visible_constraint_grid()
+
+        remove_btn.clicked.connect(do_remove)
+
+    def _instant_get_hand_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        """即时铳率页：读取手牌可见枚数约束。"""
+        hand_visible_constraints = {}
+        for tile_edit, range_slider, _ in self.instant_hand_visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            hand_visible_constraints[tile] = (min_count, max_count)
+        return hand_visible_constraints
 
     def _sync_instant_constraints_to_main(self):
         """将即时铳率页的约束与参数同步到主分析页控件。"""
@@ -1275,7 +1412,7 @@ class MainWindow(QMainWindow):
             text = self.instant_call_area_inputs[i].text().strip() if i < len(self.instant_call_area_inputs) else ""
             le.setText(text)
 
-        # 场上可见枚数（先清空主分析条目，再按即时页重建）
+        # 场上可见枚数 / 手牌可见枚数（先清空主分析条目，再按即时页重建）
         instant_constraints = list(self._instant_get_visible_constraints_from_ui().items())
         for _, _, row_widget in list(self.visible_constraint_row_refs):
             self.visible_constraint_rows_layout.removeWidget(row_widget)
@@ -1287,6 +1424,20 @@ class MainWindow(QMainWindow):
             for tile, (min_count, max_count) in instant_constraints:
                 self._add_visible_constraint_row()
                 tile_edit, range_slider, _ = self.visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(min_count, max_count)
+
+        instant_h_constraints = list(self._instant_get_hand_visible_constraints_from_ui().items())
+        for _, _, row_widget in list(self.hand_visible_constraint_row_refs):
+            self.hand_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+        self.hand_visible_constraint_row_refs.clear()
+        if not instant_h_constraints:
+            self._add_hand_visible_constraint_row()
+        else:
+            for tile, (min_count, max_count) in instant_h_constraints:
+                self._add_hand_visible_constraint_row()
+                tile_edit, range_slider, _ = self.hand_visible_constraint_row_refs[-1]
                 tile_edit.setText(tile)
                 range_slider.setRange(min_count, max_count)
 
@@ -2141,18 +2292,35 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "下载失败", message)
     
     def _rebuild_visible_constraint_grid(self):
-        """将场上可见枚数条目按 2 列重新排列"""
+        """将场上可见枚数条目按 2 列重新排列（删除行后调用；takeAt 后勿再 removeWidget）"""
         layout = self.visible_constraint_rows_layout
+        parent = self.visible_constraint_rows_widget
+        if not layout or not parent:
+            return
         while layout.count():
-            item = layout.takeAt(0)
-            if item and item.widget():
-                item.widget().setParent(None)
+            layout.takeAt(0)
         for i, (_, _, row_widget) in enumerate(self.visible_constraint_row_refs):
+            row_widget.setParent(parent)
             layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
+
+    def _rebuild_hand_visible_constraint_grid(self):
+        """将主分析页手牌可见枚数条目按 2 列重新排列（删除行后调用）"""
+        layout = self.hand_visible_constraint_rows_layout
+        parent = self.hand_visible_constraint_rows_widget
+        if not layout or not parent:
+            return
+        while layout.count():
+            layout.takeAt(0)
+        for i, (_, _, row_widget) in enumerate(self.hand_visible_constraint_row_refs):
+            row_widget.setParent(parent)
+            layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
 
     def _add_visible_constraint_row(self):
         """添加一行场上可见枚数输入（牌 + 范围滑块），每行可并排两个条目，每个条目固定宽度"""
-        row_widget = QWidget()
+        # 父控件设为滚动区内容 widget，避免 takeAt/removeWidget 链导致子控件不可见
+        row_widget = QWidget(self.visible_constraint_rows_widget)
         row_widget.setFixedWidth(292)
         row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         row_layout = QHBoxLayout(row_widget)
@@ -2171,13 +2339,50 @@ class MainWindow(QMainWindow):
         remove_btn.setToolTip("删除此行")
         row_layout.addWidget(remove_btn)
         self.visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
-        self._rebuild_visible_constraint_grid()
+        idx = len(self.visible_constraint_row_refs) - 1
+        self.visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
 
         def do_remove():
             self.visible_constraint_rows_layout.removeWidget(row_widget)
             row_widget.deleteLater()
             self.visible_constraint_row_refs.remove((tile_edit, range_slider, row_widget))
             self._rebuild_visible_constraint_grid()
+        remove_btn.clicked.connect(do_remove)
+
+    def _add_hand_visible_constraint_row(self):
+        """添加一行手牌可见枚数输入（牌 + 范围滑块），对除目标玩家外的三名玩家分别判断"""
+        row_widget = QWidget(self.hand_visible_constraint_rows_widget)
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 8m")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("可见"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.hand_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        idx = len(self.hand_visible_constraint_row_refs) - 1
+        self.hand_visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
+
+        def do_remove():
+            if self.hand_visible_constraint_rows_layout:
+                self.hand_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.hand_visible_constraint_row_refs = [
+                r for r in self.hand_visible_constraint_row_refs if r[2] != row_widget
+            ]
+            self._rebuild_hand_visible_constraint_grid()
         remove_btn.clicked.connect(do_remove)
 
     def _get_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
@@ -2192,6 +2397,31 @@ class MainWindow(QMainWindow):
                 continue
             visible_constraints[tile] = (min_count, max_count)
         return visible_constraints
+
+    def _get_hand_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        """从手牌可见枚数行收集约束，空牌名跳过"""
+        hand_visible_constraints = {}
+        for tile_edit, range_slider, _ in self.hand_visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            hand_visible_constraints[tile] = (min_count, max_count)
+        return hand_visible_constraints
+
+    def _show_hand_visible_help(self):
+        """显示手牌可见枚数说明"""
+        QMessageBox.information(
+            self,
+            "手牌可见枚数说明",
+            "该约束针对除目标玩家（满足舍牌模式的玩家）以外的其他三名玩家。\n\n"
+            "• 延伸手牌：包括该玩家当前的 13 张手牌加上牌山里的任意牌。\n"
+            "• 算法逻辑：若某种牌在某玩家的延伸手牌中可能出现的枚数范围与设置的范围有交集，则视为满足。\n"
+            "• 例：设置“8m 可见 2-3 枚”。若玩家 A 手里有 1 张，牌山里还有 3 张，则其延伸手牌可能含有 1-4 张 8m，范围 [1,4] 与 [2,3] 有交集，满足条件。\n"
+            "• 若任一非目标玩家不满足该约束，则该样本被排除。"
+        )
 
     # ---------- 分享串：生成可读字符串 / 从字符串恢复约束 ----------
     _SHARE_VERSION = "RHM1"
@@ -2259,6 +2489,8 @@ class MainWindow(QMainWindow):
                 lines.append("副露区域=%s" % t)
         for tile, (lo, hi) in self._get_visible_constraints_from_ui().items():
             lines.append("可见=%s:%d-%d" % (tile, lo, hi))
+        for tile, (lo, hi) in self._get_hand_visible_constraints_from_ui().items():
+            lines.append("手牌可见=%s:%d-%d" % (tile, lo, hi))
         sample_limit = self.sample_limit_input.value()
         if sample_limit != 10000:
             lines.append("样本上限=%d" % sample_limit)
@@ -2324,6 +2556,8 @@ class MainWindow(QMainWindow):
                 lines.append("副露区域=%s" % t)
         for tile, (lo, hi) in self._instant_get_visible_constraints_from_ui().items():
             lines.append("可见=%s:%d-%d" % (tile, lo, hi))
+        for tile, (lo, hi) in self._instant_get_hand_visible_constraints_from_ui().items():
+            lines.append("手牌可见=%s:%d-%d" % (tile, lo, hi))
         furiten = self.instant_hypothetical_furiten_input.text().strip()
         if furiten:
             lines.append("假想振听=%s" % furiten)
@@ -2360,11 +2594,11 @@ class MainWindow(QMainWindow):
                 continue
             k, _, v = line.partition("=")
             k, v = k.strip(), v.strip()
-            if k in ("模式", "副露区域", "可见", "巡目范围"):
+            if k in ("模式", "副露区域", "可见", "手牌可见", "巡目范围"):
                 data.setdefault(k, []).append(v)
             else:
                 data[k] = v
-        for k in ("模式", "副露区域", "可见", "巡目范围"):
+        for k in ("模式", "副露区域", "可见", "手牌可见", "巡目范围"):
             if k in data and isinstance(data[k], str):
                 data[k] = [data[k]]
         return data if data else None
@@ -2578,7 +2812,29 @@ class MainWindow(QMainWindow):
                 parts = v.split()
                 if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
                     entries.append((parts[0], int(parts[1]), int(parts[2])))
+
+        h_vis = data.get("手牌可见") or []
+        if not isinstance(h_vis, list):
+            h_vis = [h_vis] if h_vis else []
+        h_entries = []
+        for v in h_vis:
+            v = str(v).strip()
+            if not v:
+                continue
+            if ":" in v:
+                tile, _, rng = v.partition(":")
+                tile = tile.strip()
+                rng = rng.strip()
+                if re.match(r"^\d+-\d+$", rng):
+                    lo, hi = int(rng.split("-")[0]), int(rng.split("-")[1])
+                    h_entries.append((tile, max(0, min(4, lo)), max(0, min(4, hi))))
+            else:
+                parts = v.split()
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    h_entries.append((parts[0], int(parts[1]), int(parts[2])))
+
         if instant:
+            # 场上可见
             for _, _, row_widget in list(self.instant_visible_constraint_row_refs):
                 self.instant_visible_constraint_rows_layout.removeWidget(row_widget)
                 row_widget.deleteLater()
@@ -2590,7 +2846,20 @@ class MainWindow(QMainWindow):
                 range_slider.setRange(lo, hi)
             if not entries:
                 self._instant_add_visible_constraint_row()
+            # 手牌可见
+            for _, _, row_widget in list(self.instant_hand_visible_constraint_row_refs):
+                self.instant_hand_visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.instant_hand_visible_constraint_row_refs.clear()
+            for tile, lo, hi in h_entries:
+                self._instant_add_hand_visible_constraint_row()
+                tile_edit, range_slider, _ = self.instant_hand_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not h_entries:
+                self._instant_add_hand_visible_constraint_row()
         else:
+            # 场上可见
             for _, _, row_widget in list(self.visible_constraint_row_refs):
                 self.visible_constraint_rows_layout.removeWidget(row_widget)
                 row_widget.deleteLater()
@@ -2602,6 +2871,18 @@ class MainWindow(QMainWindow):
                 range_slider.setRange(lo, hi)
             if not entries:
                 self._add_visible_constraint_row()
+            # 手牌可见
+            for _, _, row_widget in list(self.hand_visible_constraint_row_refs):
+                self.hand_visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.hand_visible_constraint_row_refs.clear()
+            for tile, lo, hi in h_entries:
+                self._add_hand_visible_constraint_row()
+                tile_edit, range_slider, _ = self.hand_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not h_entries:
+                self._add_hand_visible_constraint_row()
 
     def _show_generate_share_dialog(self, from_instant: bool):
         """弹出对话框展示分享串并复制到剪贴板。from_instant 为 True 时从铳率分析页生成。"""
@@ -2727,6 +3008,9 @@ class MainWindow(QMainWindow):
         
         # 场上可见枚数
         visible_constraints = self._get_visible_constraints_from_ui()
+
+        # 手牌可见枚数
+        hand_visible_constraints = self._get_hand_visible_constraints_from_ui()
         
         # 样本上限
         sample_limit = self.sample_limit_input.value()
@@ -2770,6 +3054,7 @@ class MainWindow(QMainWindow):
             "instant_use_theory_point_only": instant_use_theory_point_only if use_instant else None,
             "instant_normalize_oya_ron_to_ko": instant_normalize_oya_ron_to_ko if use_instant else False,
             "visible_constraints": visible_constraints if visible_constraints else None,
+            "hand_visible_constraints": hand_visible_constraints if hand_visible_constraints else None,
             "dora_constraint": dora_constraint,
             "dora_position_spec": dora_position_spec,
             "riichi_constraint": riichi_constraint,

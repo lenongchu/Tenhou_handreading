@@ -255,6 +255,7 @@ class MatchValidator:
         self.riichi_constraint = params.get("riichi_constraint")
         self.call_constraint = params.get("call_constraint")
         self.call_area_constraints = params.get("call_area_constraints")
+        self.hand_visible_constraints = params.get("hand_visible_constraints")
         self.use_tenpai = params.get("use_tenpai", False)
         self.use_related_tile = params.get("use_related_tile", False)
         self.use_deal_in_instant = params.get("use_deal_in_instant", False)
@@ -296,6 +297,8 @@ class MatchValidator:
         if not self._check_call_area_constraints(discard, matched_variant, player_state, round_players):
             return False
         if not self._check_visible_constraints(matched_variant, player_state):
+            return False
+        if not self._check_hand_visible_constraints(discard, matched_variant, player_state, round_players):
             return False
         if not self._check_target_discard_exclusion(discard, matched_variant, match_ctx):
             return False
@@ -421,6 +424,91 @@ class MatchValidator:
             count = sum(c for t, c in player_state.visible_tiles.items() if t // 4 in equiv_bases)
             if not (min_count <= count <= max_count):
                 return False
+        return True
+
+    def _check_hand_visible_constraints(self, discard, matched_variant: Dict, player_state, round_players: List) -> bool:
+        """手牌可见枚数约束（延伸手牌）：除目标玩家外的三名玩家，其手牌+牌山中目标牌枚数须在范围内。"""
+        hvc = matched_variant.get("hand_visible_constraints")
+        if not hvc:
+            return True
+
+        # 获取当前瞬间所有玩家的巡目
+        all_turns = getattr(discard, "all_players_turns", None)
+        if all_turns is None or len(all_turns) != 4:
+            return True
+
+        # 1. 统计当前瞬间全场已暴露（非隐藏）的牌。
+        # 隐藏牌 = 4名玩家的手牌 + 牌山。
+        # 已暴露 = 舍牌 + 副露 + 宝牌指示牌。
+        global_exposed = Counter()
+        for p in round_players:
+            p_turn = all_turns[p.player_id]
+            # 舍牌
+            for d in p.discards:
+                if d.turn <= p_turn:
+                    global_exposed[d.tile // 4] += 1
+            # 副露
+            for c in p.calls:
+                if getattr(c, "from_discard_turn", 1) <= p_turn:
+                    global_exposed[MjlogParser.string_to_tile(c.pai)] += 1
+                    for cp in c.consumed:
+                        global_exposed[MjlogParser.string_to_tile(cp)] += 1
+        # 宝牌指示牌
+        if round_players:
+            for ind in round_players[0].dora_indicators:
+                global_exposed[ind // 4] += 1
+
+        # 2. 统计当前瞬间各玩家的手牌
+        hands_counts = []
+        for pid in range(4):
+            t = all_turns[pid]
+            p_state = round_players[pid]
+            if t == 0:
+                hand = list(p_state.initial_hand)
+            elif t <= len(p_state.hand_tiles_history):
+                hand = list(p_state.hand_tiles_history[t - 1])
+            else:
+                hand = list(p_state.hand_tiles)
+            
+            # 若是当前行动玩家（满足模式的玩家），其手牌应包含刚刚打出的这张牌
+            if pid == player_state.player_id:
+                hand.append(discard.tile)
+            
+            hands_counts.append(Counter(tile // 4 for tile in hand))
+
+        # 3. 计算牌山中剩余各牌的枚数
+        # Wall(T) = 4 - Exposed(T) - Sum(Hand(all, T))
+        wall_counts = Counter()
+        all_bases = set(global_exposed.keys())
+        for hc in hands_counts:
+            all_bases.update(hc.keys())
+        
+        for b in all_bases:
+            revealed_in_hands = sum(hc[b] for hc in hands_counts)
+            wall_counts[b] = max(0, 4 - global_exposed[b] - revealed_in_hands)
+
+        # 4. 校验约束
+        target_pid = player_state.player_id
+        for tile_str, (min_c, max_c) in hvc.items():
+            base_code = MjlogParser.string_to_tile(tile_str)
+            equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
+            
+            # 延伸手牌定义：该玩家的手牌 + 牌山里的任意牌。
+            # 对于每一名非目标玩家：
+            for pid in range(4):
+                if pid == target_pid:
+                    continue
+                
+                # 计算该玩家手中等价牌的总数
+                hand_c = sum(hands_counts[pid][b] for b in equiv_bases)
+                # 计算牌山中等价牌的总数
+                wall_c = sum(wall_counts[b] for b in equiv_bases)
+                
+                # 延伸手牌的可能枚数范围为 [hand_c, hand_c + wall_c]
+                # 若该范围与 [min_c, max_c] 无交集，则不满足
+                if hand_c > max_c or (hand_c + wall_c) < min_c:
+                    return False
+        
         return True
 
     def _check_target_discard_exclusion(
@@ -1714,7 +1802,8 @@ class LiveAnalyzer:
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,  # "any" | "has_call" | "no_call"
-        call_area_constraints: Optional[List[str]] = None,  # 副露区域约束，最多个AND
+        call_area_constraints: Optional[List[str]] = None,  # 副露区域约束，最多4个AND
+        hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,  # 手牌可见枚数约束（延伸手牌）
         analysis_target: str = "target_count",  # "target_count"=目标牌存在 "tenpai"=是否听牌
         turn_range: Optional[Tuple[int, int]] = None,  # (min_turn, max_turn) 如(2, 8)
         sample_limit: Optional[int] = None,
@@ -1814,7 +1903,7 @@ class LiveAnalyzer:
                 if len(multi_t) > 1
                 else _target_str_for_variant(first_t[0], first_t[1])
             )
-            vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required)
+            vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required, hand_visible_constraints)
             combo = first_t[1] if len(multi_t) == 1 else False
             item_variants.append((vars_p, t, combo))
 
@@ -1904,11 +1993,13 @@ class LiveAnalyzer:
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
             "call_area_constraints": call_area_constraints,
+            "hand_visible_constraints": hand_visible_constraints,
             "call_area_constraint_sets": call_area_constraint_sets,
             "consumed_search_list": consumed_search_list,
             "exclude_south4": exclude_south4,
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
+            "hand_visible_constraints": hand_visible_constraints,
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
             "use_tenpai": use_tenpai,
@@ -2248,6 +2339,7 @@ class LiveAnalyzer:
                 qp, tt = items[idx]
                 ok, err = verify_sample_consistency(
                     s, qp, tt, visible_constraints,
+                    hand_visible_constraints=hand_visible_constraints,
                     prior_discard_exclusion=prior_discard_exclusion,
                     call_area_constraints=call_area_constraints,
                 )
@@ -2304,6 +2396,7 @@ class LiveAnalyzer:
         dora_constraint: Optional[str] = None,
         dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         call_area_constraints: Optional[List[str]] = None,
@@ -2331,6 +2424,7 @@ class LiveAnalyzer:
             dora_constraint=dora_constraint,
             dora_position_spec=dora_position_spec,
             visible_constraints=visible_constraints,
+            hand_visible_constraints=hand_visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
             call_area_constraints=call_area_constraints,
@@ -2431,6 +2525,7 @@ class LiveAnalyzer:
         dora_constraint: Optional[str] = None,
         dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         call_area_constraints: Optional[List[str]] = None,
@@ -2472,7 +2567,7 @@ class LiveAnalyzer:
             first_t = multi_t[0]
             variant_target = ("".join(first_t[0]) if first_t[1] else first_t[0][0])
             vars_p = generate_equivalent_variants(
-                pattern, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required
+                pattern, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required, hand_visible_constraints
             )
             is_combo = first_t[1] and len(multi_t) == 1
             cs = get_consumed_search_patterns(pattern)
@@ -2533,11 +2628,13 @@ class LiveAnalyzer:
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
             "call_area_constraints": call_area_constraints,
+            "hand_visible_constraints": hand_visible_constraints,
             "call_area_constraint_sets": grid_call_area_sets,
             "consumed_search_list": consumed_search_list,
             "exclude_south4": exclude_south4,
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
+            "hand_visible_constraints": hand_visible_constraints,
             "use_tenpai": use_tenpai,
             "use_related_tile": use_related_tile,
             "prior_discard_exclusion": prior_discard_exclusion,
@@ -2932,6 +3029,7 @@ class LiveAnalyzer:
         dora_constraint: Optional[str] = None,
         dora_position_spec: Optional[List[int]] = None,  # 宝牌=模式第N张时使用
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         turn_range: Optional[Tuple[int, int]] = None,
@@ -3013,11 +3111,22 @@ class LiveAnalyzer:
             return candidates[:sample_count]
 
         variants = generate_equivalent_variants(
-            query_pattern, target_tile, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required
+            query_pattern,
+            target_tile,
+            visible_constraints,
+            prior_discard_exclusion,
+            call_area_constraints,
+            prior_discard_required,
+            hand_visible_constraints=hand_visible_constraints,
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
         riichi_search = pattern_has_riichi(query_pattern)
         samples = []
+
+        # 初始化验证器，用于手牌可见枚数等约束校验
+        validator = MatchValidator({
+            "hand_visible_constraints": hand_visible_constraints,
+        })
 
         if should_cancel and should_cancel():
             return []
@@ -3297,6 +3406,11 @@ class LiveAnalyzer:
                                     if not match_visible:
                                         continue
 
+                                hvc = matched_variant.get("hand_visible_constraints")
+                                if hvc:
+                                    if not validator._check_hand_visible_constraints(discard, matched_variant, player_state, round_players):
+                                        continue
+
                                 # 排除：若未打出牌就是目标牌，不计入（与主统计逻辑一致）
                                 mapped_target = matched_variant["target"]
                                 sample_is_combo = matched_variant.get("is_combo", False)
@@ -3525,6 +3639,7 @@ def verify_sample_consistency(
     query_pattern: List[str],
     target_tile: str,
     visible_constraints: Optional[Dict] = None,
+    hand_visible_constraints: Optional[Dict] = None,
     prior_discard_exclusion: Optional[str] = None,
     call_area_constraints: Optional[List[str]] = None,
     prior_discard_required: Optional[str] = None,
@@ -3546,8 +3661,13 @@ def verify_sample_consistency(
         first_t = parse_multi_targets(target_tile)[0]
         variant_target = "".join(first_t[0]) if first_t[1] else first_t[0][0]
         variants = generate_equivalent_variants(
-            query_pattern, variant_target, visible_constraints,
-            prior_discard_exclusion, call_area_constraints, prior_discard_required
+            query_pattern,
+            variant_target,
+            visible_constraints,
+            prior_discard_exclusion,
+            call_area_constraints,
+            prior_discard_required,
+            hand_visible_constraints=hand_visible_constraints,
         )
         
         # 补充上下文，支持 r (立直) 及 zf/kf (自风/客风) 占位符校验

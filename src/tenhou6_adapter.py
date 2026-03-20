@@ -146,6 +146,7 @@ def _parse_round_from_tenhou6(
                 opponent_riichi_happened=any(riichi_declared[i] for i in range(4) if i != actor),
                 call_happened=call_seen,
                 is_riichi_declaration=is_riichi_decl,
+                all_players_turns=list(turns_count), # 记录各玩家当前已完成舍牌的巡目
             )
             game_states[actor].discards.append(d)
             

@@ -28,6 +28,9 @@ class Discard:
     opponent_riichi_happened: bool = False  # 打出此牌时，是否已有其他三家立直
     call_happened: bool = False     # 打出此牌时，是否已有人副露（吃/碰/杠）
     is_riichi_declaration: bool = False  # 该舍牌是否为立直宣言牌（打出此牌宣告立直）
+    # 记录该时刻所有玩家的当前巡目（1-based），用于同步手牌快照。格式：[p0_turn, p1_turn, p2_turn, p3_turn]
+    # 若某玩家尚未出牌，则其巡目为 0。
+    all_players_turns: Optional[List[int]] = None
 
 
 @dataclass

@@ -13,7 +13,7 @@ from datetime import datetime
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-db_path = 'data/tenhou.db'
+db_path = r'E:\Cursor\Tenhou data\data\tenhou.db'
 backup_path = f'data/tenhou_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
 
 print("="*70)

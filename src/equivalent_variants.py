@@ -1303,6 +1303,16 @@ def _transform_visible_constraints_with_mapping(
     return {_transform_tile_with_mapping(t, mapping): v for t, v in visible_constraints.items()}
 
 
+def _transform_hand_visible_constraints_with_mapping(
+    hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]],
+    mapping: Dict[str, str]
+) -> Dict[str, Tuple[int, int]]:
+    """对手牌可见约束应用花色映射"""
+    if not hand_visible_constraints:
+        return {}
+    return {_transform_tile_with_mapping(t, mapping): v for t, v in hand_visible_constraints.items()}
+
+
 def _expand_pure_honor_pattern(parsed: List[Tuple[str, bool]]) -> List[List[Tuple[str, bool]]]:
     """
     展开纯字牌模式为具体变体。
@@ -1339,6 +1349,7 @@ def generate_equivalent_variants(
     prior_discard_exclusion: Optional[str] = None,
     call_area_constraints: Optional[List[str]] = None,
     prior_discard_required: Optional[str] = None,
+    hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> List[Dict]:
     """
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
@@ -1404,12 +1415,15 @@ def generate_equivalent_variants(
                     target_new = [_transform_tile_with_mapping(t, mapping) for t in target_tiles]
                     target_new = target_new[0] if len(target_new) == 1 else target_new
                     visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
+                    hand_visible_new = _transform_hand_visible_constraints_with_mapping(hand_visible_constraints, mapping)
                     prior_mapped = _apply_suit_mapping_to_string(prior, mapping) if prior else None
                     prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
                     call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in (call_area or [])]
                     result.append({
                         "discard": p, "target": target_new,
-                        "visible_constraints": visible_new, "is_combo": is_combo,
+                        "visible_constraints": visible_new,
+                        "hand_visible_constraints": hand_visible_new,
+                        "is_combo": is_combo,
                         "prior_discard_exclusion": prior_mapped, "prior_discard_required": prior_req_mapped,
                         "call_area_constraints": call_area_new,
                         "mapping": mapping,
@@ -1418,7 +1432,13 @@ def generate_equivalent_variants(
         t = target_tiles[0] if len(target_tiles) == 1 else target_tiles
         mapping = {"m": "m", "p": "p", "s": "s"}
         return [
-            {"discard": p, "target": t, "visible_constraints": dict(visible_constraints) if visible_constraints else {}, "is_combo": is_combo, "prior_discard_exclusion": prior, "prior_discard_required": prior_req, "call_area_constraints": call_area, "mapping": mapping}
+            {
+                "discard": p, "target": t,
+                "visible_constraints": dict(visible_constraints) if visible_constraints else {},
+                "hand_visible_constraints": dict(hand_visible_constraints) if hand_visible_constraints else {},
+                "is_combo": is_combo, "prior_discard_exclusion": prior,
+                "prior_discard_required": prior_req, "call_area_constraints": call_area, "mapping": mapping
+            }
             for p in honor_variants
         ]
 
@@ -1434,6 +1454,7 @@ def generate_equivalent_variants(
         target_new = [_transform_tile_with_mapping(t, mapping) for t in target_tiles]
         target_new = target_new[0] if len(target_new) == 1 else target_new
         visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
+        hand_visible_new = _transform_hand_visible_constraints_with_mapping(hand_visible_constraints, mapping)
         prior_mapped = _apply_suit_mapping_to_string(prior_discard_exclusion.strip(), mapping) if prior_discard_exclusion else None
         prior_req = prior_discard_required.strip() if prior_discard_required else None
         prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
@@ -1442,6 +1463,7 @@ def generate_equivalent_variants(
             "discard": discard_new,
             "target": target_new,
             "visible_constraints": visible_new,
+            "hand_visible_constraints": hand_visible_new,
             "is_combo": is_combo,
             "prior_discard_exclusion": prior_mapped,
             "prior_discard_required": prior_req_mapped,
