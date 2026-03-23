@@ -780,11 +780,11 @@ class MainWindow(QMainWindow):
         pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
         pattern_edit.setMinimumWidth(150)
         target_edit = QLineEdit()
-        target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
+        target_edit.setPlaceholderText("例: 6s、45.p、6s 2m 5p")
         target_edit.setMaximumWidth(80)
         arrow_label = QLabel("→")
         target_help_btn = QPushButton("?")
-        target_help_btn.setToolTip("目标牌说明")
+        target_help_btn.setToolTip("目标牌说明（含 5.p 五/赤五通配；即时铳率不支持 .）")
         target_help_btn.setFixedWidth(24)
         target_help_btn.clicked.connect(self._show_target_help)
         del_btn = QPushButton("×")
@@ -834,7 +834,7 @@ class MainWindow(QMainWindow):
             elif data == "related_tile":
                 target_edit.setPlaceholderText("例: 2p（分析该牌的关联度，须在模式中出现）")
             else:
-                target_edit.setPlaceholderText("例: 6s 或 6s 2m 5p")
+                target_edit.setPlaceholderText("例: 6s、45.p、6s 2m 5p")
 
     def _parse_dora_position_spec(self) -> List[int]:
         """解析「宝牌=模式第 N 张」的位置输入，返回 0-based 下标列表。如 1,3 -> [0, 2]"""
@@ -1227,7 +1227,7 @@ class MainWindow(QMainWindow):
         pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
         pattern_edit.setMinimumWidth(120)
         target_edit = QLineEdit()
-        target_edit.setPlaceholderText("例: 6s 或 3p,4p")
+        target_edit.setPlaceholderText("例: 6s、3p,4p、5.p（铳率勿用 .）")
         target_edit.setMaximumWidth(100)
         del_btn = QPushButton("×")
         del_btn.setFixedWidth(28)
@@ -1468,6 +1468,13 @@ class MainWindow(QMainWindow):
                 mt = parse_multi_targets(tg)
                 if any(is_combo for tiles, is_combo in mt):
                     QMessageBox.warning(self, "输入错误", "即时铳率暂不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
+                    return
+                if "." in tg:
+                    QMessageBox.warning(
+                        self,
+                        "输入错误",
+                        "即时铳率不支持目标通配符（如 5.p），请使用 5p 或 0p 明确指定",
+                    )
                     return
             except Exception:
                 QMessageBox.warning(self, "输入错误", "目标牌格式无效: %s" % tg[:20])

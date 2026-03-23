@@ -187,6 +187,21 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 > `r` 与 `c/p` 不能同现（立直不可副露）；`*` 仅匹配连续摸切；`cd2` 要求拆搭花色与目标牌花色不同。数字范围 `[xy]suit` 无后缀时仅匹配手切，需手摸切皆可请写 `[xy]suitf`（如 `[29]mf`）。
 
+### 目标牌输入（Target tile，统计用）
+
+用于「目标牌存量 / 搭子 combo / 多目标」等分析目标，由 `equivalent_variants.parse_target_tiles` 解析；统计时 base 集合由 `mjlog_parser.get_bases_for_target_tile_str` 展开。
+
+| 形式 | 含义 | 示例 |
+|------|------|------|
+| `5.p` / `5.m` / `5.s` | 数字与花色间插入 `.`：该「一位」同时接受普通五与赤五（`5x` 与 `0x`），任一枚在手即满足该张 | 单目标 |
+| `45.p`（简写） | 等价 `4p` + `5.p`（4p 与五位的 5p 或 0p） | 搭子 combo |
+| `4p-5.p`、`4p5.p` | 与上相同（显式书写） | — |
+| `4.p`（首位非 5） | 无赤五对应位，等价于单张 `4p` | — |
+| 默认 `5p` 与 `0p` | 不写 `.` 时，普通五与赤五在统计上**不合并**（与上表通配相反） | — |
+| 即时铳率 `deal_in_instant` | **不支持**目标串中的 `.`；须写 `5p` 或 `0p` 等明确牌（与 combo 多目标限制同页说明） | — |
+
+等价花色映射：`_transform_tile_with_mapping` 对 `5.p` 保持 `.` 并只映射末尾花色（如 `5.p`→`5.m`）。
+
 ### 2.1 副露区域约束（Call Area Constraints）
 
 用于**副露区域约束**（目标玩家必须有这些副露）及**舍牌模式中的副露占位**。支持指定副露与通配符：
@@ -366,6 +381,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 - 支持主分析页全部约束：宝牌、立直、副露、南三南四、副露区域、场上可见枚数。
 - 不支持 combo 目标（如 4s-5s 搭子），请用逗号分隔多目标（如 4s,5s）。
+- 不支持目标牌通配 `.`（如 `5.p`）；须写 `5p` 或 `0p` 等明确牌（与主分析「目标牌输入」章节一致）。
 - 振听判定：含同巡振听、立直振听、舍张振听，由 `RoundInstantDealInAnalyzer` 实现。
 
 ---
@@ -375,6 +391,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 - **代码注释**：编写或修改代码时，在每一段有逻辑意义的代码旁增加注释；注释用中文，技术术语附英文括注。详见 `.cursor/skills/code-comments/SKILL.md`。
 - **修改牌编码逻辑**：改 `mjlog_parser.TileUtils` 与 `tenhou6_adapter.TENHOU6_TO_BASE`
 - **修改舍牌模式语法**：改 `equivalent_variants`，与 `docs/dora_constraint_equivalence.md`、`docs/honor_tile_variants_design.md` 一致
+- **修改目标牌通配（`.` / 5.p 与赤五）**：改 `equivalent_variants.parse_target_tiles`、`_transform_tile_with_mapping` 与 `mjlog_parser.get_bases_for_target_tile_str`，并同步 `live_analyzer` 目标统计与 `src/ui/styles.py` 中 `TARGET_HELP_HTML`
 - **修改等价/映射逻辑**：确保 `generate_equivalent_variants` 与 `_dora_matches_constraint` 语义一致
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
 - **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径

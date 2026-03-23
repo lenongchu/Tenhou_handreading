@@ -193,6 +193,30 @@ class TileUtils:
         """返回该 base 在统计目标数时的等价 base（0m/0p/0s 与 5m/5p/5s 视为不同，仅自身）"""
         return {base}
 
+    @classmethod
+    def get_bases_for_target_tile_str(cls, tile_str: str) -> set:
+        """
+        目标牌字符串 → 统计用 base 集合（与 get_count_equivalent_bases 一致，但支持通配符）。
+        5.m / 5.p / 5.s：表示「普通五或赤五」，即 5x 与 0x 两 base 任一在手即计为该张目标。
+        4.p 等非 5 数字：. 无赤牌含义，等价于单张 4p（与 4p 相同）。
+        """
+        if (
+            len(tile_str) == 3
+            and tile_str[0].isdigit()
+            and tile_str[1] == "."
+            and tile_str[2] in "mps"
+        ):
+            d = int(tile_str[0])
+            suit = tile_str[2]
+            if d == 5:
+                return {
+                    cls.string_to_tile(f"5{suit}"),
+                    cls.string_to_tile(f"0{suit}"),
+                }
+            return {cls.string_to_tile(f"{d}{suit}")}
+        base = cls.string_to_tile(tile_str)
+        return set(cls.get_count_equivalent_bases(base))
+
 
 # 向后兼容：保留 MjlogParser 作为 TileUtils 的别名
 MjlogParser = TileUtils

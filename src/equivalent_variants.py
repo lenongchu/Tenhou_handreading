@@ -831,6 +831,8 @@ def parse_target_tiles(target_str: str) -> Tuple[List[str], bool]:
     "2m" -> (["2m"], False) 单张
     "1m3m" 或 "1m-3m" -> (["1m","3m"], True) 搭子/组合
     "13m" -> (["1m","3m"], True) 简写：多数字+花色，花色应用于所有数字
+    "5.p" -> (["5.p"], False) 通配：统计 5p 或 0p（赤五）均视为满足该张
+    "45.p" -> (["4p","5.p"], True) 简写：4p 与（5p 或 0p）
     
     Returns:
         (tile_list, is_combo): is_combo=True 表示多张牌组合（搭子）
@@ -838,7 +840,26 @@ def parse_target_tiles(target_str: str) -> Tuple[List[str], bool]:
     s = target_str.strip().replace(" ", "").replace(",", "-")
     honors = "东南西北白发中"
 
-    # 简写格式：如 "13m"、"46p" = 多个数字 + 一个花色
+    # 简写：仅数字与 . + 末尾花色，如 45.p、5.p（5.p = 5p OR 0p）
+    if len(s) >= 3 and s[-1] in "mps":
+        body = s[:-1]
+        if "." in body and re.match(r"^[\d.]+$", body):
+            tiles = []
+            i = 0
+            while i < len(body):
+                if body[i].isdigit():
+                    if i + 1 < len(body) and body[i + 1] == ".":
+                        tiles.append(f"{body[i]}.{s[-1]}")
+                        i += 2
+                    else:
+                        tiles.append(f"{body[i]}{s[-1]}")
+                        i += 1
+                else:
+                    i += 1
+            if tiles:
+                return (tiles, len(tiles) > 1)
+
+    # 简写格式：如 "13m"、"46p" = 多个数字 + 一个花色（无 . 通配）
     if len(s) >= 2 and s[-1] in "mps" and all(c.isdigit() for c in s[:-1]):
         digits, suit = s[:-1], s[-1]
         tiles = [d + suit for d in digits]
@@ -851,7 +872,11 @@ def parse_target_tiles(target_str: str) -> Tuple[List[str], bool]:
         if s[i] == "-":
             i += 1
             continue
-        if i + 1 < len(s) and s[i].isdigit() and s[i + 1] in "mps":
+        # 5.p 先于 5p 匹配
+        if i + 2 < len(s) and s[i].isdigit() and s[i + 1] == "." and s[i + 2] in "mps":
+            tiles.append(s[i : i + 3])
+            i += 3
+        elif i + 1 < len(s) and s[i].isdigit() and s[i + 1] in "mps":
             tiles.append(s[i : i + 2])
             i += 2
         elif i + 1 < len(s) and s[i].isdigit() and s[i + 1] == "z" and 1 <= int(s[i]) <= 7:
@@ -872,6 +897,7 @@ def parse_multi_targets(target_str: str) -> List[Tuple[List[str], bool]]:
     "6s 2m 5p" 或 "6s,2m,5p" -> [(["6s"],False), (["2m"],False), (["5p"],False)]
     "6s" -> [(["6s"],False)]
     "1m3m" -> [(["1m","3m"],True)]  # 搭子仍为单一目标
+    "5.p" -> [(["5.p"],False)]  # 通配：5p 或 0p 计为命中该张
     """
     s = (target_str or "").strip()
     if not s:
@@ -1273,6 +1299,9 @@ def _transform_tile_for_constraint(tile_str: str, suit: str, mirror: bool) -> st
 
 def _transform_tile_with_mapping(tile_str: str, mapping: Dict[str, str]) -> str:
     """对目标牌/约束牌应用花色映射"""
+    # 5.p 等形式：保留 .，只映射末尾花色
+    if len(tile_str) == 3 and tile_str[0].isdigit() and tile_str[1] == "." and tile_str[2] in "mps":
+        return f"{tile_str[0]}.{mapping[tile_str[2]]}"
     if tile_str in RED_FIVES or (len(tile_str) >= 2 and tile_str[-1] in "mps"):
         return f"{tile_str[0]}{mapping[tile_str[-1]]}"
     return tile_str
@@ -1405,6 +1434,8 @@ def generate_equivalent_variants(
         for t in target_tiles:
             if t in RED_FIVES:
                 target_suits.add(t[-1])
+            elif len(t) == 3 and t[1] == "." and t[2] in "mps":
+                target_suits.add(t[2])
             elif len(t) >= 2 and t[-1] in "mps" and (t[0].isdigit() or t in RED_FIVES):
                 target_suits.add(t[-1])
         if target_suits:

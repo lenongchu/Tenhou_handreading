@@ -529,27 +529,23 @@ class MatchValidator:
         target_equiv = set()
         if multi_t is None:
             # 单目标、非 combo：analyze 场景可能无 multi_t，用 mapped_target 直接
-            target_equiv = MjlogParser.get_count_equivalent_bases(
-                MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+            target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                mapped_target if isinstance(mapped_target, str) else mapped_target[0]
             )
         else:
             if len(multi_t) == 1:
                 if item_combo:
                     for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
-                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                        target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
                 else:
-                    target_equiv = MjlogParser.get_count_equivalent_bases(
-                        MjlogParser.string_to_tile(mapped_target)
-                    )
+                    target_equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
             else:
-                target_equiv = MjlogParser.get_count_equivalent_bases(
-                    MjlogParser.string_to_tile(
-                        mapped_target if isinstance(mapped_target, str) else mapped_target[0]
-                    )
+                target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
                 for tiles, _ in multi_t[1:]:
                     for t in tiles:
-                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                        target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
         if discard.tile // 4 in target_equiv:
             return False
         return True
@@ -1240,10 +1236,8 @@ def _process_one_log_grid(task: Tuple) -> Dict:
             if use_tenpai:
                 target_count = 1 if is_tenpai(hand_at_turn) else 0
             elif use_related_tile and mapped_target is not None:
-                target_equiv = MjlogParser.get_count_equivalent_bases(
-                    MjlogParser.string_to_tile(
-                        mapped_target if isinstance(mapped_target, str) else mapped_target[0]
-                    )
+                target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
                 target_discard_idx = None
                 target_discard_tile_base = None
@@ -1270,25 +1264,23 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                     target_count = 0
             elif len(multi_t) > 1:
                 if multi_t[0][1]:  # is_combo
-                    target_codes = [MjlogParser.string_to_tile(t) for t in multi_t[0][0]]
                     hand_bases = [t // 4 for t in hand_at_turn]
                     target_count = 1 if all(
-                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                        for c in target_codes
+                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                        for ts in multi_t[0][0]
                     ) else 0
                 else:
-                    equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(multi_t[0][0][0]))
+                    equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
                     target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
             elif is_combo and mapped_target is not None:
-                target_codes = [MjlogParser.string_to_tile(t) for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target])]
                 hand_bases = [t // 4 for t in hand_at_turn]
                 target_count = 1 if all(
-                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                    for c in target_codes
+                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
                 ) else 0
             elif mapped_target is not None:
-                equiv = MjlogParser.get_count_equivalent_bases(
-                    MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                equiv = MjlogParser.get_bases_for_target_tile_str(
+                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
                 target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
             else:
@@ -1463,10 +1455,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
 
             target_equiv = None
             if use_related_tile:
-                target_equiv = MjlogParser.get_count_equivalent_bases(
-                    MjlogParser.string_to_tile(
-                        mapped_target if isinstance(mapped_target, str) else mapped_target[0]
-                    )
+                target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
 
             if use_tenpai:
@@ -1507,32 +1497,25 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 for tiles, is_cb in mt_item:
                     k = _target_key(tiles, is_cb)
                     if is_cb:
-                        target_codes = [MjlogParser.string_to_tile(t) for t in tiles]
                         hand_bases = [t // 4 for t in hand_at_turn]
                         target_counts[k] = 1 if all(
-                            any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                            for c in target_codes
+                            any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                            for ts in tiles
                         ) else 0
                     else:
-                        equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(tiles[0]))
+                        equiv = MjlogParser.get_bases_for_target_tile_str(tiles[0])
                         target_counts[k] = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                 target_count = target_counts.get(_target_key(mt_item[0][0], mt_item[0][1]), 0)
             elif item_combo:
-                target_codes = [
-                    MjlogParser.string_to_tile(t)
-                    for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
-                ]
                 hand_bases = [t // 4 for t in hand_at_turn]
                 target_count = 1 if all(
-                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                    for c in target_codes
+                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
                 ) else 0
                 target_counts = None
             else:
-                equiv = MjlogParser.get_count_equivalent_bases(
-                    MjlogParser.string_to_tile(
-                        mapped_target if isinstance(mapped_target, str) else mapped_target[0]
-                    )
+                equiv = MjlogParser.get_bases_for_target_tile_str(
+                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
                 target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                 target_counts = None
@@ -1893,6 +1876,10 @@ class LiveAnalyzer:
             if use_deal_in_instant:
                 if multi_t[0][1]:
                     raise ValueError("即时铳率分析不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）")
+                if "." in t:
+                    raise ValueError(
+                        "即时铳率分析不支持目标通配符（如 5.p），请使用 5p 或 0p 明确指定"
+                    )
                 # 现在允许 len(multi_t) > 1 了
                 pass
             item_multi_targets.append(multi_t)
@@ -2884,21 +2871,21 @@ class LiveAnalyzer:
                                                 if len(multi_t) == 1:
                                                     if is_combo:
                                                         for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
-                                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                                            target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
                                                     else:
-                                                        target_equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
+                                                        target_equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                                 else:
-                                                    target_equiv = MjlogParser.get_count_equivalent_bases(
-                                                        MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                                                    target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                                                        mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                                                     )
                                                     for tiles, ic in multi_t[1:]:
                                                         for t in tiles:
-                                                            target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                                            target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
                                                 if discard.tile // 4 in target_equiv:
                                                     continue
                                             elif use_related_tile:
-                                                target_equiv = MjlogParser.get_count_equivalent_bases(
-                                                    MjlogParser.string_to_tile(mapped_target if isinstance(mapped_target, str) else mapped_target[0])
+                                                target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                                                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                                                 )
 
                                             if orig_i < len(player_state.hand_tiles_history):
@@ -2933,24 +2920,22 @@ class LiveAnalyzer:
                                                 tk = _target_key(multi_t[0][0], multi_t[0][1])
                                                 mt_item = multi_t
                                                 if multi_t[0][1]:
-                                                    target_codes = [MjlogParser.string_to_tile(t) for t in multi_t[0][0]]
                                                     hand_bases = [t // 4 for t in hand_at_turn]
                                                     target_count = 1 if all(
-                                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                                                        for c in target_codes
+                                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                                                        for ts in multi_t[0][0]
                                                     ) else 0
                                                 else:
-                                                    equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(multi_t[0][0][0]))
+                                                    equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
                                                     target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                                             elif is_combo:
-                                                target_codes = [MjlogParser.string_to_tile(t) for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target])]
                                                 hand_bases = [t // 4 for t in hand_at_turn]
                                                 target_count = 1 if all(
-                                                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                                                    for c in target_codes
+                                                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                                                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
                                                 ) else 0
                                             else:
-                                                equiv = MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(mapped_target))
+                                                equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                                 target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
 
                                             k = (tr_idx, pat_idx)
@@ -3268,11 +3253,11 @@ class LiveAnalyzer:
                                 if sample_is_combo:
                                     target_equiv = set()
                                     for t in mapped_target:
-                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                        target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
                                     if discard.tile // 4 in target_equiv:
                                         continue
                                 else:
-                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                    if discard.tile // 4 in MjlogParser.get_bases_for_target_tile_str(mapped_target):
                                         continue
 
                                 # 结局过滤
@@ -3417,11 +3402,11 @@ class LiveAnalyzer:
                                 if sample_is_combo:
                                     target_equiv = set()
                                     for t in mapped_target:
-                                        target_equiv |= MjlogParser.get_count_equivalent_bases(MjlogParser.string_to_tile(t))
+                                        target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
                                     if discard.tile // 4 in target_equiv:
                                         continue
                                 else:
-                                    if MjlogParser.bases_equivalent_for_count(discard.tile // 4, MjlogParser.string_to_tile(mapped_target)):
+                                    if discard.tile // 4 in MjlogParser.get_bases_for_target_tile_str(mapped_target):
                                         continue
 
                                 hh = (
@@ -3431,17 +3416,13 @@ class LiveAnalyzer:
                                 )
                                 hand_at_turn = list(hh)  # 必须为 list 以保留同种牌枚数
                                 if sample_is_combo:
-                                    target_codes = [
-                                        MjlogParser.string_to_tile(t) for t in mapped_target
-                                    ]
                                     hand_bases = [t // 4 for t in hand_at_turn]
                                     target_count = 1 if all(
-                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_count_equivalent_bases(c))
-                                        for c in target_codes
+                                        any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                                        for ts in mapped_target
                                     ) else 0
                                 else:
-                                    mapped_target_code = MjlogParser.string_to_tile(mapped_target)
-                                    equiv = MjlogParser.get_count_equivalent_bases(mapped_target_code)
+                                    equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                     target_count = sum(
                                         1 for tile in hand_at_turn
                                         if tile // 4 in equiv
@@ -3555,9 +3536,8 @@ def _visible_tiles_with_own_discards(visible_tiles, full_discards_up_to_now):
 
 
 def _visible_count(visible_tiles: dict, tile_str: str) -> int:
-    """统计某牌在可见牌中的枚数）m/0p/0s 串5m/5p/5s 视为不同牌）"""
-    base = MjlogParser.string_to_tile(tile_str)
-    equiv = MjlogParser.get_count_equivalent_bases(base)
+    """统计某牌在可见牌中的枚数；5.p 含 5p 与 0p；否则 0m/0p/0s 与 5m/5p/5s 仍视为不同牌"""
+    equiv = MjlogParser.get_bases_for_target_tile_str(tile_str)
     return sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
 
 
