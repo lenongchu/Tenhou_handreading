@@ -202,6 +202,8 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 等价花色映射：`_transform_tile_with_mapping` 对 `5.p` 保持 `.` 并只映射末尾花色（如 `5.p`→`5.m`）。
 
+**独立性筛选**（主界面复选框，仅分析目标为「目标牌存量」且目标为两枚数牌搭子时生效）：在手牌中预留目标两枚后，对其余牌递归拆除顺子/刻子与字刻；若存在一种拆法使合并后的所余牌满足「该搭子不与邻牌组成完整面子」，则样本计为「有」。实现见 `taatsu_independence.combo_passes_independence_filter`；`live_analyzer` 经参数 `independence_filter` 传入 worker，矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）白名单已同步该参数。
+
 ### 2.1 副露区域约束（Call Area Constraints）
 
 用于**副露区域约束**（目标玩家必须有这些副露）及**舍牌模式中的副露占位**。支持指定副露与通配符：
@@ -290,6 +292,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 | `database` | SQLite：logs, game_states, visible_tile_stats | Database.create_tables, insert_game_state |
 | `tenpai_utils` | 听牌判断 | is_tenpai (mahjong 库) |
 | `related_tile_utils` | 关联牌判断 | is_related_discard, hand_to_suit_counts |
+| `taatsu_independence` | 搭子独立性筛选（可选） | combo_passes_independence_filter |
 | `gui_app` | PyQt5 桌面界面 | 入口 |
 | `data_downloader` | 调用 houou-logs 下载牌谱 | DataDownloader |
 | `tile_illustration` | 舍牌示意图渲染 | render_illustration_to_qimage |

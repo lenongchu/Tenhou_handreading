@@ -505,6 +505,11 @@ class BatchChartDialog(QDialog):
             "prior_discard_required": prior_req,
             "max_workers": mw.max_workers_spin.value(),
             "gc_interval_batches": mw.gc_interval_batches_spin.value(),
+            "independence_filter": (
+                bool(getattr(mw, "independence_filter_check", None))
+                and mw.independence_filter_check.isChecked()
+                and (self.analysis_target_combo.currentData() or "") == "target_count"
+            ),
         }
         if self.constraint_group.isChecked():
             if self.batch_dora_any.isChecked():

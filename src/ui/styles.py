@@ -250,7 +250,15 @@ PATTERN_HELP_HTML = """
 <li>例：<code>3mt-1m</code> = 3m 摸切、1m 手切；<code>3mf-1m</code> = 3m 手摸切皆可、1m 手切</li>
 </ul>
 
-<h3>三、立直宣言牌 r</h3>
+<h3>三、关联牌标记 k（仅数牌）</h3>
+<ul>
+<li>在<strong>数牌</strong>写法后加后缀 <b>k</b>，表示该张舍牌打出时须为<strong>关联牌</strong>（related tile）：当时手牌中，<u>同花色</u>须存在与打出牌数字差 ≤ 2 的<strong>搭子</strong>（两面/边张/嵌张）或<strong>对子</strong>。字牌、花色通配符 <code>m</code>/<code>p</code>/<code>s</code> 等不支持 <code>k</code>。</li>
+<li><b>k 写在最后</b>，可与 <b>t</b>（摸切）、<b>f</b>（手摸切皆可）、<b>r</b>（立直宣言）组合，例如 <code>2pk</code>（手切关联）、<code>3mtk</code>（摸切且关联）、<code>4mfk</code>（手摸切皆可且关联）、<code>5mrk</code> / <code>5mtrk</code>（立直宣言且关联，依书写为手切/摸切立直）。</li>
+<li><b>数字范围</b>：<code>[25]mk</code> = 2m～5m 其一且为关联牌（默认手切）；<code>[29]mf</code>、<code>[29]mt</code> 等同理，范围表达式末尾只能选一个修饰字母（不能写 <code>[25]mfk</code> 这种双后缀，需改用 OR 等方式）。</li>
+<li>与「分析目标 → <b>关联牌判断</b>」的区别：<b>舍牌模式里的 <code>k</code></b>约束的是<strong>模式中该张</strong>打出时必须满足关联；<b>关联牌判断</b>是在整段模式匹配成功后，再按<strong>目标牌</strong>在序列里最后一次出现的那一打，判断是否关联。二者可同时使用。</li>
+</ul>
+
+<h3>四、立直宣言牌 r</h3>
 <ul>
 <li>牌后加 <b>r</b> 表示该牌为立直宣言牌（打出此牌宣告立直）</li>
 <li>例：<code>3m-5mr</code> = 玩家先打 3m，再打 5m 时宣告立直；统计立直瞬间手牌中目标牌的数量</li>
@@ -259,7 +267,7 @@ PATTERN_HELP_HTML = """
 <li>含 r 时优先检索牌谱是否有玩家立直，无则快速跳过</li>
 </ul>
 
-<h3>四、通配符 * 与 $</h3>
+<h3>五、通配符 * 与 $</h3>
 <ul>
 <li><b>*</b> 表示"任意摸切"，可匹配中间任意张摸切牌</li>
 <li>例：<code>3m-*-1m</code> = 3m 与 1m 之间允许若干摸切，不允许手切</li>
@@ -267,7 +275,7 @@ PATTERN_HELP_HTML = """
 <li>例：<code>c0p6p-$</code> = 用 0p6p 吃后打出任意一张手切牌</li>
 </ul>
 
-<h3>五、拆搭 cd1 / cd2 / cdm / cdp / cds</h3>
+<h3>六、拆搭 cd1 / cd2 / cdm / cdp / cds</h3>
 <p>搭子 = 两张同花色、数值差 1 或 2 的数牌（如 1m3m、2m3m、4s5s）。<b>1s9s 不是搭子</b>。拆搭须为手切，且另一张也须为手切。</p>
 <ul>
 <li><b>cd1</b>：任意拆搭（万/筒/索均可）</li>
@@ -276,7 +284,7 @@ PATTERN_HELP_HTML = """
 <li>例：<code>cd1-3m</code> 先拆某搭子，再打 3m；<code>cd2-5s</code> 拆非索搭后打 5s</li>
 </ul>
 
-<h3>六、吃 / 碰占位</h3>
+<h3>七、吃 / 碰占位</h3>
 <p>在舍牌序列中表示"此处有一次吃或碰"，不占一张舍牌；<b>语义为具体吃的/碰的牌</b>，如 <code>4mc3m5m</code> 表示必须是用 3m5m 吃的 4m。</p>
 <ul>
 <li><b>吃</b>：任意 <code>(牌)c(牌)(牌)</code> 或 <code>c(牌)(牌)</code>，如 <code>1sc2s3s</code>、<code>4mc3m5m</code>、<code>c5m6m</code></li>
@@ -284,10 +292,10 @@ PATTERN_HELP_HTML = """
 <li><b>等价变体</b>：含吃或数牌碰时<u>不</u>生成花色等价变体；仅碰字牌时仍可生成变体</li>
 </ul>
 
-<h3>七、字牌</h3>
+<h3>八、字牌</h3>
 <p><b>1z～7z</b> 对应：东、南、西、北、白、发、中</p>
 
-<h3>八、逻辑符号 NOT / OR / AND / [xy] 范围</h3>
+<h3>九、逻辑符号 NOT / OR / AND / [xy] 范围</h3>
 <ul>
 <li><b>[xy] 数字范围</b>：<code>[25]m</code> = 2m、3m、4m、5m 其一；<code>[17]z</code> = 1z～7z 其一；可与花色 m/p/s/z 搭配，参与等价变换</li>
 <li><b>NOT[xy] 排除范围</b>：<code>NOT[45]m</code> = 除 4m、5m 外任意牌；<code>NOT[12]z</code> = 除东、南外任意牌</li>
@@ -297,7 +305,7 @@ PATTERN_HELP_HTML = """
 <li><b>AND</b>：与 <b>-</b> 同级，作舍牌顺序分隔符。例：<code>3mAND4m-zNOT1z</code> = 第一张 3m、第二张 4m、第三张任意字牌（非东）</li>
 </ul>
 
-<h3>九、字牌占位符</h3>
+<h3>十、字牌占位符</h3>
 <table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;">
 <tr><th>符号</th><th>含义</th></tr>
 <tr><td><code>z</code></td><td>任意字牌（手切）</td></tr>
@@ -310,7 +318,7 @@ PATTERN_HELP_HTML = """
 <tr><td><code>apr</code></td><td>立直宣言的安牌（该舍牌为立直宣言且满足安牌条件）</td></tr>
 </table>
 
-<h3>十、示例</h3>
+<h3>十一、示例</h3>
 <ul>
 <li><code>7s-9s</code>：相邻打出 7s、9s</li>
 <li><code>7s-0m-9s</code>：7s、赤5万、9s</li>
@@ -330,9 +338,12 @@ PATTERN_HELP_HTML = """
 <li><code>3mAND4m-zNOT1z</code>：3m、4m，第三张任意字牌但非东</li>
 <li><code>3mOR5m-z</code>：第一张为 3m 或 5m，第二张任意字牌</li>
 <li><code>[28]mf-6m</code>：2m～8m 其一（手摸切皆可），接着 6m；<code>mf</code>/<code>pf</code>/<code>sf</code> 同理</li>
+<li><code>2pk-1m</code>：先打关联的 2p（手切），再打 1m</li>
+<li><code>3mtk-z</code>：3m 摸切且为关联牌，接着任意字牌</li>
+<li><code>[25]mk-6m</code>：2m～5m 其一且该打为关联牌，接着 6m</li>
 </ul>
 
-<h3>十一、前段禁打约束</h3>
+<h3>十二、前段禁打约束</h3>
 <p>在约束区域「前段禁打」中输入模式，表示<u>舍牌模式开始前</u>（即匹配到的舍牌手顺之前）该玩家不能打出这些牌。支持与舍牌模式相同的语法，并与主模式同步等价变换。</p>
 <ul>
 <li><code>NOTm</code>：前段不能打出任何万字；<code>NOTmf</code> 同义且手摸切皆可；变体 1p-2p 时自动变为 NOTp</li>
@@ -340,7 +351,7 @@ PATTERN_HELP_HTML = """
 <li>例：舍牌 <code>1m-3m</code> 目标 2m，前段 <code>NOTm</code> → 在 1m-3m 的手顺之前不能打过任何万字</li>
 </ul>
 
-<h3>十二、前段有打约束</h3>
+<h3>十三、前段有打约束</h3>
 <p>在约束区域「前段有打」中输入舍牌模式，表示<u>舍牌模式开始前</u>（即匹配到的主舍牌手顺之前）该玩家<u>必须出现过</u>这一段舍牌。语法与主舍牌模式完全相同；与主模式串联为「前段有打 … 主舍牌模式」，中间发生了什么不要求。</p>
 <ul>
 <li><code>[29]m-3pf</code>：前段曾按顺序打出过 2m 或 9m，再打出 3m（手摸切皆可）；等价变体时同步映射</li>
@@ -352,6 +363,7 @@ PATTERN_HELP_HTML = """
 TARGET_HELP_HTML = """
 <h2>目标牌输入说明</h2>
 <p>统计舍牌序列匹配时，手牌中<u>持有该目标牌</u>的数量分布（目标牌存量、听牌、关联牌、搭子组合等均通过本语法解析）。</p>
+<p><b>舍牌模式里的关联牌后缀 <code>k</code></b>与目标牌输入无关：若要在<strong>舍牌手顺</strong>中规定「这一张打出时必须是关联牌」，请在<strong>模式</strong>里对该数牌加后缀 <code>k</code>（如 <code>2pk</code>、<code>3mtk</code>、<code>[25]mk</code>）。完整说明见主界面「舍牌模式」旁 <b>?</b> 帮助中的「三、关联牌标记 k」。</p>
 
 <h3>一、单张</h3>
 <ul>
@@ -377,6 +389,7 @@ TARGET_HELP_HTML = """
 <li><b>13m</b>：简写，等价 1m3m</li>
 <li>搭子模式结果只有两种：没有 / 有</li>
 <li>搭子中可含 <b>5.p</b> 等，例如 <b>45.p</b> 表示 4p 与「5 或赤五」同时满足</li>
+<li>主界面可勾选 <b>独立性筛选</b>（仅「目标牌存量」生效）：在手牌其余部分尽量拆除顺子/刻子与字刻后，若存在一种拆法使该两枚搭子不能与其余牌组成完整面子（顺/刻），才计为「有」；可减少长连如 <code>45678m</code> 对中间搭子的重复计数</li>
 </ul>
 
 <h3>四、多目标（同时分析多张牌）</h3>

@@ -48,6 +48,27 @@ from .instant_deal_in import RoundInstantDealInAnalyzer, extract_tenhou6_rounds
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_combo_independence_filter(
+    hand_at_turn: List[int],
+    mapped_target: Union[str, List[str], None],
+    base_count: int,
+    enabled: bool,
+) -> int:
+    """
+    搭子 combo：在已判定「目标张数齐套」(base_count==1) 后套独立性筛选（independence filter）。
+    非 combo、未齐套、或非两枚数牌目标时直接返回 base_count。
+    """
+    if not enabled or base_count != 1 or mapped_target is None:
+        return base_count
+    tiles = mapped_target if isinstance(mapped_target, list) else [mapped_target]
+    if len(tiles) != 2:
+        return base_count
+    from .taatsu_independence import combo_passes_independence_filter
+
+    return 1 if combo_passes_independence_filter(hand_at_turn, tiles) else 0
+
+
 # 每批从数据库读取的对局数。越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
 ANALYSIS_BATCH_SIZE = 5000
 MIN_ANALYSIS_BATCH_SIZE = 100
@@ -1200,6 +1221,7 @@ def _process_one_log_grid(task: Tuple) -> Dict:
     log_id, log_content, params = task
     use_tenpai = params.get("use_tenpai", False)
     use_related_tile = params.get("use_related_tile", False)
+    independence_filter = bool(params.get("independence_filter", False))
     grid_meta = params.get("grid_meta") or []
 
     def _target_key(tiles: List[str], is_combo: bool) -> str:
@@ -1269,15 +1291,22 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                         any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
                         for ts in multi_t[0][0]
                     ) else 0
+                    target_count = _apply_combo_independence_filter(
+                        hand_at_turn, multi_t[0][0], target_count, independence_filter
+                    )
                 else:
                     equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
                     target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
             elif is_combo and mapped_target is not None:
                 hand_bases = [t // 4 for t in hand_at_turn]
+                mts = mapped_target if isinstance(mapped_target, list) else [mapped_target]
                 target_count = 1 if all(
                     any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
-                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
+                    for ts in mts
                 ) else 0
+                target_count = _apply_combo_independence_filter(
+                    hand_at_turn, mapped_target, target_count, independence_filter
+                )
             elif mapped_target is not None:
                 equiv = MjlogParser.get_bases_for_target_tile_str(
                     mapped_target if isinstance(mapped_target, str) else mapped_target[0]
@@ -1324,6 +1353,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     use_related_tile = params.get("use_related_tile", False)
     use_deal_in_instant = params.get("use_deal_in_instant", False)
     multi_target = params.get("multi_target", False)
+    independence_filter = bool(params.get("independence_filter", False))
     cap = params.get("cap", MATCHED_STATES_CAP)
     worker_matched_states_cap = max(
         1, min(cap, int(params.get("worker_matched_states_cap", cap)))
@@ -1498,20 +1528,27 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     k = _target_key(tiles, is_cb)
                     if is_cb:
                         hand_bases = [t // 4 for t in hand_at_turn]
-                        target_counts[k] = 1 if all(
+                        tc = 1 if all(
                             any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
                             for ts in tiles
                         ) else 0
+                        target_counts[k] = _apply_combo_independence_filter(
+                            hand_at_turn, tiles, tc, independence_filter
+                        )
                     else:
                         equiv = MjlogParser.get_bases_for_target_tile_str(tiles[0])
                         target_counts[k] = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                 target_count = target_counts.get(_target_key(mt_item[0][0], mt_item[0][1]), 0)
             elif item_combo:
                 hand_bases = [t // 4 for t in hand_at_turn]
-                target_count = 1 if all(
+                mts = mapped_target if isinstance(mapped_target, list) else [mapped_target]
+                tc = 1 if all(
                     any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
-                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
+                    for ts in mts
                 ) else 0
+                target_count = _apply_combo_independence_filter(
+                    hand_at_turn, mapped_target, tc, independence_filter
+                )
                 target_counts = None
             else:
                 equiv = MjlogParser.get_bases_for_target_tile_str(
@@ -1804,6 +1841,7 @@ class LiveAnalyzer:
         gc_interval_batches: Optional[int] = None,
         instant_use_theory_point_only: Optional[bool] = True,  # 即时铳率：True=平均铳点仅按理论点（表宝牌），False=可考虑里宝模拟（若已实现）
         instant_normalize_oya_ron_to_ko: bool = False,  # 即时铳率：True=亲家和牌时铳点按子家算（折半），统一统计口径
+        independence_filter: bool = False,  # 仅目标牌存量+搭子 combo：拆面子后判定搭子独立性，抑制长顺重复计搭子
     ) -> Dict:
         """
         分析舍牌模式，计算目标牌在手牌中的概率。
@@ -1910,6 +1948,8 @@ class LiveAnalyzer:
         is_combo = first_t0[1] and len(multi_targets) == 1
         use_tenpai = (analysis_target == "tenpai")
         multi_target = len(multi_targets) > 1
+        # 独立性筛选仅对「目标牌存量」有意义，其它分析目标忽略该开关
+        eff_independence_filter = bool(independence_filter) and analysis_target == "target_count"
 
         matched_states = []
         sample_pool: List[Dict] = []
@@ -1999,6 +2039,7 @@ class LiveAnalyzer:
             "cap": cap,
             "worker_matched_states_cap": worker_matched_states_cap,
             "worker_sample_pool_cap": worker_sample_pool_cap,
+            "independence_filter": eff_independence_filter,
         }
         if use_parallel:
             logger.info(f"开始分析（并行 workers={workers}）..")
@@ -2314,6 +2355,7 @@ class LiveAnalyzer:
             'elapsed_seconds': round(time.perf_counter() - t0, 1),
             'instant_use_theory_point_only': instant_use_theory_point_only if use_deal_in_instant else None,
             'instant_normalize_oya_ron_to_ko': instant_normalize_oya_ron_to_ko if use_deal_in_instant else None,
+            'independence_filter': eff_independence_filter,
         }
 
         logger.info(f"analysis complete: matched {total_matches} states")
@@ -2527,6 +2569,7 @@ class LiveAnalyzer:
         prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
+        independence_filter: bool = False,
     ) -> Dict:
         """
         单次扫描批量分析：舍牌模式 × 巡目范围 网格，一次遍历数据库得到所有单格格的合并率。
@@ -2543,6 +2586,7 @@ class LiveAnalyzer:
         use_related_tile = (analysis_target == "related_tile")
         # 是否为「即时铳率」分析模式；用于 _should_run_memory_maintenance 区分内存维护策略（即时铳率下不必每批都做 GC）
         use_deal_in_instant = (analysis_target == "deal_in_instant")
+        eff_grid_independence = bool(independence_filter) and analysis_target == "target_count"
         keys = [0, 1] if (use_tenpai or use_related_tile) else [0, 1, 2, 3]
         merge_keys_f = [k for k in merge_keys if k in keys] or keys[:2]
 
@@ -2626,6 +2670,7 @@ class LiveAnalyzer:
             "use_related_tile": use_related_tile,
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
+            "independence_filter": eff_grid_independence,
         }
 
         conn = _connect_db_memory_efficient(self.db_path)
@@ -2921,19 +2966,26 @@ class LiveAnalyzer:
                                                 mt_item = multi_t
                                                 if multi_t[0][1]:
                                                     hand_bases = [t // 4 for t in hand_at_turn]
-                                                    target_count = 1 if all(
+                                                    tc = 1 if all(
                                                         any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
                                                         for ts in multi_t[0][0]
                                                     ) else 0
+                                                    target_count = _apply_combo_independence_filter(
+                                                        hand_at_turn, multi_t[0][0], tc, eff_grid_independence
+                                                    )
                                                 else:
                                                     equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
                                                     target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
                                             elif is_combo:
                                                 hand_bases = [t // 4 for t in hand_at_turn]
-                                                target_count = 1 if all(
+                                                mts = mapped_target if isinstance(mapped_target, list) else [mapped_target]
+                                                tc = 1 if all(
                                                     any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
-                                                    for ts in (mapped_target if isinstance(mapped_target, list) else [mapped_target])
+                                                    for ts in mts
                                                 ) else 0
+                                                target_count = _apply_combo_independence_filter(
+                                                    hand_at_turn, mapped_target, tc, eff_grid_independence
+                                                )
                                             else:
                                                 equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                                 target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
@@ -3034,6 +3086,7 @@ class LiveAnalyzer:
         deal_in_filter: Optional[str] = None,  # "hit"|"miss"|"furiten" 即时铳率样本筛选
         analysis_target: Optional[str] = None,
         pattern_index_filter: Optional[int] = None,  # 多模式时只保留 matched_pattern_idx == 此值的样本
+        independence_filter: bool = False,
     ) -> List[Dict]:
         """
         收集验证样本，用于人工复盘核验。
@@ -3046,6 +3099,7 @@ class LiveAnalyzer:
         )
         use_deal_in_instant = (analysis_target == "deal_in_instant")
         batch_size = _clamp_analysis_batch_size(requested_batch_size, workers=1, use_parallel=False)
+        eff_collect_independence = bool(independence_filter) and (analysis_target or "target_count") == "target_count"
 
         if sample_pool is not None:
             # 从预收集的样本池中筛选并取前 N 个，无需遍历牌谱（主分析已排除南四局则无需再过滤）
@@ -3417,10 +3471,13 @@ class LiveAnalyzer:
                                 hand_at_turn = list(hh)  # 必须为 list 以保留同种牌枚数
                                 if sample_is_combo:
                                     hand_bases = [t // 4 for t in hand_at_turn]
-                                    target_count = 1 if all(
+                                    tc = 1 if all(
                                         any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
                                         for ts in mapped_target
                                     ) else 0
+                                    target_count = _apply_combo_independence_filter(
+                                        hand_at_turn, mapped_target, tc, eff_collect_independence
+                                    )
                                 else:
                                     equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                     target_count = sum(
@@ -3675,12 +3732,29 @@ def verify_sample_consistency(
 
 
 def _target_counts_display_set(tc: dict) -> set:
-    """多目标时，各目标牌及其等价牌的显示集合"""
+    """多目标时，各目标牌及其等价牌的显示集合（键可能为 combo 合并串如 4p5.p，不能直接 string_to_tile）"""
     out = set()
     for k in (tc or {}):
-        base = MjlogParser.string_to_tile(k)
-        for b in MjlogParser.get_count_equivalent_bases(base):
-            out.add(MjlogParser.tile_to_string(b * 4))
+        if not k:
+            continue
+        try:
+            bases = MjlogParser.get_bases_for_target_tile_str(k)
+            for b in bases:
+                for eq in MjlogParser.get_count_equivalent_bases(b):
+                    out.add(MjlogParser.tile_to_string(eq * 4))
+            continue
+        except ValueError:
+            pass
+        # 多目标下 _target_key 对搭子为 "".join(sorted(tiles))，如 "4p5.p"
+        tokens, _ = parse_target_tiles(k)
+        for tok in tokens:
+            try:
+                tb = MjlogParser.get_bases_for_target_tile_str(tok)
+            except ValueError:
+                continue
+            for b in tb:
+                for eq in MjlogParser.get_count_equivalent_bases(b):
+                    out.add(MjlogParser.tile_to_string(eq * 4))
     return out
 
 
@@ -3725,7 +3799,12 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         else:
             mt_set = _target_display_set(mt) if not (use_tenpai or use_related_tile) and mt else set()
         hand_parts = []
-        for t in sorted(s["hand_tiles"], key=lambda x: (x // 4, x)):
+        hand_tiles = s.get("hand_tiles") or []
+        try:
+            hand_iter = sorted(hand_tiles, key=lambda x: (x // 4, x))
+        except TypeError:
+            hand_iter = list(hand_tiles) if isinstance(hand_tiles, (list, tuple)) else []
+        for t in hand_iter:
             ts = MjlogParser.tile_to_string(t)
             hand_parts.append(f"[{ts}]" if (ts in mt_set) else ts)
         hand_str = " ".join(hand_parts)
@@ -3756,10 +3835,10 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
             f"  Seat:        {wind}",
             f"  Turn:        {s['turn']}",
             f"  Dora:        {s['dora_readable']}",
-            f"  Discards:    {' '.join(s['actual_pattern'])}",
+            f"  Discards:    {' '.join(s.get('actual_pattern') or [])}",
             f"  副露区:      {call_area_str}",
             target_line,
-            f"  Hand({len(s['hand_tiles'])}): {hand_str}",
+            f"  Hand({len(hand_tiles)}): {hand_str}",
         ]
         if use_instant:
             block.append(f"  振听状态:    {s.get('furiten_state', 'none')}")

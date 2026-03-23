@@ -408,7 +408,7 @@ class MainWindow(QMainWindow):
         ph_row = QHBoxLayout()
         ph_row.addWidget(QLabel("舍牌模式 (可添加多条，满足任一即计入):"))
         pattern_help_btn = QPushButton("?")
-        pattern_help_btn.setToolTip("舍牌模式输入说明")
+        pattern_help_btn.setToolTip("舍牌模式输入说明（含关联牌后缀 k）")
         pattern_help_btn.setFixedWidth(28)
         pattern_help_btn.clicked.connect(self._show_pattern_help)
         ph_row.addWidget(pattern_help_btn)
@@ -681,7 +681,8 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
-            "关联牌判断：判断目标牌（须在模式中出现）是否为关联牌（与手牌搭子距离≤2）；"
+            "关联牌判断：按目标牌在模式中最后一次出现的那一打，判断是否关联牌（与手牌搭子距离≤2）；"
+            "舍牌模式中若要规定「某张打出时必为关联牌」，请在数牌后加后缀 k（如 2pk），详见舍牌模式 ? 帮助；"
             "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
@@ -711,6 +712,14 @@ class MainWindow(QMainWindow):
         self.matched_states_cap_spin.valueChanged.connect(self._save_matched_states_cap)
         self.matched_states_cap_spin.setMinimumWidth(56)
         opts_row.addWidget(self.matched_states_cap_spin)
+        # 搭子独立性筛选：仅「目标牌存量」分析目标下显示（与 live_analyzer 中 eff_independence 一致）
+        self.independence_filter_check = QCheckBox("独立性筛选")
+        self.independence_filter_check.setToolTip(
+            "仅「目标牌存量」且目标为搭子（如 4m5m）时生效：在手牌其余部分尽量拆除顺子/刻子后，"
+            "若存在一种拆法使该两枚不构成嵌在长顺中的面子，才计为「有」；可减少 45678 等对中间搭子的重复计数。"
+        )
+        self.independence_filter_check.setVisible(False)
+        opts_row.addWidget(self.independence_filter_check)
         opts_row.addStretch()
         right_layout.addLayout(opts_row)
         
@@ -777,7 +786,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         pattern_edit = QLineEdit()
-        pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
+        pattern_edit.setPlaceholderText("例: 7s-9s、2pk-1m、c0p6p-$、cd1-3m")
         pattern_edit.setMinimumWidth(150)
         target_edit = QLineEdit()
         target_edit.setPlaceholderText("例: 6s、45.p、6s 2m 5p")
@@ -835,6 +844,8 @@ class MainWindow(QMainWindow):
                 target_edit.setPlaceholderText("例: 2p（分析该牌的关联度，须在模式中出现）")
             else:
                 target_edit.setPlaceholderText("例: 6s、45.p、6s 2m 5p")
+        if hasattr(self, "independence_filter_check"):
+            self.independence_filter_check.setVisible(data == "target_count")
 
     def _parse_dora_position_spec(self) -> List[int]:
         """解析「宝牌=模式第 N 张」的位置输入，返回 0-based 下标列表。如 1,3 -> [0, 2]"""
@@ -925,7 +936,7 @@ class MainWindow(QMainWindow):
         ph_row = QHBoxLayout()
         ph_row.addWidget(QLabel("舍牌模式 (可添加多条，满足任一即计入):"))
         instant_pattern_help_btn = QPushButton("?")
-        instant_pattern_help_btn.setToolTip("舍牌模式输入说明")
+        instant_pattern_help_btn.setToolTip("舍牌模式输入说明（含关联牌后缀 k）")
         instant_pattern_help_btn.setFixedWidth(28)
         instant_pattern_help_btn.clicked.connect(self._show_pattern_help)
         ph_row.addWidget(instant_pattern_help_btn)
@@ -1224,7 +1235,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         pattern_edit = QLineEdit()
-        pattern_edit.setPlaceholderText("例: 7s-9s、c0p6p-$、cd1-3m")
+        pattern_edit.setPlaceholderText("例: 7s-9s、2pk-1m、c0p6p-$、cd1-3m")
         pattern_edit.setMinimumWidth(120)
         target_edit = QLineEdit()
         target_edit.setPlaceholderText("例: 6s、3p,4p、5.p（铳率勿用 .）")
@@ -2445,6 +2456,11 @@ class MainWindow(QMainWindow):
         analysis = self.analysis_target_combo.currentData() or "target_count"
         analysis_map = {"target_count": "目标牌存量", "tenpai": "是否听牌", "related_tile": "关联牌判断", "outcome": "和铳率"}
         lines.append("分析=%s" % analysis_map.get(analysis, "目标牌存量"))
+        # 仅「目标牌存量」有意义；与 execute_query 中 independence_on 口径一致
+        if analysis == "target_count" and getattr(self, "independence_filter_check", None):
+            lines.append(
+                "独立性筛选=%s" % ("是" if self.independence_filter_check.isChecked() else "否")
+            )
         turn_ranges = self._get_turn_ranges_from_ui()
         if turn_ranges:
             for t_min, t_max in turn_ranges:
@@ -2682,6 +2698,18 @@ class MainWindow(QMainWindow):
                 if self.analysis_target_combo.itemData(i) == target:
                     self.analysis_target_combo.setCurrentIndex(i)
                     break
+            # 分享串中的搭子独立性筛选（仅目标牌存量生效）
+            if getattr(self, "independence_filter_check", None):
+                raw_ind = (data.get("独立性筛选") or "否")
+                if isinstance(raw_ind, str):
+                    ind = raw_ind.strip()
+                else:
+                    ind = "否"
+                want_on = ind == "是" or ind.lower() in ("1", "true", "yes", "开", "on")
+                if target == "target_count":
+                    self.independence_filter_check.setChecked(want_on)
+                else:
+                    self.independence_filter_check.setChecked(False)
             turn_range_strs = data.get("巡目范围") or []
             if isinstance(turn_range_strs, str):
                 turn_range_strs = [turn_range_strs]
@@ -2922,7 +2950,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("请粘贴之前生成的分享串（多行 key=value 格式）："))
         te = QTextEdit()
-        te.setPlaceholderText("例：\nRHM1\n模式=7s-9s→6s\n分析=目标牌存量\n巡目=1-6\n或 巡目范围=1-3\n巡目范围=4-6\n巡目范围=7-9\n...")
+        te.setPlaceholderText("例：\nRHM1\n模式=7s-9s→6s\n分析=目标牌存量\n独立性筛选=是\n巡目=1-6\n或 巡目范围=1-3\n巡目范围=4-6\n巡目范围=7-9\n...")
         te.setMinimumSize(420, 200)
         layout.addWidget(te)
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -3055,6 +3083,12 @@ class MainWindow(QMainWindow):
         instant_normalize_oya_ron_to_ko = False
         if use_instant and getattr(self, "instant_normalize_oya_ron_to_ko_check", None):
             instant_normalize_oya_ron_to_ko = self.instant_normalize_oya_ron_to_ko_check.isChecked()
+        # 与本次实际 analysis_target 对齐（含铳率页强制即时铳率等），避免误传独立性开关
+        independence_on = (
+            bool(getattr(self, "independence_filter_check", None))
+            and self.independence_filter_check.isChecked()
+            and analysis_target == "target_count"
+        )
         params = {
             "query_items": query_items,
             "analysis_target": analysis_target,
@@ -3079,6 +3113,7 @@ class MainWindow(QMainWindow):
             "hypothetical_furiten_tiles": hypothetical_furiten,
             "max_workers": self.max_workers_spin.value(),
             "gc_interval_batches": self.gc_interval_batches_spin.value(),
+            "independence_filter": independence_on,
         }
         
         # 启动查询线程
@@ -3234,14 +3269,19 @@ class MainWindow(QMainWindow):
                 target_tile = "听牌"  # 样本展示用
             elif self.last_query_params.get("analysis_target") == "outcome":
                 target_tile = "和铳率"  # 样本展示用
-            text = format_samples_for_display(
-                samples,
-                query_str,
-                target_tile,
-                analysis_target=self.last_query_params.get("analysis_target", "target_count"),
-            )
-            dlg = SampleDialog(self, text, query_str.replace("-", "_"))
-            dlg.exec_()
+            try:
+                text = format_samples_for_display(
+                    samples,
+                    query_str,
+                    target_tile,
+                    analysis_target=self.last_query_params.get("analysis_target", "target_count"),
+                )
+                safe_qs = (query_str or "pattern").replace("-", "_")
+                dlg = SampleDialog(self, text, safe_qs)
+                dlg.exec_()
+            except Exception as e:
+                logger.exception("格式化或展示验证样本失败")
+                QMessageBox.critical(self, "生成样本失败", str(e))
         elif not success:
             QMessageBox.critical(self, "生成失败", str(samples_or_error))
         else:
@@ -3418,6 +3458,11 @@ class MainWindow(QMainWindow):
                 "prior_discard_required": self.prior_discard_required_input.text().strip() or None,
                 "analysis_batch_size": self.analysis_batch_size_spin.value(),
                 "gc_interval_batches": self.gc_interval_batches_spin.value(),
+                "independence_filter": (
+                    bool(getattr(self, "independence_filter_check", None))
+                    and self.independence_filter_check.isChecked()
+                    and (self.analysis_target_combo.currentData() or "") == "target_count"
+                ),
             }
             self.gen_sample_btn.setEnabled(True)
             # 舍牌模式选择：多模式时列出每个模式供生成样本时选择

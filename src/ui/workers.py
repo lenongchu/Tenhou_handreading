@@ -225,18 +225,31 @@ class SampleThread(QThread):
                     + (f"/{_fmt_int(total)}" if total > 0 else "")
                 )
 
-            params = {
-                k: v
-                for k, v in self.params.items()
-                if k
-                not in (
-                    "query_pattern_str",
-                    "is_combo",
-                    "query_items",
-                    "matched_states_cap",
-                    "call_area_constraints",
-                )
+            # 仅传入 collect_verification_samples 声明的参数，避免 last_query_params 里多余键导致 TypeError 闪退
+            _allowed_collect = {
+                "query_pattern",
+                "target_tile",
+                "dora_constraint",
+                "dora_position_spec",
+                "visible_constraints",
+                "hand_visible_constraints",
+                "riichi_constraint",
+                "call_constraint",
+                "call_area_constraints",
+                "turn_range",
+                "sample_limit",
+                "total_logs_hint",
+                "analysis_batch_size",
+                "exclude_south4",
+                "exclude_south3",
+                "prior_discard_exclusion",
+                "prior_discard_required",
+                "gc_interval_batches",
+                "analysis_target",
+                "pattern_index_filter",
+                "independence_filter",
             }
+            params = {k: v for k, v in self.params.items() if k in _allowed_collect}
             samples = self.analyzer.collect_verification_samples(
                 **params,
                 sample_count=self.sample_count,
@@ -307,6 +320,7 @@ class GridQueryThread(QThread):
                     "prior_discard_required",
                     "max_workers",
                     "gc_interval_batches",
+                    "independence_filter",
                 )
             }
 
@@ -402,6 +416,7 @@ class BatchChartThread(QThread):
                     "prior_discard_required",
                     "max_workers",
                     "gc_interval_batches",
+                    "independence_filter",
                 )
             }
             self.progress.emit(
