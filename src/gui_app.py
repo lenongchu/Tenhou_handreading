@@ -546,9 +546,12 @@ class MainWindow(QMainWindow):
         self.call_group.addButton(self.call_has_radio, 1)
         self.call_no_radio = QRadioButton("无人副露")
         self.call_group.addButton(self.call_no_radio, 2)
+        self.target_no_call_check = QCheckBox("目标无副露")
+        self.target_no_call_check.setToolTip("仅针对分析目标的玩家在满足舍牌模式的瞬间没有副露")
         call_row.addWidget(self.call_any_radio)
         call_row.addWidget(self.call_has_radio)
         call_row.addWidget(self.call_no_radio)
+        call_row.addWidget(self.target_no_call_check)
         call_row.addStretch()
         right_layout.addLayout(call_row)
         exclude_south_row = QHBoxLayout()
@@ -1039,9 +1042,12 @@ class MainWindow(QMainWindow):
         self.instant_call_group.addButton(self.instant_call_has_radio, 1)
         self.instant_call_no_radio = QRadioButton("无人副露")
         self.instant_call_group.addButton(self.instant_call_no_radio, 2)
+        self.instant_target_no_call_check = QCheckBox("目标无副露")
+        self.instant_target_no_call_check.setToolTip("仅针对分析目标的玩家在满足舍牌模式的瞬间没有副露")
         call_row.addWidget(self.instant_call_any_radio)
         call_row.addWidget(self.instant_call_has_radio)
         call_row.addWidget(self.instant_call_no_radio)
+        call_row.addWidget(self.instant_target_no_call_check)
         call_row.addStretch()
         c_layout.addLayout(call_row)
 
@@ -1405,6 +1411,7 @@ class MainWindow(QMainWindow):
         self.call_any_radio.setChecked(self.instant_call_any_radio.isChecked())
         self.call_has_radio.setChecked(self.instant_call_has_radio.isChecked())
         self.call_no_radio.setChecked(self.instant_call_no_radio.isChecked())
+        self.target_no_call_check.setChecked(self.instant_target_no_call_check.isChecked())
 
         # 南三/南四
         self.exclude_south4_check.setChecked(self.instant_exclude_south4_check.isChecked())
@@ -2498,6 +2505,8 @@ class MainWindow(QMainWindow):
         elif self.call_no_radio.isChecked():
             cv = "no_call"
         lines.append("副露=%s" % call_map.get(cv, "任意"))
+        if self.target_no_call_check.isChecked():
+            lines.append("目标无副露=是")
         lines.append("南三=%s" % ("是" if self.exclude_south3_check.isChecked() else "否"))
         lines.append("南四=%s" % ("是" if self.exclude_south4_check.isChecked() else "否"))
         prior = self.prior_discard_exclusion_input.text().strip()
@@ -2565,6 +2574,8 @@ class MainWindow(QMainWindow):
         elif self.instant_call_no_radio.isChecked():
             cv = "no_call"
         lines.append("副露=%s" % call_map.get(cv, "任意"))
+        if self.instant_target_no_call_check.isChecked():
+            lines.append("目标无副露=是")
         lines.append("南三=%s" % ("是" if self.instant_exclude_south3_check.isChecked() else "否"))
         lines.append("南四=%s" % ("是" if self.instant_exclude_south4_check.isChecked() else "否"))
         prior = self.instant_prior_discard_exclusion_input.text().strip()
@@ -2795,10 +2806,12 @@ class MainWindow(QMainWindow):
         if instant:
             ra, rh, rn = self.instant_riichi_any_radio, self.instant_riichi_has_radio, self.instant_riichi_no_radio
             ca, ch, cn = self.instant_call_any_radio, self.instant_call_has_radio, self.instant_call_no_radio
+            tnc = self.instant_target_no_call_check
             s3, s4 = self.instant_exclude_south3_check, self.instant_exclude_south4_check
         else:
             ra, rh, rn = self.riichi_any_radio, self.riichi_has_radio, self.riichi_no_radio
             ca, ch, cn = self.call_any_radio, self.call_has_radio, self.call_no_radio
+            tnc = self.target_no_call_check
             s3, s4 = self.exclude_south3_check, self.exclude_south4_check
         ra.setChecked(riichi == "any")
         rh.setChecked(riichi == "has_riichi")
@@ -2806,6 +2819,7 @@ class MainWindow(QMainWindow):
         ca.setChecked(call == "any")
         ch.setChecked(call == "has_call")
         cn.setChecked(call == "no_call")
+        tnc.setChecked((data.get("目标无副露") or "否") == "是")
         s3.setChecked((data.get("南三") or "否") == "是")
         s4.setChecked((data.get("南四") or "否") == "是")
 
@@ -3100,6 +3114,7 @@ class MainWindow(QMainWindow):
             "dora_position_spec": dora_position_spec,
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
+            "target_no_call": self.target_no_call_check.isChecked(),
             "call_area_constraints": call_area_constraints if call_area_constraints else None,
             "turn_range": turn_range,
             "sample_limit": sample_limit,

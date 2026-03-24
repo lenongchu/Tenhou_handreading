@@ -69,9 +69,10 @@ def _apply_combo_independence_filter(
     return 1 if combo_passes_independence_filter(hand_at_turn, tiles) else 0
 
 
-# 每批从数据库读取的对局数。越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
+# 每批从数据库读取的对局数（统一默认）：主分析、矩阵、即时铳率(deal_in_instant) 等均用 analyze 入参 analysis_batch_size，未传时即用本值；GUI 单控件覆盖。
+# 越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
 ANALYSIS_BATCH_SIZE = 5000
-MIN_ANALYSIS_BATCH_SIZE = 100
+MIN_ANALYSIS_BATCH_SIZE = 500
 # 主统计时最多保留的匹配状态条数（仅用于返回给界面，超出部分不保留，避免内存持续增长）
 MATCHED_STATES_CAP = 200
 SAMPLE_POOL_CAP = 3000
@@ -79,12 +80,27 @@ PARALLEL_MIN_MATCHED_STATES_PER_LOG = 4
 PARALLEL_MAX_SAMPLE_POOL_PER_LOG = 512  # 提高以保留更多可铳样本，避免单局多匹配时样本池截断
 PARALLEL_BATCH_PER_WORKER = 500
 PARALLEL_IN_FLIGHT_FACTOR = 2
-GC_INTERVAL_BATCHES = 20  # 降低频率，因为现在有管理员强制清理
-HIGH_MEMORY_LOAD_RATIO = 0.95
-# 并行分析时，每处理多少批后重启worker 池
+GC_INTERVAL_BATCHES = 10  # 降低频率，因为现在有管理员强制清理
+# 内存负载阈值 [0,1]，与 GlobalMemoryStatusEx 的 dwMemoryLoad 一致；误写成 10 会导致「高压早维护」分支永不到
+HIGH_MEMORY_LOAD_RATIO = 0.94
+# 并行分析时，每处理多少批后重启 worker 池（过小会频繁 shutdown(wait=True) 造成明显批间停顿）
 POOL_RESTART_EVERY_BATCHES = 10
-# 即时铳率分析时每批最多读取条数
-DEAL_IN_INSTANT_BATCH_SIZE = 8000
+
+# ---------------------------------------------------------------------------
+# 长分析中的内存维护（默认关闭最耗时的几项；系统在 ~94% 饱和时收益常不明显）
+# 需要恢复旧行为时把对应项改为 True 即可（不必翻注释块）。
+# ---------------------------------------------------------------------------
+# 每 N 批：gc（若开）+ PRAGMA shrink_memory + 关闭并重连主线程上的 DB 连接。
+# True 时极易造成明显批间低谷，且与 _trim 叠加时常表现为「停顿越来越久」（WAL/页缓存 + 系统文件缓存被反复刷冷）。
+ENABLE_PERIODIC_MEMORY_MAINTENANCE = False
+# 每 POOL_RESTART_EVERY_BATCHES 批：整池 shutdown(wait=True) 再建进程池
+ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY = False
+# Windows：EmptyWorkingSet + SetSystemFileCacheSize（可能拖慢后续 I/O）
+ENABLE_TRIM_PROCESS_MEMORY = True
+# 是否与「周期 DB 维护」一同调用 Trim：极易拉长低谷；分析结束时的 finally 仍会按需 Trim（见 ENABLE_TRIM_PROCESS_MEMORY）
+ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE = False
+# 取消/结束等路径上的 gc.collect()（全量 GC 在百万对象下很慢）
+ENABLE_GC_COLLECT_DURING_ANALYSIS = False
 
 
 def _get_variant_pattern_suit(matched_variant: Optional[Dict]) -> Optional[str]:
@@ -169,7 +185,8 @@ class BackgroundLogFetcher:
         self.db_path = db_path
         self.batch_size = batch_size
         self.last_id = last_id
-        self.queue = queue.Queue(maxsize=2)  # 预取 2 批，平衡内存与 I/O 覆盖
+        # 多缓冲几批 SQL 结果，便于预取线程提前 execute/fetchall，与计算重叠（勿盲目加大：每格≈一批 log 体积）
+        self.queue = queue.Queue(maxsize=BACKGROUND_FETCHER_QUEUE_MAX_BATCHES)
         self.stop_event = threading.Event()
         self.error = None
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -178,7 +195,7 @@ class BackgroundLogFetcher:
     def _run(self):
         try:
             # 后台线程开启独立连接
-            conn = _connect_db_memory_efficient(self.db_path)
+            conn = _connect_db_memory_efficient(self.db_path, log_sequential_reader=True)
             cur = conn.cursor()
             last_id = self.last_id
             
@@ -229,6 +246,114 @@ class BackgroundLogFetcher:
         except:
             pass
 
+
+# 行任务预取队列内哨兵：标记「一个 SQL 批已拆完」，主线程取出时调用 on_batch_done（可能关连主库 conn，必须在主线程）
+_PREFETCH_BATCH_GAP = object()
+_PREFETCH_STREAM_END = object()
+
+
+class _RowTaskPrefetcher:
+    """
+    后台线程从 BackgroundLogFetcher 取整批 log，拆成 (log_id, content, params) 写入有界队列。
+    主线程上 next(task_iter) 仅 queue.get，避免在 SQL 批边界阻塞在 fetcher.next_batch()，减轻锯齿状 CPU 空窗。
+    """
+
+    def __init__(
+        self,
+        fetcher: BackgroundLogFetcher,
+        per_log_params: Dict,
+        on_batch_done: Optional[Callable[[], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        queue_maxsize: int = 256,
+    ):
+        self._fetcher = fetcher
+        self._per_log_params = per_log_params
+        self._on_batch_done = on_batch_done
+        self._should_cancel = should_cancel
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(32, int(queue_maxsize)))
+        self._stop = threading.Event()
+        self._error: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="RowTaskPrefetch")
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if self._should_cancel and self._should_cancel():
+                    break
+                logs = self._fetcher.next_batch()
+                if not logs:
+                    break
+                for row in logs:
+                    if self._stop.is_set():
+                        return
+                    if self._should_cancel and self._should_cancel():
+                        return
+                    log_id, log_content = row[0], row[1]
+                    task = (log_id, log_content, self._per_log_params)
+                    while not self._stop.is_set():
+                        try:
+                            self._q.put(task, timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
+                if self._stop.is_set():
+                    return
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(_PREFETCH_BATCH_GAP, timeout=0.25)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            logger.error(f"行级任务预取线程出错: {e}")
+            self._error = e
+        finally:
+            while True:
+                try:
+                    self._q.put(_PREFETCH_STREAM_END, timeout=2.0)
+                    break
+                except queue.Full:
+                    if self._stop.is_set():
+                        try:
+                            self._q.put_nowait(_PREFETCH_STREAM_END)
+                        except Exception:
+                            pass
+                        break
+                    continue
+
+    def close(self) -> None:
+        """停止预取并尽量排空队列，减轻 cancel 时生产者阻塞在 put 的概率。"""
+        self._stop.set()
+        try:
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+        except Exception:
+            pass
+        self._thread.join(timeout=3.0)
+
+    def __iter__(self) -> "_RowTaskPrefetcher":
+        return self
+
+    def __next__(self) -> Tuple:
+        if self._error is not None:
+            raise self._error
+        if self._should_cancel and self._should_cancel():
+            raise StopIteration
+        while True:
+            item = self._q.get()
+            if item is _PREFETCH_STREAM_END:
+                raise StopIteration
+            if item is _PREFETCH_BATCH_GAP:
+                if self._on_batch_done:
+                    self._on_batch_done()
+                continue
+            return item
+
+
 def _tile_str_eq(a: str, b: str) -> bool:
     """牌字符串相等（东/1z 等字牌格式统一比较）"""
     if a == b:
@@ -275,6 +400,7 @@ class MatchValidator:
         self.dora_position_spec = params.get("dora_position_spec") or []
         self.riichi_constraint = params.get("riichi_constraint")
         self.call_constraint = params.get("call_constraint")
+        self.target_no_call = params.get("target_no_call", False)
         self.call_area_constraints = params.get("call_area_constraints")
         self.hand_visible_constraints = params.get("hand_visible_constraints")
         self.use_tenpai = params.get("use_tenpai", False)
@@ -313,7 +439,7 @@ class MatchValidator:
             return False
         if not self._check_riichi_constraint(discard):
             return False
-        if not self._check_call_constraint(discard):
+        if not self._check_call_constraint(discard, player_state):
             return False
         if not self._check_call_area_constraints(discard, matched_variant, player_state, round_players):
             return False
@@ -412,14 +538,20 @@ class MatchValidator:
             return False
         return True
 
-    def _check_call_constraint(self, discard) -> bool:
-        """副露约束（舍牌级）：该舍牌是否在鸣牌后打出。"""
-        if not self.call_constraint or self.call_constraint == "any":
-            return True
-        if self.call_constraint == "has_call" and not discard.call_happened:
-            return False
-        if self.call_constraint == "no_call" and discard.call_happened:
-            return False
+    def _check_call_constraint(self, discard, player_state=None) -> bool:
+        """副露约束（舍牌级）：该舍牌是否在鸣牌后打出，或目标玩家当前瞬间是否无副露。"""
+        if self.call_constraint and self.call_constraint != "any":
+            if self.call_constraint == "has_call" and not discard.call_happened:
+                return False
+            if self.call_constraint == "no_call" and discard.call_happened:
+                return False
+        
+        # 目标无副露约束：仅针对分析目标的玩家在满足舍牌模式的瞬间没有副露
+        if self.target_no_call and player_state:
+            # 检查该玩家在该巡之前（含该巡）是否有已完成的副露
+            # from_discard_turn 是副露后第一张舍牌的巡目；若 <= 当前巡目，则已完成副露
+            if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
+                return False
         return True
 
     def _check_call_area_constraints(
@@ -581,6 +713,8 @@ def _clamp_analysis_batch_size(batch_size: int, workers: int, use_parallel: bool
 
 def _trim_process_memory() -> None:
     """Best-effort memory trim for long runs (mainly effective on Windows)."""
+    if not ENABLE_TRIM_PROCESS_MEMORY:
+        return
     if os.name != "nt":
         return
     try:
@@ -624,8 +758,16 @@ def _get_system_memory_load_ratio() -> Optional[float]:
     return None
 
 
+def _maybe_analysis_gc() -> None:
+    """全量 GC：长分析中途调用成本高；由 ENABLE_GC_COLLECT_DURING_ANALYSIS 控制。"""
+    if ENABLE_GC_COLLECT_DURING_ANALYSIS:
+        gc.collect()
+
+
 def _should_run_memory_maintenance(batch_index: int, gc_interval_batches: Optional[int] = None, is_instant_mode: bool = False) -> bool:
     """Run maintenance periodically, or early under high system memory pressure."""
+    if not ENABLE_PERIODIC_MEMORY_MAINTENANCE:
+        return False
     if batch_index <= 0:
         return False
     interval = gc_interval_batches if gc_interval_batches is not None else GC_INTERVAL_BATCHES
@@ -658,8 +800,15 @@ def _iter_pool_results_bounded(
 
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            # 必须先交付本轮全部 result，再调用 next(task_iter)。
+            # 跨批迭代器在 SQL 批边界会阻塞在 fetcher.next_batch()；若在每个 fut 上交替 yield+next，
+            # 第一个 next 卡住时同轮其它已完成的 future 既不能 yield 也不能进入下一轮 wait，worker 易长时间空转（CPU 低谷变长）。
+            results = []
             for fut in done:
-                yield fut.result()
+                results.append(fut.result())
+            for r in results:
+                yield r
+            for _ in results:
                 try:
                     pending.add(pool.submit(fn, next(task_iter)))
                 except StopIteration:
@@ -737,14 +886,24 @@ def _game_at_index_contains_consumed(raw: str, game_index: int, consumed_search)
         return False
 
 
-def _connect_db_memory_efficient(db_path: str):
+# SQLite：PRAGMA cache_size 负值 = 缓存上限（KiB）。过小则大 batch 读 BLOB 时页抖动、磁盘占用呈锯齿。
+SQLITE_DEFAULT_CACHE_KIB = 20000  # ~20 MiB，主线程偶发查询 / 维护重连
+SQLITE_LOG_SCANNER_CACHE_KIB = 262144  # ~256 MiB，仅顺序扫 logs 的预取连接（内存换 I/O 平滑）
+# 预取队列每格 = 一整批 fetchall 结果；加深可重叠「下一批 SQL」与当前批计算（内存按 batch 体积×格数涨）
+BACKGROUND_FETCHER_QUEUE_MAX_BATCHES = 6
+
+
+def _connect_db_memory_efficient(db_path: str, *, log_sequential_reader: bool = False):
     """
     创建限制内存占用的 SQLite 连接。
     避免 tenhou.db 在长时分析中占用十余 GB 内存（SQLite 缓存 + OS 文件缓存）。
+    log_sequential_reader=True：给 BackgroundLogFetcher 等大段顺序读 BLOB 的连接用更大页缓存，
+    减轻 batchsize 上万时页频繁换出导致的磁盘锯齿（disk active time 脉冲）。
     """
     conn = sqlite3.connect(db_path, timeout=60)
-    # 恢复性能：增加 SQLite 内部页面缓存
-    conn.execute("PRAGMA cache_size = -20000")
+    # PRAGMA cache_size 为负时表示「KiB」；默认 ~20MiB，扫表连接 ~256MiB（可调 SQLITE_*_CACHE_KIB）
+    cache_kib = SQLITE_LOG_SCANNER_CACHE_KIB if log_sequential_reader else SQLITE_DEFAULT_CACHE_KIB
+    conn.execute(f"PRAGMA cache_size = {-int(cache_kib)}")
     # 启用 Memory Mapped I/O (mmap)，将数据库文件映射到内存地址空间
     # 只要内存足够，这将显著提升读取 BLOB/JSON 字段的速度。这里设为 4GB
     conn.execute("PRAGMA mmap_size = 4294967296")
@@ -833,6 +992,7 @@ def iter_valid_discards(
     exclude_south3 = params.get("exclude_south3", False)
     dora_constraint = params.get("dora_constraint")
     call_constraint = params.get("call_constraint")
+    target_no_call = params.get("target_no_call", False)
     call_area_constraints = params.get("call_area_constraints")
     call_area_constraint_sets = params.get("call_area_constraint_sets")
     consumed_search_list = params.get("consumed_search_list", [])
@@ -866,13 +1026,14 @@ def iter_valid_discards(
                 continue
 
         # 局级：副露约束（round 内至少有一名玩家可能满足）
-        if call_constraint or call_area_constraints or call_area_constraint_sets:
+        if call_constraint or target_no_call or call_area_constraints or call_area_constraint_sets:
             if not round_could_satisfy_call_constraints(
                 round_players,
                 call_constraint,
                 None if call_area_constraint_sets else call_area_constraints,
                 oya,
                 call_area_constraint_sets=call_area_constraint_sets,
+                target_no_call=target_no_call,
             ):
                 continue
 
@@ -885,7 +1046,8 @@ def iter_valid_discards(
 
         for player_state in round_players:
             # 玩家级：call_constraint=="no_call" 时，有副露则跳过
-            if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
+            # 如果开启了 target_no_call，则不在此处做全局跳过，而是在舍牌级精确判断
+            if not target_no_call and call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
                 continue
 
             # 玩家级：副露区域约束
@@ -915,12 +1077,16 @@ def iter_valid_discards(
                     if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                         continue
 
-                # 舍牌级：副露约束（该舍牌是否在鸣牌后打出）
-                if call_constraint and call_constraint != "any":
+                # 舍牌级：副露约束（该舍牌是否在鸣牌后打出，或目标玩家无副露）
+                if (call_constraint and call_constraint != "any") or target_no_call:
                     if call_constraint == "has_call" and not discard.call_happened:
                         continue
                     if call_constraint == "no_call" and discard.call_happened:
                         continue
+                    # 目标无副露：仅针对本玩家在当前瞬间
+                    if target_no_call:
+                        if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
+                            continue
 
                 round_idx = round_start // round_size
                 yield (player_state, round_players, round_idx, orig_i, discard)
@@ -930,6 +1096,7 @@ def _core_match_engine(
     raw_content: str,
     params: Dict,
     is_grid: bool = False,
+    pre_parsed_game_states: Optional[List[GameState]] = None,
 ) -> Iterator[Dict]:
     """
     核心匹配引擎：接管 JSON 解析、遍历与匹配逻辑，作为 analyze 与 grid 共用的底层。
@@ -940,6 +1107,7 @@ def _core_match_engine(
         raw_content: 已解压的 log 字符串（调用方负责 _get_raw_content）
         params: 分析参数，含 items/item_variants（analyze）或 patterns/grid_meta（grid）
         is_grid: True 为矩阵分析模式，False 为主界面分析
+        pre_parsed_game_states: 若已 `parse_tenhou6_json` 过则传入，避免与 extract_tenhou6_rounds 等重复 json.loads
 
     Yields:
         符合所有约束的样本字典，含 matched_idx, item, player_state, round_players,
@@ -965,8 +1133,11 @@ def _core_match_engine(
                 if not any(log_contains_consumed(raw_content, cs) for cs in consumed_search_list):
                     return
 
-    # 【2. 解析】
-    game_states = parse_log_to_game_states(raw_content)
+    # 【2. 解析】worker 侧可与即时铳率共用同一次 tenhou6 解析，避免双重 json.loads
+    if pre_parsed_game_states is not None:
+        game_states = pre_parsed_game_states
+    else:
+        game_states = parse_log_to_game_states(raw_content)
     if not game_states:
         return
 
@@ -977,6 +1148,7 @@ def _core_match_engine(
         "exclude_south3": params.get("exclude_south3", False),
         "dora_constraint": params.get("dora_constraint"),
         "call_constraint": params.get("call_constraint"),
+        "target_no_call": params.get("target_no_call", False),
         "call_area_constraints": params.get("call_area_constraints"),
         "call_area_constraint_sets": params.get("call_area_constraint_sets"),
         "consumed_search_list": consumed_search_list,
@@ -1231,7 +1403,26 @@ def _process_one_log_grid(task: Tuple) -> Dict:
 
     try:
         raw = _get_raw_content(log_content)
-        matches = _core_match_engine(raw, params, is_grid=True)
+        parsed_tenhou6: Optional[dict] = None
+        if _is_tenhou6_json(raw):
+            try:
+                parsed_tenhou6 = json.loads(raw)
+            except Exception:
+                parsed_tenhou6 = None
+        pre_gs: Optional[List[GameState]] = None
+        if parsed_tenhou6 is not None:
+            try:
+                from .tenhou6_adapter import parse_tenhou6_json
+
+                pre_gs = parse_tenhou6_json(parsed_tenhou6)
+            except Exception:
+                pre_gs = None
+        if pre_gs is not None:
+            matches = _core_match_engine(
+                raw, params, is_grid=True, pre_parsed_game_states=pre_gs
+            )
+        else:
+            matches = _core_match_engine(raw, params, is_grid=True)
 
         for m in matches:
             player_state = m["player_state"]
@@ -1438,13 +1629,43 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             "matched_states": [], "sample_pool": [], "instant_deal_in_dist": instant_deal_in_dist,
                             "instant_deal_in_dist_per_pattern": instant_deal_in_dist_per_pattern}
 
-        # 即时铳率（instant deal-in）需要 tenhou6 的事件流载荷（round payload）。
-        # 只在 use_deal_in_instant=True 时提取，避免无谓的解析成本。
-        round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw)) if use_deal_in_instant else []
+        # tenhou6 JSON：单次 json.loads，供 extract_tenhou6_rounds 与 parse_tenhou6_json 共用，
+        # 避免「即时铳率 + 核心引擎」对同一巨串重复解析（重构后主要性能回退点之一）。
+        parsed_tenhou6: Optional[dict] = None
+        if _is_tenhou6_json(raw):
+            try:
+                parsed_tenhou6 = json.loads(raw)
+            except Exception:
+                parsed_tenhou6 = None
+
+        # 即时铳率需要 tenhou6 事件流；字典路径零二次 loads
+        if use_deal_in_instant:
+            if parsed_tenhou6 is not None:
+                round_payloads = extract_tenhou6_rounds(parsed_tenhou6)
+            else:
+                round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw))
+        else:
+            round_payloads = []
+
+        pre_gs: Optional[List[GameState]] = None
+        if parsed_tenhou6 is not None:
+            try:
+                from .tenhou6_adapter import parse_tenhou6_json
+
+                pre_gs = parse_tenhou6_json(parsed_tenhou6)
+            except Exception:
+                pre_gs = None
 
         # 使用核心匹配引擎扁平化遍历，本函数仅负责数据聚合。
         instant_analyzers = {}  # 按 round_idx 缓存 RoundInstantDealInAnalyzer，避免同一局多次初始化
-        for m in _core_match_engine(raw, params, is_grid=False):
+        if pre_gs is not None:
+            match_engine_iter = _core_match_engine(
+                raw, params, is_grid=False, pre_parsed_game_states=pre_gs
+            )
+        else:
+            match_engine_iter = _core_match_engine(raw, params, is_grid=False)
+
+        for m in match_engine_iter:
             matched_idx = m["matched_idx"]
             player_state = m["player_state"]
             round_players = m["round_players"]
@@ -1822,6 +2043,7 @@ class LiveAnalyzer:
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,  # "any" | "has_call" | "no_call"
+        target_no_call: bool = False,  # 目标无副露：仅针对分析目标的玩家在满足舍牌模式的瞬间没有副露
         call_area_constraints: Optional[List[str]] = None,  # 副露区域约束，最多4个AND
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,  # 手牌可见枚数约束（延伸手牌）
         analysis_target: str = "target_count",  # "target_count"=目标牌存在 "tenpai"=是否听牌
@@ -2019,6 +2241,7 @@ class LiveAnalyzer:
             "visible_constraints": visible_constraints,
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
+            "target_no_call": target_no_call,
             "call_area_constraints": call_area_constraints,
             "hand_visible_constraints": hand_visible_constraints,
             "call_area_constraint_sets": call_area_constraint_sets,
@@ -2063,29 +2286,67 @@ class LiveAnalyzer:
         # 避免 COUNT(*) 鍦ㄥぇ搴撲笂罚秒等燂紱使用 total_logs_hint 鎴?sample_limit
         total_logs = _total_logs
 
-        # 批量读取并分析（用id 游标分页），避免OFFSET 越大越慢）
-        last_id = None  # None 表示第一页；之后用WHERE id < last_id
+        # 批量读取并分析（用 id 游标分页），避免 OFFSET 越大越慢；预取线程见 BackgroundLogFetcher
         processed = 0
         pool = ProcessPoolExecutor(max_workers=workers) if use_parallel else None
-        batch_count = 0  # 每 N 批重启pool 以释放 worker 内容瓨
+        batch_count = 0  # 每 N 批重启 pool（仅 ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY 分支使用）
         maintenance_batch_index = 0
 
         # 启动后台预取线程，掩盖数据库 I/O 延迟
         fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
-        
-        while True:
-            # 检查是否取消
-            if should_cancel and should_cancel():
-                logger.info("analysis cancelled")
-                break
-            
-            # 从预取队列获取一批对局数据（如果后台还没读完，这里会阻塞等待，但通常已经预取好了）
-            logs = fetcher.next_batch()
-            if not logs:
-                break
-            
-            if use_parallel and pool is not None:
-                # 并行分支
+
+        # 并行/串行共用的单条合并逻辑（避免三处复制）
+        def _merge_one_analyze_per_log(per_log_result: Dict) -> None:
+            nonlocal total_matches, outcome_wins_total, outcome_deal_ins_total
+            nonlocal deal_in_hits_total, deal_in_point_sum_total, excluded_due_to_hypothetical_furiten
+            total_matches += per_log_result["total_matches"]
+            outcome_wins_total += per_log_result.get("outcome_wins", 0)
+            outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
+            deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
+            deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
+            excluded_due_to_hypothetical_furiten += per_log_result.get("excluded_due_to_hypothetical_furiten", 0)
+            for t, c in per_log_result.get("excluded_due_to_hypothetical_furiten_by_tile", {}).items():
+                excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + c
+            if use_deal_in_instant and multi_target:
+                wid = per_log_result.get("instant_deal_in_dist", {})
+                for tk, stats in wid.items():
+                    if tk in instant_deal_in_dist:
+                        instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
+                        instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
+            if pattern_instant_dists:
+                per_pat = per_log_result.get("instant_deal_in_dist_per_pattern") or []
+                for idx, pat_dist in enumerate(per_pat):
+                    if idx < len(pattern_instant_dists):
+                        for tk, st in pat_dist.items():
+                            if tk in pattern_instant_dists[idx]:
+                                pattern_instant_dists[idx][tk]["hits"] += st.get("hits", 0)
+                                pattern_instant_dists[idx][tk]["points"] += st.get("points", 0)
+            for i, n in enumerate(per_log_result["pattern_matches"]):
+                pattern_matches[i] += n
+            for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
+                for k, v in d_delta.items():
+                    if isinstance(v, dict):
+                        for c, n in v.items():
+                            pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
+                    else:
+                        pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
+            matched_states.extend(per_log_result["matched_states"])
+            sample_pool.extend(per_log_result["sample_pool"])
+            # 合并后立即截断，避免 matched_states / sample_pool 无限增长
+            if len(matched_states) > cap:
+                del matched_states[cap:]
+            if len(sample_pool) > sample_pool_cap:
+                del sample_pool[sample_pool_cap:]
+
+        if use_parallel and pool is not None and ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY:
+            # 需按批 drain 进程池以便安全重启时，仍用「每 SQL 批一段 bounded」
+            while True:
+                if should_cancel and should_cancel():
+                    logger.info("analysis cancelled")
+                    break
+                logs = fetcher.next_batch()
+                if not logs:
+                    break
                 task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
                 for per_log_result in _iter_pool_results_bounded(
                     pool,
@@ -2096,70 +2357,103 @@ class LiveAnalyzer:
                     if should_cancel and should_cancel():
                         fetcher.stop()
                         conn.close()
-                        gc.collect()
+                        _maybe_analysis_gc()
                         _trim_process_memory()
-                        if pool:
-                            pool.shutdown(wait=False)
+                        pool.shutdown(wait=False)
                         return _empty_analysis_result(first_pattern, first_target)
-                    total_matches += per_log_result["total_matches"]
-                    outcome_wins_total += per_log_result.get("outcome_wins", 0)
-                    outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
-                    deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
-                    deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
-                    excluded_due_to_hypothetical_furiten += per_log_result.get("excluded_due_to_hypothetical_furiten", 0)
-                    for t, c in per_log_result.get("excluded_due_to_hypothetical_furiten_by_tile", {}).items():
-                        excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + c
-                    if use_deal_in_instant and multi_target:
-                        wid = per_log_result.get("instant_deal_in_dist", {})
-                        for tk, stats in wid.items():
-                            if tk in instant_deal_in_dist:
-                                instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
-                                instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
-                    if pattern_instant_dists:
-                        per_pat = per_log_result.get("instant_deal_in_dist_per_pattern") or []
-                        for idx, pat_dist in enumerate(per_pat):
-                            if idx < len(pattern_instant_dists):
-                                for tk, st in pat_dist.items():
-                                    if tk in pattern_instant_dists[idx]:
-                                        pattern_instant_dists[idx][tk]["hits"] += st.get("hits", 0)
-                                        pattern_instant_dists[idx][tk]["points"] += st.get("points", 0)
-                    for i, n in enumerate(per_log_result["pattern_matches"]):
-                        pattern_matches[i] += n
-                    for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
-                        for k, v in d_delta.items():
-                            if isinstance(v, dict):
-                                for c, n in v.items():
-                                    pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
-                            else:
-                                pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
-                    matched_states.extend(per_log_result["matched_states"])
-                    sample_pool.extend(per_log_result["sample_pool"])
-                    # 每批合并后立即截断，避免跨批次内存无限增长
-                    if len(matched_states) > cap:
-                        del matched_states[cap:]
-                    if len(sample_pool) > sample_pool_cap:
-                        del sample_pool[sample_pool_cap:]
+                    _merge_one_analyze_per_log(per_log_result)
                     processed += 1
                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                         progress_callback(processed, total_logs)
                     if sample_limit and processed >= sample_limit:
                         break
                 batch_count += 1
-                # 定期重启 worker 池，释放子进程内 Python 持有的内存
                 if batch_count >= POOL_RESTART_EVERY_BATCHES:
                     pool.shutdown(wait=True)
                     pool = ProcessPoolExecutor(max_workers=workers)
                     batch_count = 0
-            else:
-                # 串行 = 单 worker，复用 _process_one_log_analyze（与并行同一算法）
+                maintenance_batch_index += 1
+                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                    _maybe_analysis_gc()
+                    try:
+                        conn.execute("PRAGMA shrink_memory")
+                    except Exception:
+                        pass
+                    conn.close()
+                    conn = _connect_db_memory_efficient(self.db_path)
+                    cur = conn.cursor()
+                    _ensure_log_json_column(conn)
+                    if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                        _trim_process_memory()
+                if sample_limit and processed >= sample_limit:
+                    break
+        elif use_parallel and pool is not None:
+            # 默认：跨 SQL 批单段 bounded，下一批任务在本批尾部已开始 submit，减轻批末 CPU 空窗
+            def _on_parallel_sql_batch_done() -> None:
+                nonlocal maintenance_batch_index, conn, cur
+                maintenance_batch_index += 1
+                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                    _maybe_analysis_gc()
+                    try:
+                        conn.execute("PRAGMA shrink_memory")
+                    except Exception:
+                        pass
+                    conn.close()
+                    conn = _connect_db_memory_efficient(self.db_path)
+                    cur = conn.cursor()
+                    _ensure_log_json_column(conn)
+                    if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                        _trim_process_memory()
+
+            _max_if = max(2, workers * PARALLEL_IN_FLIGHT_FACTOR)
+            _row_pref = _RowTaskPrefetcher(
+                fetcher,
+                analysis_params,
+                on_batch_done=_on_parallel_sql_batch_done,
+                should_cancel=lambda: bool(should_cancel and should_cancel()),
+                queue_maxsize=max(128, _max_if * 6),
+            )
+            _parallel_bounded = _iter_pool_results_bounded(
+                pool,
+                _process_one_log_analyze,
+                _row_pref,
+                max_in_flight=_max_if,
+            )
+            try:
+                for per_log_result in _parallel_bounded:
+                    if should_cancel and should_cancel():
+                        logger.info("analysis cancelled")
+                        fetcher.stop()
+                        conn.close()
+                        _maybe_analysis_gc()
+                        _trim_process_memory()
+                        pool.shutdown(wait=False)
+                        return _empty_analysis_result(first_pattern, first_target)
+                    _merge_one_analyze_per_log(per_log_result)
+                    processed += 1
+                    if progress_callback and (processed <= 10 or processed % 10 == 0):
+                        progress_callback(processed, total_logs)
+                    if sample_limit and processed >= sample_limit:
+                        break
+            finally:
+                _parallel_bounded.close()
+                _row_pref.close()
+                fetcher.stop()
+        else:
+            # 串行：单进程逐条，仍按 SQL 批取 log
+            while True:
+                if should_cancel and should_cancel():
+                    logger.info("analysis cancelled")
+                    break
+                logs = fetcher.next_batch()
+                if not logs:
+                    break
                 for log_id, log_content in logs:
                     if should_cancel and should_cancel():
                         fetcher.stop()
                         conn.close()
-                        gc.collect()
+                        _maybe_analysis_gc()
                         _trim_process_memory()
-                        if pool:
-                            pool.shutdown(wait=False)
                         return _empty_analysis_result(first_pattern, first_target)
                     try:
                         per_log_result = _process_one_log_analyze((log_id, log_content, analysis_params))
@@ -2168,72 +2462,34 @@ class LiveAnalyzer:
                         if isinstance(e, ValueError):
                             raise
                         continue
-                    total_matches += per_log_result["total_matches"]
-                    outcome_wins_total += per_log_result.get("outcome_wins", 0)
-                    outcome_deal_ins_total += per_log_result.get("outcome_deal_ins", 0)
-                    deal_in_hits_total += per_log_result.get("deal_in_hits", 0)
-                    deal_in_point_sum_total += per_log_result.get("deal_in_point_sum", 0)
-                    excluded_due_to_hypothetical_furiten += per_log_result.get("excluded_due_to_hypothetical_furiten", 0)
-                    for t, c in per_log_result.get("excluded_due_to_hypothetical_furiten_by_tile", {}).items():
-                        excluded_due_to_hypothetical_furiten_by_tile[t] = excluded_due_to_hypothetical_furiten_by_tile.get(t, 0) + c
-                    if use_deal_in_instant and multi_target:
-                        wid = per_log_result.get("instant_deal_in_dist", {})
-                        for tk, stats in wid.items():
-                            if tk in instant_deal_in_dist:
-                                instant_deal_in_dist[tk]["hits"] += stats.get("hits", 0)
-                                instant_deal_in_dist[tk]["points"] += stats.get("points", 0)
-                    if pattern_instant_dists:
-                        per_pat = per_log_result.get("instant_deal_in_dist_per_pattern") or []
-                        for idx, pat_dist in enumerate(per_pat):
-                            if idx < len(pattern_instant_dists):
-                                for tk, st in pat_dist.items():
-                                    if tk in pattern_instant_dists[idx]:
-                                        pattern_instant_dists[idx][tk]["hits"] += st.get("hits", 0)
-                                        pattern_instant_dists[idx][tk]["points"] += st.get("points", 0)
-                    for i, n in enumerate(per_log_result["pattern_matches"]):
-                        pattern_matches[i] += n
-                    for idx, d_delta in enumerate(per_log_result["pattern_distributions"]):
-                        for k, v in d_delta.items():
-                            if isinstance(v, dict):
-                                for c, n in v.items():
-                                    pattern_distributions[idx][k][c] = pattern_distributions[idx][k].get(c, 0) + n
-                            else:
-                                pattern_distributions[idx][k] = pattern_distributions[idx].get(k, 0) + v
-                    matched_states.extend(per_log_result["matched_states"])
-                    sample_pool.extend(per_log_result["sample_pool"])
-                    if len(matched_states) > cap:
-                        del matched_states[cap:]
-                    if len(sample_pool) > sample_pool_cap:
-                        del sample_pool[sample_pool_cap:]
+                    _merge_one_analyze_per_log(per_log_result)
                     processed += 1
                     if progress_callback and (processed <= 10 or processed % 10 == 0):
                         progress_callback(processed, total_logs)
                     if sample_limit and processed >= sample_limit:
                         break
-
-            # 批次结束后的维护（不要在此处调用 fetcher.stop()，否则会杀死预取线程导致下一批永远取不到）
-            maintenance_batch_index += 1
-            if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
-                gc.collect()
-                try:
-                    conn.execute("PRAGMA shrink_memory")
-                except:
-                    pass
-                conn.close()
-                conn = _connect_db_memory_efficient(self.db_path)
-                cur = conn.cursor()
-                _ensure_log_json_column(conn)
-                _trim_process_memory()
-
-            # 达到样本限制
-            if sample_limit and processed >= sample_limit:
-                break
+                # 与旧逻辑一致：每取完一批 log（无论是否因 sample_limit 提前结束内层循环）都做维护计数
+                maintenance_batch_index += 1
+                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                    _maybe_analysis_gc()
+                    try:
+                        conn.execute("PRAGMA shrink_memory")
+                    except Exception:
+                        pass
+                    conn.close()
+                    conn = _connect_db_memory_efficient(self.db_path)
+                    cur = conn.cursor()
+                    _ensure_log_json_column(conn)
+                    if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                        _trim_process_memory()
+                if sample_limit and processed >= sample_limit:
+                    break
 
         if pool is not None:
             pool.shutdown(wait=True)
         fetcher.stop()
         conn.close()
-        gc.collect()
+        _maybe_analysis_gc()
         _trim_process_memory()
 
         # 并行时可能超过 cap，截断
@@ -2428,6 +2684,7 @@ class LiveAnalyzer:
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
+        target_no_call: bool = False,
         call_area_constraints: Optional[List[str]] = None,
         turn_range: Optional[Tuple[int, int]] = None,
         sample_limit: Optional[int] = None,
@@ -2456,6 +2713,7 @@ class LiveAnalyzer:
             hand_visible_constraints=hand_visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
+            target_no_call=target_no_call,
             call_area_constraints=call_area_constraints,
             turn_range=turn_range,
             sample_limit=sample_limit,
@@ -2491,6 +2749,7 @@ class LiveAnalyzer:
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
+        target_no_call: bool = False,
         call_area_constraints: Optional[List[str]] = None,
         turn_range: Optional[Tuple[int, int]] = None,
         sample_limit: Optional[int] = None,
@@ -2515,6 +2774,7 @@ class LiveAnalyzer:
             visible_constraints=visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
+            target_no_call=target_no_call,
             call_area_constraints=call_area_constraints,
             analysis_target="deal_in_instant",
             turn_range=turn_range,
@@ -2557,6 +2817,7 @@ class LiveAnalyzer:
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
+        target_no_call: bool = False,
         call_area_constraints: Optional[List[str]] = None,
         sample_limit: Optional[int] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -2658,6 +2919,7 @@ class LiveAnalyzer:
             "dora_position_spec": dora_position_spec or [],
             "riichi_constraint": riichi_constraint,
             "call_constraint": call_constraint,
+            "target_no_call": target_no_call,
             "call_area_constraints": call_area_constraints,
             "hand_visible_constraints": hand_visible_constraints,
             "call_area_constraint_sets": grid_call_area_sets,
@@ -2680,47 +2942,77 @@ class LiveAnalyzer:
 
         # 后台预取，掩盖数据库 I/O 延迟（与主分析一致）
         fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
+        # 单进程池贯穿全程：避免旧实现「每 SQL 批 with 新建池」造成的批间进程启停、CPU 空窗
+        grid_pool = ProcessPoolExecutor(max_workers=workers) if use_parallel else None
 
         try:
-            while True:
-                if should_cancel and should_cancel():
-                    logger.info("grid analysis cancelled")
-                    break
-                logs = fetcher.next_batch()
-                if not logs:
-                    break
+            if use_parallel and grid_pool is not None:
+                def _on_grid_sql_batch_done() -> None:
+                    nonlocal maintenance_batch_index, conn
+                    maintenance_batch_index += 1
+                    if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                        _maybe_analysis_gc()
+                        try:
+                            conn.execute("PRAGMA shrink_memory")
+                        except Exception:
+                            pass
+                        conn.close()
+                        conn = _connect_db_memory_efficient(self.db_path)
+                        _ensure_log_json_column(conn)
+                        if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                            _trim_process_memory()
 
-                if use_parallel:
-                    task_iter = ((log_id, log_content, grid_params) for log_id, log_content in logs)
-                    with ProcessPoolExecutor(max_workers=workers) as pool:
-                        for per_log_result in _iter_pool_results_bounded(
-                            pool,
-                            _process_one_log_grid,
-                            task_iter,
-                            max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
-                        ):
-                            if should_cancel and should_cancel():
-                                fetcher.stop()
-                                conn.close()
-                                gc.collect()
-                                _trim_process_memory()
-                                return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
-                            for (tr_idx, pat_idx), delta in per_log_result.items():
-                                k = (tr_idx, pat_idx)
-                                for count, n in delta.items():
-                                    grid_dist[k][count] = grid_dist[k].get(count, 0) + n
-                            processed += 1
-                            if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                progress_callback(processed, total_logs)
-                            if sample_limit and processed >= sample_limit:
-                                break
-                else:
+                _g_max_if = max(2, workers * PARALLEL_IN_FLIGHT_FACTOR)
+                _grid_row_pref = _RowTaskPrefetcher(
+                    fetcher,
+                    grid_params,
+                    on_batch_done=_on_grid_sql_batch_done,
+                    should_cancel=lambda: bool(should_cancel and should_cancel()),
+                    queue_maxsize=max(128, _g_max_if * 6),
+                )
+                _grid_bounded = _iter_pool_results_bounded(
+                    grid_pool,
+                    _process_one_log_grid,
+                    _grid_row_pref,
+                    max_in_flight=_g_max_if,
+                )
+                try:
+                    for per_log_result in _grid_bounded:
+                        if should_cancel and should_cancel():
+                            logger.info("grid analysis cancelled")
+                            fetcher.stop()
+                            conn.close()
+                            _maybe_analysis_gc()
+                            _trim_process_memory()
+                            return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
+                        for (tr_idx, pat_idx), delta in per_log_result.items():
+                            k = (tr_idx, pat_idx)
+                            for count, n in delta.items():
+                                grid_dist[k][count] = grid_dist[k].get(count, 0) + n
+                        processed += 1
+                        if progress_callback and (processed <= 10 or processed % 10 == 0):
+                            progress_callback(processed, total_logs)
+                        if sample_limit and processed >= sample_limit:
+                            break
+                finally:
+                    _grid_bounded.close()
+                    _grid_row_pref.close()
+                    fetcher.stop()
+            else:
+                while True:
+                    if should_cancel and should_cancel():
+                        logger.info("grid analysis cancelled")
+                        break
+                    logs = fetcher.next_batch()
+                    if not logs:
+                        break
+
                     call_area_constraint_sets = grid_call_area_sets
                     for log_id, log_content in logs:
                         if should_cancel and should_cancel():
                             fetcher.stop()
                             conn.close()
-                            gc.collect()
+                            _maybe_analysis_gc()
                             _trim_process_memory()
                             return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
                         try:
@@ -2756,11 +3048,12 @@ class LiveAnalyzer:
                                 if consumed_search_list:
                                     if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
                                         continue
-                                if call_constraint or call_area_constraints or call_area_constraint_sets:
+                                if call_constraint or target_no_call or call_area_constraints or call_area_constraint_sets:
                                     if not round_could_satisfy_call_constraints(
                                         round_players, call_constraint,
                                         None if call_area_constraint_sets else call_area_constraints,
-                                        oya, call_area_constraint_sets=call_area_constraint_sets
+                                        oya, call_area_constraint_sets=call_area_constraint_sets,
+                                        target_no_call=target_no_call,
                                     ):
                                         continue
                                 if riichi_any:
@@ -2771,7 +3064,7 @@ class LiveAnalyzer:
                                         continue
 
                                 for player_state in round_players:
-                                    if call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
+                                    if not target_no_call and call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
                                         continue
                                     if call_area_constraint_sets:
                                         if not player_could_satisfy_any_call_area_constraints(player_state, oya, call_area_constraint_sets):
@@ -2897,11 +3190,14 @@ class LiveAnalyzer:
                                                     continue
                                                 if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                                     continue
-                                            if call_constraint and call_constraint != "any":
+                                            if (call_constraint and call_constraint != "any") or target_no_call:
                                                 if call_constraint == "has_call" and not discard.call_happened:
                                                     continue
                                                 if call_constraint == "no_call" and discard.call_happened:
                                                     continue
+                                                if target_no_call:
+                                                    if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
+                                                        continue
                                             _ca = matched_variant.get("call_area_constraints") or call_area_constraints
                                             if _ca:
                                                 if not player_satisfies_call_area_constraints(
@@ -3006,25 +3302,28 @@ class LiveAnalyzer:
                         if sample_limit and processed >= sample_limit:
                             break
 
-                del logs
-                maintenance_batch_index += 1
-                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
-                    gc.collect()
-                    try:
-                        conn.execute("PRAGMA shrink_memory")
-                    except Exception:
-                        pass
-                    conn.close()
-                    conn = _connect_db_memory_efficient(self.db_path)
-                    _ensure_log_json_column(conn)
-                    _trim_process_memory()
-                if sample_limit and processed >= sample_limit:
-                    break
+                    del logs
+                    maintenance_batch_index += 1
+                    if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
+                        _maybe_analysis_gc()
+                        try:
+                            conn.execute("PRAGMA shrink_memory")
+                        except Exception:
+                            pass
+                        conn.close()
+                        conn = _connect_db_memory_efficient(self.db_path)
+                        _ensure_log_json_column(conn)
+                        if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                            _trim_process_memory()
+                    if sample_limit and processed >= sample_limit:
+                        break
 
         finally:
+            if grid_pool is not None:
+                grid_pool.shutdown(wait=True)
             fetcher.stop()
             conn.close()
-            gc.collect()
+            _maybe_analysis_gc()
             _trim_process_memory()
 
         # 按格计算合并概率、完整分布与样本数
@@ -3069,6 +3368,7 @@ class LiveAnalyzer:
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
+        target_no_call: bool = False,
         turn_range: Optional[Tuple[int, int]] = None,
         sample_limit: Optional[int] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -3165,6 +3465,7 @@ class LiveAnalyzer:
         # 初始化验证器，用于手牌可见枚数等约束校验
         validator = MatchValidator({
             "hand_visible_constraints": hand_visible_constraints,
+            "target_no_call": target_no_call,
         })
 
         if should_cancel and should_cancel():
@@ -3206,7 +3507,7 @@ class LiveAnalyzer:
             for log_id, log_content in logs:
                 if should_cancel and should_cancel():
                     conn.close()
-                    gc.collect()
+                    _maybe_analysis_gc()
                     _trim_process_memory()
                     return samples
                 try:
@@ -3423,11 +3724,14 @@ class LiveAnalyzer:
                                         continue
                                     if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
                                         continue
-                                if call_constraint and call_constraint != "any":
+                                if (call_constraint and call_constraint != "any") or target_no_call:
                                     if call_constraint == "has_call" and not discard.call_happened:
                                         continue
                                     if call_constraint == "no_call" and discard.call_happened:
                                         continue
+                                    if target_no_call:
+                                        if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
+                                            continue
 
                                 vc = matched_variant["visible_constraints"]
                                 if vc:
@@ -3558,23 +3862,24 @@ class LiveAnalyzer:
             del logs
             maintenance_batch_index += 1
             if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
-                gc.collect()
+                _maybe_analysis_gc()
                 try:
                     conn.execute("PRAGMA shrink_memory")
-                except:
+                except Exception:
                     pass
                 conn.close()
                 conn = _connect_db_memory_efficient(self.db_path)
                 cur = conn.cursor()
                 _ensure_log_json_column(conn)
-                _trim_process_memory()
+                if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
+                    _trim_process_memory()
             if sample_limit and processed >= sample_limit:
                 break
             if len(samples) >= sample_count:
                 break
 
         conn.close()
-        gc.collect()
+        _maybe_analysis_gc()
         _trim_process_memory()
         return samples
 
@@ -3881,7 +4186,7 @@ def get_database_stats(db_path: str) -> Dict:
             stats['db_size_mb'] = os.path.getsize(db_path) / (1024 * 1024)
     finally:
         conn.close()
-    gc.collect()
+    _maybe_analysis_gc()
     _trim_process_memory()
     return stats
 

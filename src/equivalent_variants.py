@@ -243,11 +243,13 @@ def round_could_satisfy_call_constraints(
     call_area_constraints: Optional[List[str]],
     oya: int,
     call_area_constraint_sets: Optional[List[List[str]]] = None,
+    target_no_call: bool = False,
 ) -> bool:
     """
     局级预过滤：call_constraint 与 call_area_constraints 是否有任何玩家可能满足。
     - call_constraint "has_call": 至少一人有副露
-    - call_constraint "no_call": 至少一人无副露
+    - call_constraint "no_call": 至少一人无副露（全场/全局）
+    - target_no_call: 至少有一人满足「当前无副露」的可能性（基本总是 True，除非全员开局就副露）
     - call_area_constraints: 单组约束，至少一人可能满足
     - call_area_constraint_sets: 多组约束（等价变体），至少一人可能满足任一组
     """
@@ -257,10 +259,23 @@ def round_could_satisfy_call_constraints(
         )
         if call_constraint == "has_call" and not any_has_call:
             return False
-        if call_constraint == "no_call" and all(
+        # 如果开启了 target_no_call，我们放宽 no_call 的局级过滤，因为 target_no_call 允许玩家中途副露
+        if not target_no_call and call_constraint == "no_call" and all(
             len(getattr(p, "calls", []) or []) > 0 for p in round_players
         ):
             return False
+    
+    # 对于 target_no_call，只要有人在第一巡之前没副露就行，这几乎总是满足的
+    if target_no_call:
+        # 除非所有人都在第一巡之前就有副露（例如加杠等特殊情况，但在天凤中基本不可能开局就全员副露）
+        # 这里做一个最基本的校验：是否存在一个玩家，其最早的 from_discard_turn > 1
+        if all(
+            len(getattr(p, "calls", []) or []) > 0 and 
+            all(getattr(c, "from_discard_turn", 1) <= 1 for c in getattr(p, "calls", []))
+            for p in round_players
+        ):
+            return False
+
     if call_area_constraint_sets:
         if not any(
             player_could_satisfy_call_area_constraints(p, oya, cs)
@@ -773,7 +788,7 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
             
         if base in RED_FIVES or (len(base) >= 2 and base[-1] in "mps" and (base[0].isdigit() or base in RED_FIVES)):
             return (f"{CALL_PREFIX}r:{base}", is_tsumo)
-        if base in HONOR_PLACEHOLDERS:
+        if base in HONOR_PLACEHOLDERS or base == "$":
             return (f"{CALL_PREFIX}r:{base}", is_tsumo)
     if s.endswith("f") and len(s) >= 2:
         base = s[:-1]
@@ -1799,6 +1814,8 @@ def _match_pattern_at_end(
                 bakaze = ctx.get("bakaze")
                 if not _ap_condition_met(visible_tiles, tile_str, bakaze):
                     return False
+            elif want_tile == "$":
+                pass  # $ 匹配任意牌
             elif tile_str != want_tile:
                 return False
             # 摸切要求须一致（pat_want_tsumogiri 为 None 时手摸切皆可）
