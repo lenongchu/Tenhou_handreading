@@ -6,6 +6,7 @@
 """
 import gc
 import os
+import sys
 import time
 import sqlite3
 import gzip
@@ -70,7 +71,7 @@ def _apply_combo_independence_filter(
 
 
 # 每批从数据库读取的对局数（统一默认）：主分析、矩阵、即时铳率(deal_in_instant) 等均用 analyze 入参 analysis_batch_size，未传时即用本值；GUI 单控件覆盖。
-# 越大则 SQL 次数越少、略快，但单批内存线性增加（约 1.2GB/1000 条，5000 条约 6GB）
+# 过小则 SQL 批次数暴增、批边界与主线程合并更频繁，CPU 易呈「锯齿状」低谷；默认取较大批以换流水线重叠（内存紧张时再改小或用入参覆盖）
 ANALYSIS_BATCH_SIZE = 5000
 MIN_ANALYSIS_BATCH_SIZE = 500
 # 主统计时最多保留的匹配状态条数（仅用于返回给界面，超出部分不保留，避免内存持续增长）
@@ -79,13 +80,12 @@ SAMPLE_POOL_CAP = 3000
 PARALLEL_MIN_MATCHED_STATES_PER_LOG = 4
 PARALLEL_MAX_SAMPLE_POOL_PER_LOG = 512  # 提高以保留更多可铳样本，避免单局多匹配时样本池截断
 PARALLEL_BATCH_PER_WORKER = 500
-PARALLEL_IN_FLIGHT_FACTOR = 2
+# Python 3.11+ 可选 max_tasks_per_child：过小会导致子进程在单批内就轮换，引发明显批间/批内停顿；None 表示不限制（默认）
+PARALLEL_MAX_TASKS_PER_CHILD: Optional[int] = None
+PARALLEL_IN_FLIGHT_FACTOR = 4
 GC_INTERVAL_BATCHES = 10  # 降低频率，因为现在有管理员强制清理
 # 内存负载阈值 [0,1]，与 GlobalMemoryStatusEx 的 dwMemoryLoad 一致；误写成 10 会导致「高压早维护」分支永不到
 HIGH_MEMORY_LOAD_RATIO = 0.94
-# 并行分析时，每处理多少批后重启 worker 池（过小会频繁 shutdown(wait=True) 造成明显批间停顿）
-POOL_RESTART_EVERY_BATCHES = 10
-
 # ---------------------------------------------------------------------------
 # 长分析中的内存维护（默认关闭最耗时的几项；系统在 ~94% 饱和时收益常不明显）
 # 需要恢复旧行为时把对应项改为 True 即可（不必翻注释块）。
@@ -93,8 +93,6 @@ POOL_RESTART_EVERY_BATCHES = 10
 # 每 N 批：gc（若开）+ PRAGMA shrink_memory + 关闭并重连主线程上的 DB 连接。
 # True 时极易造成明显批间低谷，且与 _trim 叠加时常表现为「停顿越来越久」（WAL/页缓存 + 系统文件缓存被反复刷冷）。
 ENABLE_PERIODIC_MEMORY_MAINTENANCE = False
-# 每 POOL_RESTART_EVERY_BATCHES 批：整池 shutdown(wait=True) 再建进程池
-ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY = False
 # Windows：EmptyWorkingSet + SetSystemFileCacheSize（可能拖慢后续 I/O）
 ENABLE_TRIM_PROCESS_MEMORY = True
 # 是否与「周期 DB 维护」一同调用 Trim：极易拉长低谷；分析结束时的 finally 仍会按需 Trim（见 ENABLE_TRIM_PROCESS_MEMORY）
@@ -179,14 +177,56 @@ def _is_deal_in_hit_sample(sample: Dict) -> bool:
     return False
 
 
+def _make_analysis_process_pool(max_workers: int) -> ProcessPoolExecutor:
+    """创建分析用进程池。仅当 PARALLEL_MAX_TASKS_PER_CHILD 为正数且 Python>=3.11 时才传入 max_tasks_per_child。"""
+    mtpc = PARALLEL_MAX_TASKS_PER_CHILD
+    if sys.version_info >= (3, 11) and mtpc is not None and mtpc > 0:
+        return ProcessPoolExecutor(
+            max_workers=max_workers,
+            max_tasks_per_child=int(mtpc),
+        )
+    return ProcessPoolExecutor(max_workers=max_workers)
+
+
+def _ipc_copy_instant_eval(ev: Optional[Dict]) -> Dict:
+    """Worker→主进程 IPC：即时铳率 evaluate 仅保留统计/展示键，降低 pickle 与合并开销。"""
+    if not ev:
+        return {
+            "deal_in_hit": False,
+            "deal_in_point": 0,
+            "furiten_state": "none",
+            "furiten_reason": "",
+            "waits_snapshot": [],
+        }
+    return {
+        "deal_in_hit": bool(ev.get("deal_in_hit")),
+        "deal_in_point": int(ev.get("deal_in_point", 0)),
+        "furiten_state": ev.get("furiten_state", "none"),
+        "furiten_reason": ev.get("furiten_reason", ""),
+        "waits_snapshot": list(ev.get("waits_snapshot") or []),
+    }
+
+
+def _ipc_copy_instant_eval_multi(multi: Optional[Dict]) -> Dict:
+    """多目标即时铳率：逐目标裁剪后再进入跨进程序列化。"""
+    if not multi:
+        return {}
+    return {k: _ipc_copy_instant_eval(v) for k, v in multi.items()}
+
+
 class BackgroundLogFetcher:
     """后台对局预取器，用于在计算时并行读取数据库 I/O"""
     def __init__(self, db_path, batch_size, last_id=None):
         self.db_path = db_path
         self.batch_size = batch_size
         self.last_id = last_id
-        # 多缓冲几批 SQL 结果，便于预取线程提前 execute/fetchall，与计算重叠（勿盲目加大：每格≈一批 log 体积）
-        self.queue = queue.Queue(maxsize=BACKGROUND_FETCHER_QUEUE_MAX_BATCHES)
+        # 有界队列存流式元素：('chunk', rows) 与 ('batch_done',)；容量按「每批 chunk 数 × 缓冲批数」估算，避免 fetchmany 时阻塞死锁
+        _chunks_est = max(
+            1,
+            (int(batch_size) + BACKGROUND_FETCHER_FETCHMANY_ROWS - 1) // BACKGROUND_FETCHER_FETCHMANY_ROWS,
+        ) + 2
+        _q_cap = max(64, _chunks_est * BACKGROUND_FETCHER_QUEUE_MAX_BATCHES)
+        self.queue = queue.Queue(maxsize=_q_cap)
         self.stop_event = threading.Event()
         self.error = None
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -198,7 +238,8 @@ class BackgroundLogFetcher:
             conn = _connect_db_memory_efficient(self.db_path, log_sequential_reader=True)
             cur = conn.cursor()
             last_id = self.last_id
-            
+            fm = max(1, int(BACKGROUND_FETCHER_FETCHMANY_ROWS))
+
             while not self.stop_event.is_set():
                 if last_id is None:
                     query = """
@@ -219,24 +260,50 @@ class BackgroundLogFetcher:
                         LIMIT ?
                     """
                     cur.execute(query, (last_id, self.batch_size))
-                
-                rows = cur.fetchall()
-                if not rows:
-                    self.queue.put(None)  # 结束标志
+
+                # fetchmany 分块入队：不必等整批 fetchall 完成即可被 RowTaskPrefetcher 消费，缩短 worker 批末空转
+                batch_last_id = None
+                any_chunk = False
+                while not self.stop_event.is_set():
+                    chunk = cur.fetchmany(fm)
+                    if not chunk:
+                        break
+                    any_chunk = True
+                    batch_last_id = chunk[-1][0]
+                    self.queue.put(("chunk", chunk))
+                if not any_chunk:
+                    self.queue.put(None)  # 无更多对局
                     break
-                
-                last_id = rows[-1][0]
-                self.queue.put(rows)
+                last_id = batch_last_id
+                self.queue.put(("batch_done",))
             conn.close()
         except Exception as e:
             logger.error(f"后台预取线程出错: {e}")
             self.error = e
             self.queue.put(None)
 
-    def next_batch(self):
+    def pull_stream_item(self):
+        """流式取队列：('chunk', rows) | ('batch_done',) | None（None=扫描结束）。供 RowTaskPrefetcher 使用。"""
         if self.error:
             raise self.error
         return self.queue.get()
+
+    def next_batch(self):
+        """串行路径：聚合 chunk 直至 batch_done，对外仍为「一整批 rows」。"""
+        if self.error:
+            raise self.error
+        acc = []
+        while True:
+            item = self.pull_stream_item()
+            if item is None:
+                return None if not acc else acc
+            if item[0] == "chunk":
+                acc.extend(item[1])
+            elif item[0] == "batch_done":
+                return acc
+            else:
+                logger.warning("BackgroundLogFetcher: 未知队列项 %r", item)
+                continue
 
     def stop(self):
         self.stop_event.set()
@@ -254,8 +321,8 @@ _PREFETCH_STREAM_END = object()
 
 class _RowTaskPrefetcher:
     """
-    后台线程从 BackgroundLogFetcher 取整批 log，拆成 (log_id, content, params) 写入有界队列。
-    主线程上 next(task_iter) 仅 queue.get，避免在 SQL 批边界阻塞在 fetcher.next_batch()，减轻锯齿状 CPU 空窗。
+    后台线程从 BackgroundLogFetcher 取流式 chunk，拆成 (log_id, content, params) 写入有界队列。
+    与 fetchmany 分块配合，避免等整批 fetchall 结束后才向 worker 队列投喂，减轻批末 CPU 断崖。
     """
 
     def __init__(
@@ -281,30 +348,35 @@ class _RowTaskPrefetcher:
             while not self._stop.is_set():
                 if self._should_cancel and self._should_cancel():
                     break
-                logs = self._fetcher.next_batch()
-                if not logs:
+                item = self._fetcher.pull_stream_item()
+                if item is None:
                     break
-                for row in logs:
+                if item[0] == "chunk":
+                    _, rows = item
+                    for row in rows:
+                        if self._stop.is_set():
+                            return
+                        if self._should_cancel and self._should_cancel():
+                            return
+                        log_id, log_content = row[0], row[1]
+                        task = (log_id, log_content, self._per_log_params)
+                        while not self._stop.is_set():
+                            try:
+                                self._q.put(task, timeout=0.25)
+                                break
+                            except queue.Full:
+                                continue
+                elif item[0] == "batch_done":
                     if self._stop.is_set():
                         return
-                    if self._should_cancel and self._should_cancel():
-                        return
-                    log_id, log_content = row[0], row[1]
-                    task = (log_id, log_content, self._per_log_params)
                     while not self._stop.is_set():
                         try:
-                            self._q.put(task, timeout=0.25)
+                            self._q.put(_PREFETCH_BATCH_GAP, timeout=0.25)
                             break
                         except queue.Full:
                             continue
-                if self._stop.is_set():
-                    return
-                while not self._stop.is_set():
-                    try:
-                        self._q.put(_PREFETCH_BATCH_GAP, timeout=0.25)
-                        break
-                    except queue.Full:
-                        continue
+                else:
+                    logger.warning("_RowTaskPrefetcher: 未知 fetch 项 %r", item)
         except Exception as e:
             logger.error(f"行级任务预取线程出错: {e}")
             self._error = e
@@ -800,15 +872,11 @@ def _iter_pool_results_bounded(
 
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            # 必须先交付本轮全部 result，再调用 next(task_iter)。
-            # 跨批迭代器在 SQL 批边界会阻塞在 fetcher.next_batch()；若在每个 fut 上交替 yield+next，
-            # 第一个 next 卡住时同轮其它已完成的 future 既不能 yield 也不能进入下一轮 wait，worker 易长时间空转（CPU 低谷变长）。
-            results = []
+            # 对每个已完成任务：result → 立刻 yield → 立刻 submit 补位，避免先把本轮 done 全部 unpickle 再统一投喂（主线程 CPU 突刺、worker 短暂挨饿）。
+            # 若 next(task_iter) 阻塞，仅影响同轮后续 fut 的交付顺序；FIRST_COMPLETED 下 done 通常仅 1 个。
             for fut in done:
-                results.append(fut.result())
-            for r in results:
+                r = fut.result()
                 yield r
-            for _ in results:
                 try:
                     pending.add(pool.submit(fn, next(task_iter)))
                 except StopIteration:
@@ -889,8 +957,9 @@ def _game_at_index_contains_consumed(raw: str, game_index: int, consumed_search)
 # SQLite：PRAGMA cache_size 负值 = 缓存上限（KiB）。过小则大 batch 读 BLOB 时页抖动、磁盘占用呈锯齿。
 SQLITE_DEFAULT_CACHE_KIB = 20000  # ~20 MiB，主线程偶发查询 / 维护重连
 SQLITE_LOG_SCANNER_CACHE_KIB = 262144  # ~256 MiB，仅顺序扫 logs 的预取连接（内存换 I/O 平滑）
-# 预取队列每格 = 一整批 fetchall 结果；加深可重叠「下一批 SQL」与当前批计算（内存按 batch 体积×格数涨）
-BACKGROUND_FETCHER_QUEUE_MAX_BATCHES = 6
+# 预取队列容量按「chunk 槽位」计：每 SQL 批会拆成多个 fetchmany 块先入队，worker 可更早开工（避免整批 fetchall 结束才投喂）
+BACKGROUND_FETCHER_QUEUE_MAX_BATCHES = 8
+BACKGROUND_FETCHER_FETCHMANY_ROWS = 400
 
 
 def _connect_db_memory_efficient(db_path: str, *, log_sequential_reader: bool = False):
@@ -1879,29 +1948,59 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 )
 
             if len(matched_states) < worker_matched_states_cap:
+                # matched_states 仅作轻量摘要跨进程序列化：不携带整表 visible_tiles / 手牌列表，降低 IPC 与主进程合并成本
+                _vt_ms = dict(player_state.visible_tiles)
+                if len(mt_item) > 1 and target_counts:
+                    if isinstance(mapped_target, list):
+                        _visible_target_ms = ", ".join(
+                            f"{t}:{_visible_count(_vt_ms, t)}" for t in mapped_target
+                        )
+                    else:
+                        _visible_target_ms = ", ".join(
+                            f"{k}:{_visible_count(_vt_ms, k)}" for k in target_counts
+                        )
+                elif item_combo and isinstance(mapped_target, list):
+                    _visible_target_ms = ", ".join(
+                        f"{t}:{_visible_count(_vt_ms, t)}" for t in mapped_target
+                    )
+                else:
+                    _visible_target_ms = str(
+                        _visible_count(
+                            _vt_ms,
+                            mapped_target if isinstance(mapped_target, str) else mapped_target[0],
+                        )
+                    )
                 ms_entry = {
-                    "round_num": player_state.round_num, "turn": discard.turn,
-                    "actual_pattern": hand_discard_strings, "mapped_target": mapped_target,
-                    "hand_tiles": list(hand_at_turn), "visible_tiles": dict(player_state.visible_tiles),
+                    "round_num": player_state.round_num,
+                    "turn": discard.turn,
+                    "actual_pattern": hand_discard_strings,
+                    "mapped_target": mapped_target,
+                    "visible_target": _visible_target_ms,
                 }
                 if target_counts is not None:
                     ms_entry["target_counts"] = target_counts
                 else:
                     ms_entry["target_count"] = target_count
                 if use_deal_in_instant:
-                    deal_in_hit_val = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
-                    ms_entry.update({
-                        "deal_in_hit": deal_in_hit_val,
-                        "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
-                        "furiten_state": instant_eval.get("furiten_state", "none"),
-                        "furiten_reason": instant_eval.get("furiten_reason", ""),
-                        "waits_snapshot": instant_eval.get("waits_snapshot", []),
-                    })
+                    _slim_ie = _ipc_copy_instant_eval(instant_eval)
+                    if excluded_this_match_by_hypothetical_furiten:
+                        _slim_ie["deal_in_hit"] = False
+                        _slim_ie["deal_in_point"] = 0
+                    ms_entry.update(_slim_ie)
                     if multi_target:
                         if excluded_this_match_by_hypothetical_furiten:
-                            ms_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                            ms_entry["instant_eval_multi"] = {
+                                k: {
+                                    **_ipc_copy_instant_eval(v),
+                                    "deal_in_hit": False,
+                                    "deal_in_point": 0,
+                                }
+                                for k, v in instant_eval_multi.items()
+                            }
                         else:
-                            ms_entry["instant_eval_multi"] = instant_eval_multi
+                            ms_entry["instant_eval_multi"] = _ipc_copy_instant_eval_multi(
+                                instant_eval_multi
+                            )
                 matched_states.append(ms_entry)
 
             is_deal_in = use_deal_in_instant and not excluded_this_match_by_hypothetical_furiten and (
@@ -1935,7 +2034,6 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     "actual_pattern": hand_discard_strings.copy() if hand_discard_strings else [],
                     "mapped_target": mapped_target,
                     "hand_tiles": list(hand_at_turn), "visible_tiles": visible_tiles_dict,
-                    "dora_indicators": list(player_state.dora_indicators),
                     "dora_readable": dora_readable, "visible_target": visible_target,
                     "call_area": call_area, "is_combo": item_combo, "matched_pattern_idx": matched_idx,
                     "outcome_won": bool(rw and player_state.player_id in rw),
@@ -1946,19 +2044,25 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                 else:
                     sp_entry["target_count"] = target_count
                 if use_deal_in_instant:
-                    sp_deal_in_hit = False if excluded_this_match_by_hypothetical_furiten else bool(instant_eval.get("deal_in_hit"))
-                    sp_entry.update({
-                        "deal_in_hit": sp_deal_in_hit,
-                        "deal_in_point": 0 if excluded_this_match_by_hypothetical_furiten else int(instant_eval.get("deal_in_point", 0)),
-                        "furiten_state": instant_eval.get("furiten_state", "none"),
-                        "furiten_reason": instant_eval.get("furiten_reason", ""),
-                        "waits_snapshot": instant_eval.get("waits_snapshot", []),
-                    })
+                    _slim_sp = _ipc_copy_instant_eval(instant_eval)
+                    if excluded_this_match_by_hypothetical_furiten:
+                        _slim_sp["deal_in_hit"] = False
+                        _slim_sp["deal_in_point"] = 0
+                    sp_entry.update(_slim_sp)
                     if multi_target:
                         if excluded_this_match_by_hypothetical_furiten:
-                            sp_entry["instant_eval_multi"] = {k: {**v, "deal_in_hit": False, "deal_in_point": 0} for k, v in instant_eval_multi.items()}
+                            sp_entry["instant_eval_multi"] = {
+                                k: {
+                                    **_ipc_copy_instant_eval(v),
+                                    "deal_in_hit": False,
+                                    "deal_in_point": 0,
+                                }
+                                for k, v in instant_eval_multi.items()
+                            }
                         else:
-                            sp_entry["instant_eval_multi"] = instant_eval_multi
+                            sp_entry["instant_eval_multi"] = _ipc_copy_instant_eval_multi(
+                                instant_eval_multi
+                            )
                 if len(sample_pool) < worker_sample_pool_cap:
                     sample_pool.append(sp_entry)
                 else:
@@ -2063,7 +2167,7 @@ class LiveAnalyzer:
         gc_interval_batches: Optional[int] = None,
         instant_use_theory_point_only: Optional[bool] = True,  # 即时铳率：True=平均铳点仅按理论点（表宝牌），False=可考虑里宝模拟（若已实现）
         instant_normalize_oya_ron_to_ko: bool = False,  # 即时铳率：True=亲家和牌时铳点按子家算（折半），统一统计口径
-        independence_filter: bool = False,  # 仅目标牌存量+搭子 combo：拆面子后判定搭子独立性，抑制长顺重复计搭子
+        independence_filter: bool = False,  # 仅目标牌存量+搭子 combo：单花色 (M,T) 价值，V_origin==V_after+(0,1) 判真搭子
     ) -> Dict:
         """
         分析舍牌模式，计算目标牌在手牌中的概率。
@@ -2288,8 +2392,7 @@ class LiveAnalyzer:
 
         # 批量读取并分析（用 id 游标分页），避免 OFFSET 越大越慢；预取线程见 BackgroundLogFetcher
         processed = 0
-        pool = ProcessPoolExecutor(max_workers=workers) if use_parallel else None
-        batch_count = 0  # 每 N 批重启 pool（仅 ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY 分支使用）
+        pool = _make_analysis_process_pool(workers) if use_parallel else None
         maintenance_batch_index = 0
 
         # 启动后台预取线程，掩盖数据库 I/O 延迟
@@ -2338,57 +2441,8 @@ class LiveAnalyzer:
             if len(sample_pool) > sample_pool_cap:
                 del sample_pool[sample_pool_cap:]
 
-        if use_parallel and pool is not None and ENABLE_PARALLEL_POOL_RESTART_FOR_MEMORY:
-            # 需按批 drain 进程池以便安全重启时，仍用「每 SQL 批一段 bounded」
-            while True:
-                if should_cancel and should_cancel():
-                    logger.info("analysis cancelled")
-                    break
-                logs = fetcher.next_batch()
-                if not logs:
-                    break
-                task_iter = ((log_id, log_content, analysis_params) for log_id, log_content in logs)
-                for per_log_result in _iter_pool_results_bounded(
-                    pool,
-                    _process_one_log_analyze,
-                    task_iter,
-                    max_in_flight=max(2, workers * PARALLEL_IN_FLIGHT_FACTOR),
-                ):
-                    if should_cancel and should_cancel():
-                        fetcher.stop()
-                        conn.close()
-                        _maybe_analysis_gc()
-                        _trim_process_memory()
-                        pool.shutdown(wait=False)
-                        return _empty_analysis_result(first_pattern, first_target)
-                    _merge_one_analyze_per_log(per_log_result)
-                    processed += 1
-                    if progress_callback and (processed <= 10 or processed % 10 == 0):
-                        progress_callback(processed, total_logs)
-                    if sample_limit and processed >= sample_limit:
-                        break
-                batch_count += 1
-                if batch_count >= POOL_RESTART_EVERY_BATCHES:
-                    pool.shutdown(wait=True)
-                    pool = ProcessPoolExecutor(max_workers=workers)
-                    batch_count = 0
-                maintenance_batch_index += 1
-                if _should_run_memory_maintenance(maintenance_batch_index, gc_interval_batches, use_deal_in_instant):
-                    _maybe_analysis_gc()
-                    try:
-                        conn.execute("PRAGMA shrink_memory")
-                    except Exception:
-                        pass
-                    conn.close()
-                    conn = _connect_db_memory_efficient(self.db_path)
-                    cur = conn.cursor()
-                    _ensure_log_json_column(conn)
-                    if ENABLE_TRIM_WITH_PERIODIC_MAINTENANCE:
-                        _trim_process_memory()
-                if sample_limit and processed >= sample_limit:
-                    break
-        elif use_parallel and pool is not None:
-            # 默认：跨 SQL 批单段 bounded，下一批任务在本批尾部已开始 submit，减轻批末 CPU 空窗
+        if use_parallel and pool is not None:
+            # 跨 SQL 批单段 bounded；预取线程与 _RowTaskPrefetcher 重叠 I/O 与计算，避免主线程包办 next_batch
             def _on_parallel_sql_batch_done() -> None:
                 nonlocal maintenance_batch_index, conn, cur
                 maintenance_batch_index += 1
@@ -2411,7 +2465,7 @@ class LiveAnalyzer:
                 analysis_params,
                 on_batch_done=_on_parallel_sql_batch_done,
                 should_cancel=lambda: bool(should_cancel and should_cancel()),
-                queue_maxsize=max(128, _max_if * 6),
+                queue_maxsize=max(128, _max_if * 8),
             )
             _parallel_bounded = _iter_pool_results_bounded(
                 pool,
@@ -2943,7 +2997,7 @@ class LiveAnalyzer:
         # 后台预取，掩盖数据库 I/O 延迟（与主分析一致）
         fetcher = BackgroundLogFetcher(self.db_path, batch_size, last_id=None)
         # 单进程池贯穿全程：避免旧实现「每 SQL 批 with 新建池」造成的批间进程启停、CPU 空窗
-        grid_pool = ProcessPoolExecutor(max_workers=workers) if use_parallel else None
+        grid_pool = _make_analysis_process_pool(workers) if use_parallel else None
 
         try:
             if use_parallel and grid_pool is not None:
@@ -2968,7 +3022,7 @@ class LiveAnalyzer:
                     grid_params,
                     on_batch_done=_on_grid_sql_batch_done,
                     should_cancel=lambda: bool(should_cancel and should_cancel()),
-                    queue_maxsize=max(128, _g_max_if * 6),
+                    queue_maxsize=max(128, _g_max_if * 8),
                 )
                 _grid_bounded = _iter_pool_results_bounded(
                     grid_pool,
@@ -3821,7 +3875,6 @@ class LiveAnalyzer:
                                     "mapped_target": mapped_target,
                                     "hand_tiles": list(hand_at_turn),
                                     "visible_tiles": visible_tiles_dict,
-                                    "dora_indicators": list(player_state.dora_indicators),
                                     "dora_readable": dora_readable,
                                     "visible_target": visible_target,
                                     "call_area": call_area,
@@ -3831,15 +3884,11 @@ class LiveAnalyzer:
                                     "outcome_deal_in": bool(rdi is not None and rdi == player_state.player_id),
                                 }
                                 if use_deal_in_instant:
-                                    sp_entry.update({
-                                        "deal_in_hit": bool(instant_eval.get("deal_in_hit")),
-                                        "deal_in_point": int(instant_eval.get("deal_in_point", 0)),
-                                        "furiten_state": instant_eval.get("furiten_state", "none"),
-                                        "furiten_reason": instant_eval.get("furiten_reason", ""),
-                                        "waits_snapshot": instant_eval.get("waits_snapshot", []),
-                                    })
+                                    sp_entry.update(_ipc_copy_instant_eval(instant_eval))
                                     if instant_eval_multi:
-                                        sp_entry["instant_eval_multi"] = instant_eval_multi
+                                        sp_entry["instant_eval_multi"] = _ipc_copy_instant_eval_multi(
+                                            instant_eval_multi
+                                        )
                                 # 实时扫描匹配到的样本，无需再调用 verify_sample_consistency 校验，直接添加
                                 samples.append(sp_entry)
                                 if len(samples) >= sample_count:
@@ -4024,7 +4073,8 @@ def verify_sample_consistency(
             "discard_riichi_flags": riichi_flags,
             "current_discard_turn": sample.get("turn"),
             "visible_tiles": sample.get("visible_tiles"),
-            "dora_indicators": sample.get("dora_indicators"),
+            # 样本池已省略 dora_indicators 列表以瘦身 IPC；离线校验用空列表（占位符匹配不依赖指示牌）
+            "dora_indicators": sample.get("dora_indicators") or [],
         }
         
         matched = match_discard_to_variant(full_discards, variants, ctx)

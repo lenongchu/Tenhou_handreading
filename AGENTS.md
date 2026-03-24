@@ -202,7 +202,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 等价花色映射：`_transform_tile_with_mapping` 对 `5.p` 保持 `.` 并只映射末尾花色（如 `5.p`→`5.m`）。
 
-**独立性筛选**（主界面复选框，仅分析目标为「目标牌存量」且目标为两枚数牌搭子时生效）：在手牌中预留目标两枚后，对其余牌递归拆除顺子/刻子与字刻；若存在一种拆法使合并后的所余牌满足「该搭子不与邻牌组成完整面子」，则样本计为「有」。实现见 `taatsu_independence.combo_passes_independence_filter`；`live_analyzer` 经参数 `independence_filter` 传入 worker，矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）白名单已同步该参数。
+**独立性筛选**（主界面复选框，仅分析目标为「目标牌存量」且目标为两枚同花色数牌搭子时生效）：在单花色 9 枚计数上定义结构价值元组 `(M, T)`（字典序）：`M` 为最多面子数（顺子/刻子），`T` 为在 `M` 最大的前提下最多搭子或对子**块**数（互不相交）。记原手牌该花色最优价值为 `V_origin`，强制删去目标两枚后的最优价值为 `V_after`。当且仅当 `V_origin == (V_after[0], V_after[1] + 1)`（面子数不变、搭子块数恰好多 1）时计为「有」，可抑制长顺（如 `456789`）中误把 `78`、`89` 等当独立搭子。实现见 `taatsu_independence.combo_passes_independence_filter`；`live_analyzer` 经参数 `independence_filter` 传入 worker，矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）白名单已同步该参数。
 
 ### 2.1 副露区域约束（Call Area Constraints）
 
@@ -399,7 +399,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
 - **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径
 - **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）。铳率分析页支持**多条舍牌模式**（可添加多行“模式 + 目标牌”），满足任一即计入，与主分析页一致。
-- **矩阵分析与主分析同步**：主界面矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）均调用 `analyze_discard_pattern_grid`。新增主分析约束或参数时，必须同步更新两处传给 grid 的 shared/shared_filtered 白名单，确保 `prior_discard_exclusion`、`prior_discard_required`、`gc_interval_batches` 等与主分析一致。**性能优化也需同步**：若主分析新增 `BackgroundLogFetcher`、`POOL_RESTART_EVERY_BATCHES`、`_clamp_analysis_batch_size` 等优化，需在 `live_analyzer.analyze_discard_pattern_grid` 中同步实现。参考：`gui_app.GridQueryThread.run`、`gui_app.BatchChartThread.run`、`live_analyzer.analyze_discard_pattern`。
+- **矩阵分析与主分析同步**：主界面矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）均调用 `analyze_discard_pattern_grid`。新增主分析约束或参数时，必须同步更新两处传给 grid 的 shared/shared_filtered 白名单，确保 `prior_discard_exclusion`、`prior_discard_required`、`gc_interval_batches` 等与主分析一致。**性能优化也需同步**：流式链路为 `BackgroundLogFetcher`（`fetchmany` 分块入队）+ `_RowTaskPrefetcher` + `_iter_pool_results_bounded`（勿在主线程用生成器包办 `next_batch`）；Python 3.11+ 可在 `live_analyzer.PARALLEL_MAX_TASKS_PER_CHILD` 设正数启用 `max_tasks_per_child`（默认 `None` 不轮换，避免过小值导致子进程频繁重启、批间停顿）；若主分析调整 `_clamp_analysis_batch_size`、`BACKGROUND_FETCHER_QUEUE_MAX_BATCHES` 等，矩阵/grid 路径需一并跟进。参考：`gui_app.GridQueryThread.run`、`gui_app.BatchChartThread.run`、`live_analyzer.analyze_discard_pattern`。
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
 - **本手册维护**：新增重要目录/脚本/模块时，同步更新本文件；`docs/项目文件夹结构说明.md` 保持为轻量索引并指向本文件
 - **双文件同步**：`AGENTS.md` 与 `.cursor/rules/tenhou-handreading-project.mdc` 内容一致，修改任一处需同步另一处

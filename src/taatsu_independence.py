@@ -1,9 +1,13 @@
 """
 搭子独立性筛选（independence filter）
 
-从手牌中尽可能拆除面子（顺子/刻子）与字牌刻子后，若存在一种拆法使目标两枚数牌
-在所余牌中无法与邻牌组成完整面子，则视为「独立搭子」。用于避免长连如 45678 中
-45、56、67、78 被重复统计（仅边界 45、78 通过）。
+在同花色 9 枚计数向量上定义结构价值 (M, T)（字典序）：
+- M：最多能拆出的面子数（顺子 / 刻子，各 3 张）
+- T：在 M 已达最大的前提下，剩余牌中最多能拆出的搭子/对子数（对子、两面/边张、嵌张，各 2 张）
+
+对目标两枚数牌：若整手该花色 V_origin 与删去这两枚后 V_after 满足
+V_origin == (V_after[0], V_after[1] + 1)，则视为该搭子在「最优结构」中恰好贡献一个搭子单位，
+且未挤占面子；用于抑制长连中段的伪搭子（如 456789 中的 78、89）。
 """
 from functools import lru_cache
 from typing import List, Optional, Tuple
@@ -63,88 +67,84 @@ def _parse_number_tile_suit_index(tile_str: str) -> Tuple[Optional[str], Optiona
     return suit, num - 1
 
 
-def _reserve_two_tiles(
-    m: List[int],
-    p: List[int],
-    s: List[int],
-    suit_a: str,
-    idx_a: int,
-    suit_b: str,
-    idx_b: int,
-) -> Optional[Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]]:
-    """
-    从手牌计数中各扣 1 枚目标牌，成功则返回
-    (rem_m, rem_p, rem_s, prot_m, prot_p, prot_s)；prot 仅两枚目标位为 1。
-    """
-    prot_m, prot_p, prot_s = [0] * 9, [0] * 9, [0] * 9
-    rm, rp, rs = m[:], p[:], s[:]
+def _suit_vec(m: List[int], p: List[int], s: List[int], suit: str) -> List[int]:
+    if suit == "m":
+        return m
+    if suit == "p":
+        return p
+    return s
 
-    def take(vec, prot, idx):
-        if vec[idx] < 1:
-            return False
-        vec[idx] -= 1
-        prot[idx] += 1
-        return True
 
-    if suit_a == "m":
-        if not take(rm, prot_m, idx_a):
+def _remove_two_ranks(vec: List[int], ia: int, ib: int) -> Optional[List[int]]:
+    """从单花色 9 维向量中各删 1 枚（同索引删 2 枚）。"""
+    v = vec[:]
+    if ia == ib:
+        if v[ia] < 2:
             return None
-    elif suit_a == "p":
-        if not take(rp, prot_p, idx_a):
-            return None
+        v[ia] -= 2
     else:
-        if not take(rs, prot_s, idx_a):
+        if v[ia] < 1 or v[ib] < 1:
             return None
-
-    if suit_b == "m":
-        if not take(rm, prot_m, idx_b):
-            return None
-    elif suit_b == "p":
-        if not take(rp, prot_p, idx_b):
-            return None
-    else:
-        if not take(rs, prot_s, idx_b):
-            return None
-
-    return (rm, rp, rs, prot_m, prot_p, prot_s)
+        v[ia] -= 1
+        v[ib] -= 1
+    return v
 
 
-def _has_any_meld(
-    m: Tuple[int, ...], p: Tuple[int, ...], s: Tuple[int, ...], z: Tuple[int, ...]
-) -> bool:
-    """可拆除的顺子（三色）或刻子（含字）是否存在。"""
-    for vec in (m, p, s):
-        for i in range(9):
-            if vec[i] >= 3:
-                return True
-        for i in range(7):
-            if vec[i] and vec[i + 1] and vec[i + 2]:
-                return True
+@lru_cache(maxsize=None)
+def _max_T_blocks(state: Tuple[int, ...]) -> int:
+    """
+    仅用搭子/对子（不占面子）：对子、相邻两面/边张、嵌张；两两不交，求最多块数。
+    """
+    c = list(state)
+    if sum(c) == 0:
+        return 0
+    best = 0
+    for i in range(9):
+        if c[i] >= 2:
+            nc = tuple(c[j] - 2 if j == i else c[j] for j in range(9))
+            best = max(best, 1 + _max_T_blocks(nc))
+    for i in range(8):
+        if c[i] and c[i + 1]:
+            nc = list(c)
+            nc[i] -= 1
+            nc[i + 1] -= 1
+            best = max(best, 1 + _max_T_blocks(tuple(nc)))
     for i in range(7):
-        if z[i] >= 3:
-            return True
-    return False
+        if c[i] and c[i + 2]:
+            nc = list(c)
+            nc[i] -= 1
+            nc[i + 2] -= 1
+            best = max(best, 1 + _max_T_blocks(tuple(nc)))
+    return best
 
 
-def _remainder_taatsu_independent(R: List[int], i: int, j: int) -> bool:
+@lru_cache(maxsize=None)
+def _suit_value_MT(state: Tuple[int, ...]) -> Tuple[int, int]:
     """
-    在所余某一花色 9 枚向量 R（含目标搭子）上，判断两索引 i<=j 是否「不与邻牌成面子」。
+    单花色结构价值 (M, T)，字典序最大：先最大化面子数 M，再最大化搭子/对子数 T。
+    面子：刻子（3 同）或顺子（连续 3 张）。
     """
-    if i > j:
-        i, j = j, i
-    if i == j:
-        # 对子：不能再有第三张同数
-        return R[i] <= 2
-    if j == i + 1:
-        # 两面/边张：不能同时存在 i-1 与 i+2（即不能补成顺）
-        left_ext = i > 0 and R[i - 1] > 0
-        right_ext = j < 8 and R[j + 1] > 0
-        return not left_ext and not right_ext
-    if j == i + 2:
-        # 嵌张：中间不能存在
-        return R[i + 1] == 0
-    # 非标准两枚搭子间距：不额外限制
-    return True
+    c = list(state)
+    # 不取面子，整副牌只数 T
+    best = (0, _max_T_blocks(state))
+    for i in range(9):
+        if c[i] >= 3:
+            nc = tuple(c[j] - 3 if j == i else c[j] for j in range(9))
+            m, t = _suit_value_MT(nc)
+            cand = (1 + m, t)
+            if cand > best:
+                best = cand
+    for i in range(7):
+        if c[i] and c[i + 1] and c[i + 2]:
+            nc = list(c)
+            nc[i] -= 1
+            nc[i + 1] -= 1
+            nc[i + 2] -= 1
+            m, t = _suit_value_MT(tuple(nc))
+            cand = (1 + m, t)
+            if cand > best:
+                best = cand
+    return best
 
 
 def combo_passes_independence_filter(hand_tiles: List[int], mapped_tile_strings: List[str]) -> bool:
@@ -152,8 +152,7 @@ def combo_passes_independence_filter(hand_tiles: List[int], mapped_tile_strings:
     搭子 combo 是否通过独立性筛选。
 
     - 仅当恰好 2 张目标且为同花色数牌（含 5.p）时执行；否则视为通过（不筛）。
-    - 若存在一种从「非保留牌」中拆除面子/刻子的方式，使合并后该花色所余满足
-      _remainder_taatsu_independent，则返回 True。
+    - 在该花色计数上：V_origin == (V_after[0], V_after[1] + 1) 时通过。
     """
     if len(mapped_tile_strings) != 2:
         return True
@@ -163,72 +162,13 @@ def combo_passes_independence_filter(hand_tiles: List[int], mapped_tile_strings:
     if su_a is None or su_b is None or su_a != su_b:
         return True
 
-    m, p, s, z = _hand_to_mps_z_counts(hand_tiles)
-    reserved = _reserve_two_tiles(m, p, s, su_a, ia, su_b, ib)
-    if reserved is None:
-        return False
-    rm, rp, rs, prot_m, prot_p, prot_s = reserved
-    rz = z[:]  # 字牌不参与保留，全部留在可拆池
-
-    prot_m_t = tuple(prot_m)
-    prot_p_t = tuple(prot_p)
-    prot_s_t = tuple(prot_s)
-    suit_key = su_a
-    idx_lo, idx_hi = (ia, ib) if ia <= ib else (ib, ia)
-
-    @lru_cache(maxsize=None)
-    def dfs(rm_t, rp_t, rs_t, rz_t):
-        """在可拆余牌 (rm,rp,rs,rz) 上递归拆面子，任一终态满足独立性即 True。"""
-        if not _has_any_meld(rm_t, rp_t, rs_t, rz_t):
-            Rm = [rm_t[i] + prot_m_t[i] for i in range(9)]
-            Rp = [rp_t[i] + prot_p_t[i] for i in range(9)]
-            Rs = [rs_t[i] + prot_s_t[i] for i in range(9)]
-            R = Rm if suit_key == "m" else Rp if suit_key == "p" else Rs
-            return _remainder_taatsu_independent(R, idx_lo, idx_hi)
-
-        rm = list(rm_t)
-        rp = list(rp_t)
-        rs = list(rs_t)
-        rz = list(rz_t)
-
-        # 字刻子
-        for i in range(7):
-            if rz[i] >= 3:
-                nz = rz[:]
-                nz[i] -= 3
-                if dfs(tuple(rm), tuple(rp), tuple(rs), tuple(nz)):
-                    return True
-
-        for name, vec in ("m", rm), ("p", rp), ("s", rs):
-            v = vec
-            for i in range(9):
-                if v[i] >= 3:
-                    nv = v[:]
-                    nv[i] -= 3
-                    if name == "m":
-                        if dfs(tuple(nv), tuple(rp), tuple(rs), tuple(rz)):
-                            return True
-                    elif name == "p":
-                        if dfs(tuple(rm), tuple(nv), tuple(rs), tuple(rz)):
-                            return True
-                    else:
-                        if dfs(tuple(rm), tuple(rp), tuple(nv), tuple(rz)):
-                            return True
-            for i in range(7):
-                if v[i] and v[i + 1] and v[i + 2]:
-                    nv = v[:]
-                    nv[i] -= 1
-                    nv[i + 1] -= 1
-                    nv[i + 2] -= 1
-                    if name == "m":
-                        if dfs(tuple(nv), tuple(rp), tuple(rs), tuple(rz)):
-                            return True
-                    elif name == "p":
-                        if dfs(tuple(rm), tuple(nv), tuple(rs), tuple(rz)):
-                            return True
-                    else:
-                        if dfs(tuple(rm), tuple(rp), tuple(nv), tuple(rz)):
-                            return True
+    m, p, s, _z = _hand_to_mps_z_counts(hand_tiles)
+    vec = _suit_vec(m, p, s, su_a)
+    vec_after = _remove_two_ranks(vec, ia, ib)
+    if vec_after is None:
         return False
 
-    return dfs(tuple(rm), tuple(rp), tuple(rs), tuple(rz))
+    v_o = _suit_value_MT(tuple(vec))
+    v_a = _suit_value_MT(tuple(vec_after))
+    # 核心：恰好损失一个搭子单位、面子数不变
+    return v_o == (v_a[0], v_a[1] + 1)

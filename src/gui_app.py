@@ -718,8 +718,9 @@ class MainWindow(QMainWindow):
         # 搭子独立性筛选：仅「目标牌存量」分析目标下显示（与 live_analyzer 中 eff_independence 一致）
         self.independence_filter_check = QCheckBox("独立性筛选")
         self.independence_filter_check.setToolTip(
-            "仅「目标牌存量」且目标为搭子（如 4m5m）时生效：在手牌其余部分尽量拆除顺子/刻子后，"
-            "若存在一种拆法使该两枚不构成嵌在长顺中的面子，才计为「有」；可减少 45678 等对中间搭子的重复计数。"
+            "仅「目标牌存量」且目标为搭子（如 4m5m）时生效：单花色上最优结构价值为 (M,T)（面子数 M、"
+            "在 M 最大下搭子/对子块数 T）；强制抽走该两枚后若满足 V原=(V后[0], V后[1]+1) 才计为「有」，"
+            "可抑制长顺里误把边界两枚当独立搭子。"
         )
         self.independence_filter_check.setVisible(False)
         opts_row.addWidget(self.independence_filter_check)
