@@ -164,11 +164,37 @@ class TileUtils:
 
     @staticmethod
     def get_jikaze(player_id: int, oya: int, round_num: int) -> str:
-        """自风：东场东家=东…；南场东家=南…"""
-        winds = ["东", "南", "西", "北"]
-        seat = (player_id - oya + 4) % 4
-        field = round_num // 4
-        return winds[(seat + field) % 4]
+        """
+        自风（seat wind）：仅由相对亲家（oya）的座位决定，逆时针为东南西北。
+        与役牌 / zf / yp / yaku_honor_bases_for_seat 一致；勿把 round 场序叠加到座位上
+        （旧实现用 (seat+field)%4 会在南场把部分座位的役牌集合算错，如 yp 误.match 北）。
+        round_num 保留仅为兼容调用签名，不参与计算。
+        """
+        _ = round_num  # API 兼容（compatibility）；场风请用 get_bakaze
+        return TileUtils.get_player_wind(player_id, oya)
+
+    @staticmethod
+    def get_bakaze(round_num: int) -> str:
+        """
+        场风（round wind）：东一至东四为东，南一至南四为南…
+        与 honor_ctx 一致；超长局下标封顶，避免 round_num//4 越界。
+        """
+        winds = ("东", "南", "西", "北")
+        idx = min(max(round_num // 4, 0), len(winds) - 1)
+        return winds[idx]
+
+    @staticmethod
+    def yaku_honor_bases_for_seat(player_id: int, oya: int, round_num: int) -> Set[int]:
+        """立直役牌 base 集合：自风、场风（连风时 set 自动去重）、三元。"""
+        ji = TileUtils.get_jikaze(player_id, oya, round_num)
+        ba = TileUtils.get_bakaze(round_num)
+        return {
+            TileUtils.string_to_tile(ji),
+            TileUtils.string_to_tile(ba),
+            TileUtils.string_to_tile("白"),
+            TileUtils.string_to_tile("发"),
+            TileUtils.string_to_tile("中"),
+        }
 
     @staticmethod
     def get_kyokuze_list(player_id: int, oya: int, round_num: int) -> List[str]:

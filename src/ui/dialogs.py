@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Callable, TYPE_CHECKING
 
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
     QTextEdit, QTextBrowser, QGroupBox, QComboBox, QCheckBox,
     QRadioButton, QProgressBar, QMessageBox, QDialogButtonBox, QApplication,
+    QScrollArea, QWidget, QSizePolicy,
 )
 from PyQt5.QtCore import Qt
 
@@ -166,8 +167,95 @@ class TileIllustrationDialog(QDialog):
         layout.addWidget(TileIllustrationWidget(self))
 
 
+def _instant_series_list(grid_result: dict) -> List[Tuple[int, str, str]]:
+    """
+    将即时铳率矩阵展平为 (pat_idx, target_key, 勾选标签) 列表，供对话框与导出共用。
+    """
+    header_row = grid_result.get("header_row", [])
+    header_col = grid_result.get("header_col", [])
+    instant_cells = grid_result.get("instant_matrix_cells") or {}
+    instant_meta = grid_result.get("instant_matrix_meta") or {}
+    n_row = len(header_row)
+
+    def _resolve_tks(pat_idx: int) -> List[str]:
+        tks = instant_meta.get(pat_idx)
+        if tks:
+            return list(tks)
+        acc = set()
+        for tr_idx in range(n_row):
+            c = instant_cells.get((tr_idx, pat_idx))
+            if c:
+                acc.update((c.get("by_target") or {}).keys())
+        return sorted(acc)
+
+    series: List[Tuple[int, str, str]] = []
+    for pat_idx in range(len(header_col)):
+        for tk in _resolve_tks(pat_idx):
+            lbl = f"{header_col[pat_idx]} · {tk}"
+            series.append((pat_idx, tk, lbl))
+    return series
+
+
+def instant_matrix_export_tsv(grid_result: dict, series_active: Optional[List[bool]] = None) -> str:
+    """
+    即时铳率矩阵制表（TSV）：每行一巡目；列为各「模式·目标」的铳率(%) / 平均铳点 / 铳度；每模式末列样本 n；行末为勾选列算术平均。
+    series_active 与 _instant_series_list 顺序一致；None 表示全部视为勾选。
+    """
+    instant_cells = grid_result.get("instant_matrix_cells") or {}
+    if not instant_cells:
+        return ""
+    header_row = grid_result.get("header_row", [])
+    header_col = grid_result.get("header_col", [])
+    series = _instant_series_list(grid_result)
+    if not series:
+        return ""
+    if series_active is None:
+        active = [True] * len(series)
+    else:
+        active = series_active
+        if len(active) != len(series):
+            active = [True] * len(series)
+    hdr = ["巡目范围"]
+    for pat_idx, tk, _ in series:
+        short = f"{header_col[pat_idx]}·{tk}"
+        hdr.extend([f"{short}铳率(%)", f"{short}平均铳点", f"{short}铳度"])
+    for pat_idx in range(len(header_col)):
+        hdr.append(f"{header_col[pat_idx]}(n)")
+    hdr.extend(["合并铳率(%)", "合并平均铳点", "合并铳度"])
+    rows = ["\t".join(hdr)]
+    for tr_idx, tr_label in enumerate(header_row):
+        cells = [tr_label]
+        merge_rates: List[float] = []
+        merge_pts: List[float] = []
+        merge_ints: List[float] = []
+        for i, (pat_idx, tk, _) in enumerate(series):
+            data = instant_cells.get((tr_idx, pat_idx)) or {}
+            bt = (data.get("by_target") or {}).get(tk) or {}
+            r1 = float(bt.get("rate", 0) or 0)
+            pa = float(bt.get("point_avg", 0) or 0)
+            inte = float(bt.get("intensity", 0) or 0)
+            cells.append(f"{100.0 * r1:.2f}")
+            cells.append(f"{pa:.1f}")
+            cells.append(f"{inte:.2f}")
+            if active[i]:
+                merge_rates.append(r1)
+                merge_pts.append(pa)
+                merge_ints.append(inte)
+        for pat_idx in range(len(header_col)):
+            n = (instant_cells.get((tr_idx, pat_idx)) or {}).get("total")
+            cells.append("" if n is None else str(int(n)))
+        if merge_rates:
+            cells.append(f"{100.0 * sum(merge_rates) / len(merge_rates):.2f}")
+            cells.append(f"{sum(merge_pts) / len(merge_pts):.1f}")
+            cells.append(f"{sum(merge_ints) / len(merge_ints):.2f}")
+        else:
+            cells.extend(["", "", ""])
+        rows.append("\t".join(cells))
+    return "\n".join(rows)
+
+
 class MatrixDisplayDialog(QDialog):
-    """矩阵展示窗口：勾选 0/1/2/3 张，动态预览并复制 Excel 格式；每格显示样本数"""
+    """矩阵展示窗口：存量/听牌等为 bucket 勾选合并；即时铳率为分目标展示并可勾选列算术平均。"""
 
     def __init__(self, parent, grid_result: dict):
         super().__init__(parent)
@@ -181,10 +269,57 @@ class MatrixDisplayDialog(QDialog):
         self._analysis_target = grid_result.get("analysis_target", "target_count")
         self._use_tenpai = (self._analysis_target == "tenpai")
         self._use_related_tile = (self._analysis_target == "related_tile")
+        self._instant_cells = grid_result.get("instant_matrix_cells") or {}
+        self._is_instant_dialog = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        # 即时铳率矩阵：走分目标 + 勾选合并（instant deal-in grid）
+        if self._analysis_target == "deal_in_instant" and self._instant_cells:
+            self._build_instant_matrix_ui(layout)
+            return
+        self._build_classic_matrix_ui(layout)
+
+    def _build_instant_matrix_ui(self, layout: QVBoxLayout) -> None:
+        # 分目标展示 + 勾选列参与行末算术平均（arithmetic mean）
+        self._is_instant_dialog = True
+        self.setMinimumSize(900, 500)
+        hint = QLabel(
+            "每列为「模式·目标牌」的铳率（占该格命中样本 %）、平均铳点、铳度（率×点）。"
+            "勾选下方条目后，行末「合并」为三指标对勾选列的算术平均。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8b949e;")
+        layout.addWidget(hint)
+        self._series = _instant_series_list(self._result)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        self._series_cbs = []
+        for i, (_, _, lbl) in enumerate(self._series):
+            cb = QCheckBox(lbl)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_preview)
+            self._series_cbs.append(cb)
+            grid.addWidget(cb, i // 4, i % 4)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+        self._preview = QTextEdit()
+        self._preview.setReadOnly(True)
+        self._preview.setMinimumHeight(240)
+        layout.addWidget(self._preview)
+        btn_row = QHBoxLayout()
+        self._copy_btn = QPushButton("复制到 Excel")
+        self._copy_btn.clicked.connect(self._copy_excel)
+        btn_row.addWidget(self._copy_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        self._update_preview()
+
+    def _build_classic_matrix_ui(self, layout: QVBoxLayout) -> None:
+        self._is_instant_dialog = False
         use_tenpai = self._use_tenpai
         use_related_tile = self._use_related_tile
         if use_tenpai:
@@ -229,7 +364,15 @@ class MatrixDisplayDialog(QDialog):
             out[(tr_idx, pat_idx)] = round(val, 2)
         return out
 
-    def _update_preview(self):
+    def _update_preview(self, *args):
+        if getattr(self, "_is_instant_dialog", False):
+            if not self._series:
+                self._preview.setPlainText("无目标列（请确认模式与目标牌）")
+                return
+            self._preview.setPlainText(
+                instant_matrix_export_tsv(self._result, [cb.isChecked() for cb in self._series_cbs])
+            )
+            return
         tbl = self._compute_table()
         if tbl is None:
             self._preview.setPlainText("请至少勾选一项")
@@ -257,6 +400,14 @@ class MatrixDisplayDialog(QDialog):
         self._preview.setPlainText("\n".join(rows))
 
     def _copy_excel(self):
+        if getattr(self, "_is_instant_dialog", False):
+            txt = instant_matrix_export_tsv(self._result, [cb.isChecked() for cb in self._series_cbs])
+            if not txt.strip():
+                QMessageBox.information(self, "提示", "无数据可复制")
+                return
+            QApplication.clipboard().setText(txt)
+            QMessageBox.information(self, "已复制", "表格已复制到剪贴板，可粘贴到 Excel。")
+            return
         tbl = self._compute_table()
         if tbl is None:
             QMessageBox.information(self, "提示", "请至少勾选一项")
@@ -373,30 +524,33 @@ class BatchChartDialog(QDialog):
             call_area_row.addWidget(le)
         call_area_row.addStretch()
         cg_layout.addLayout(call_area_row)
-        prior_excl_row = QHBoxLayout()
-        prior_excl_row.addWidget(QLabel("前段禁打:"))
-        self.batch_prior_discard_exclusion_input = QLineEdit()
-        self.batch_prior_discard_exclusion_input.setPlaceholderText("例: NOTm 或 4mOR2m")
+        batch_prior_pair_row = QHBoxLayout()
+        batch_prior_pair_row.addWidget(QLabel("前段禁打:"))
+        self.batch_prior_discard_exclusion_input = QTextEdit()
+        self.batch_prior_discard_exclusion_input.setPlaceholderText("每行一条表达式（换行），多条并集禁打")
         self.batch_prior_discard_exclusion_input.setToolTip(
-            "巡目范围开始前不能打出这些牌。随 x 轴巡目变化：如 4-6 巡时指第 3 巡前；7-9 巡时指第 6 巡前"
+            "巡目范围开始前不能打出这些牌；多行时每条表达式并集禁打。"
+            "随 x 轴巡目变化：如 4-6 巡时指第 3 巡前；7-9 巡时指第 6 巡前"
         )
+        self.batch_prior_discard_exclusion_input.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.batch_prior_discard_exclusion_input.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.batch_prior_discard_exclusion_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.batch_prior_discard_exclusion_input.setFixedHeight(46)
         self.batch_prior_discard_exclusion_input.setMinimumWidth(140)
-        self.batch_prior_discard_exclusion_input.setMaximumWidth(200)
-        prior_excl_row.addWidget(self.batch_prior_discard_exclusion_input)
-        prior_excl_row.addStretch()
-        cg_layout.addLayout(prior_excl_row)
-        prior_req_row = QHBoxLayout()
-        prior_req_row.addWidget(QLabel("前段有打:"))
+        self.batch_prior_discard_exclusion_input.setMaximumWidth(280)
+        self.batch_prior_discard_exclusion_input.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        batch_prior_pair_row.addWidget(self.batch_prior_discard_exclusion_input)
+
+        batch_prior_pair_row.addWidget(QLabel("前段有打:"))
         self.batch_prior_discard_required_input = QLineEdit()
         self.batch_prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
         self.batch_prior_discard_required_input.setToolTip(
             "巡目范围开始前须出现过该舍牌模式（语法同舍牌模式）。与主模式串联：前段有打 … 舍牌模式，中间不要求"
         )
         self.batch_prior_discard_required_input.setMinimumWidth(140)
-        self.batch_prior_discard_required_input.setMaximumWidth(200)
-        prior_req_row.addWidget(self.batch_prior_discard_required_input)
-        prior_req_row.addStretch()
-        cg_layout.addLayout(prior_req_row)
+        self.batch_prior_discard_required_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        batch_prior_pair_row.addWidget(self.batch_prior_discard_required_input, stretch=1)
+        cg_layout.addLayout(batch_prior_pair_row)
         vc_row = QHBoxLayout()
         vc_row.addWidget(QLabel("场上可见枚数:"))
         self.batch_use_main_constraints = QCheckBox("使用主界面场上可见枚数")
@@ -481,7 +635,9 @@ class BatchChartDialog(QDialog):
         for i, le in enumerate(self.batch_call_area_inputs):
             if i < len(mw.call_area_inputs):
                 le.setText(mw.call_area_inputs[i].text())
-        self.batch_prior_discard_exclusion_input.setText(mw.prior_discard_exclusion_input.text())
+        self.batch_prior_discard_exclusion_input.setPlainText(
+            mw.prior_discard_exclusion_input.toPlainText()
+        )
         self.batch_prior_discard_required_input.setText(mw.prior_discard_required_input.text())
         QMessageBox.information(self, "已同步", "约束条件已从主界面同步")
 
@@ -489,10 +645,10 @@ class BatchChartDialog(QDialog):
         mw = self.main_window
         cached = (self._load_db_status_fn(mw.db_path) if self._load_db_status_fn else None)
         if self.constraint_group.isChecked():
-            prior_excl = self.batch_prior_discard_exclusion_input.text().strip() or None
+            prior_excl = self.batch_prior_discard_exclusion_input.toPlainText().strip() or None
             prior_req = self.batch_prior_discard_required_input.text().strip() or None
         else:
-            prior_excl = mw.prior_discard_exclusion_input.text().strip() or None
+            prior_excl = mw.prior_discard_exclusion_input.toPlainText().strip() or None
             prior_req = mw.prior_discard_required_input.text().strip() or None
         base = {
             "sample_limit": mw.sample_limit_input.value(),
@@ -525,8 +681,18 @@ class BatchChartDialog(QDialog):
             visible = {}
             if self.batch_use_main_constraints.isChecked():
                 visible = mw._get_visible_constraints_from_ui() or {}
-            base.update(dora_constraint=dora, dora_position_spec=dora_pos, riichi_constraint=riichi, call_constraint=call,
-                call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
+            hvis = mw._get_hand_visible_constraints_from_ui() or {}
+            pvis = mw._get_player_visible_constraints_from_ui() or {}
+            base.update(
+                dora_constraint=dora,
+                dora_position_spec=dora_pos,
+                riichi_constraint=riichi,
+                call_constraint=call,
+                call_area_constraints=call_area if call_area else None,
+                visible_constraints=visible if visible else None,
+                hand_visible_constraints=hvis if hvis else None,
+                player_visible_constraints=pvis if pvis else None,
+            )
         else:
             if getattr(mw, "dora_any_radio", None) and mw.dora_any_radio.isChecked():
                 dora = "any"
@@ -544,8 +710,18 @@ class BatchChartDialog(QDialog):
             call = "any" if mw.call_any_radio.isChecked() else ("has_call" if mw.call_has_radio.isChecked() else "no_call")
             call_area = [le.text().strip() for le in mw.call_area_inputs if le.text().strip()][:4]
             visible = mw._get_visible_constraints_from_ui() or {}
-            base.update(dora_constraint=dora, dora_position_spec=dora_pos, riichi_constraint=riichi, call_constraint=call,
-                call_area_constraints=call_area if call_area else None, visible_constraints=visible if visible else None)
+            hvis = mw._get_hand_visible_constraints_from_ui() or {}
+            pvis = mw._get_player_visible_constraints_from_ui() or {}
+            base.update(
+                dora_constraint=dora,
+                dora_position_spec=dora_pos,
+                riichi_constraint=riichi,
+                call_constraint=call,
+                call_area_constraints=call_area if call_area else None,
+                visible_constraints=visible if visible else None,
+                hand_visible_constraints=hvis if hvis else None,
+                player_visible_constraints=pvis if pvis else None,
+            )
         return base
 
     def _get_merge_keys(self) -> List[int]:

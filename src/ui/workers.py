@@ -149,6 +149,7 @@ class OutcomeQueryThread(QThread):
                     "dora_position_spec",
                     "visible_constraints",
                     "hand_visible_constraints",
+                    "player_visible_constraints",
                     "riichi_constraint",
                     "call_constraint",
                     "target_no_call",
@@ -234,6 +235,7 @@ class SampleThread(QThread):
                 "dora_position_spec",
                 "visible_constraints",
                 "hand_visible_constraints",
+                "player_visible_constraints",
                 "riichi_constraint",
                 "call_constraint",
                 "target_no_call",
@@ -314,6 +316,7 @@ class GridQueryThread(QThread):
                     "call_area_constraints",
                     "visible_constraints",
                     "hand_visible_constraints",
+                    "player_visible_constraints",
                     "sample_limit",
                     "total_logs_hint",
                     "analysis_batch_size",
@@ -324,6 +327,8 @@ class GridQueryThread(QThread):
                     "max_workers",
                     "gc_interval_batches",
                     "independence_filter",
+                    "hypothetical_furiten_tiles",
+                    "instant_normalize_oya_ron_to_ko",
                 )
             }
 
@@ -333,10 +338,12 @@ class GridQueryThread(QThread):
                 if t and (t <= 100 or c <= 10 or c % max(1, t // 20) == 0):
                     self.progress.emit(f"已处理 {c:,}/{t:,} 场对局")
 
+            # 即时铳率（deal_in_instant）矩阵：仅合并「可铳」桶（bucket 1），等同听牌矩阵的展示方式
+            _mk = [1] if self.analysis_target == "deal_in_instant" else [1, 2]
             result = self.analyzer.analyze_discard_pattern_grid(
                 patterns=self.patterns,
                 turn_ranges=self.turn_ranges,
-                merge_keys=[1, 2],
+                merge_keys=_mk,
                 analysis_target=self.analysis_target,
                 progress_callback=progress_fn,
                 should_cancel=lambda: self._should_cancel,
@@ -411,6 +418,7 @@ class BatchChartThread(QThread):
                     "call_area_constraints",
                     "visible_constraints",
                     "hand_visible_constraints",
+                    "player_visible_constraints",
                     "sample_limit",
                     "total_logs_hint",
                     "analysis_batch_size",
@@ -421,6 +429,8 @@ class BatchChartThread(QThread):
                     "max_workers",
                     "gc_interval_batches",
                     "independence_filter",
+                    "hypothetical_furiten_tiles",
+                    "instant_normalize_oya_ron_to_ko",
                 )
             }
             self.progress.emit(
@@ -433,10 +443,15 @@ class BatchChartThread(QThread):
                 if t and (t <= 100 or c <= 10 or c % max(1, t // 20) == 0):
                     self.progress.emit(f"已处理 {c:,}/{t:,} 场对局")
 
+            _mk = (
+                self.merge_keys
+                if self.analysis_target != "deal_in_instant"
+                else [1]
+            )
             result = self.analyzer.analyze_discard_pattern_grid(
                 patterns=self.patterns,
                 turn_ranges=self.turn_ranges,
-                merge_keys=self.merge_keys,
+                merge_keys=_mk,
                 analysis_target=self.analysis_target,
                 progress_callback=progress_fn,
                 should_cancel=lambda: self._should_cancel,

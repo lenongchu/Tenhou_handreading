@@ -27,7 +27,8 @@ from .related_tile_utils import (
 )
 from .equivalent_variants import (
     generate_equivalent_variants,
-    get_forbidden_bases_from_exclusion_str,
+    get_prior_discard_exclusion_forbidden_bases,
+    normalize_prior_discard_exclusion_list,
     match_discard_to_variant,
     match_discard_pattern_contained,
     prior_required_pattern_to_variants,
@@ -46,8 +47,16 @@ from .equivalent_variants import (
     pattern_has_riichi,
 )
 from .instant_deal_in import RoundInstantDealInAnalyzer, extract_tenhou6_rounds
+from .yaku_hai_hand_stats import (
+    compute_yaku_hai_hand_stats,
+    yaku_hai_per_tile_counts,
+    yaku_pair_units_bucket,
+)
 
 logger = logging.getLogger(__name__)
+
+# 生成验证样本时：役牌模式下单选「三对及以上」传给 collect_verification_samples 的哨兵（与 0/1/2 的精确 pair_kinds 区分）
+YAKU_HAI_PAIR_FILTER_GE3 = -1
 
 
 def _apply_combo_independence_filter(
@@ -458,6 +467,30 @@ def _opponent_riichi_happened(discard) -> bool:
     return bool(getattr(discard, "opponent_riichi_happened", getattr(discard, "riichi_happened", False)))
 
 
+def _hands_counters_at_discard_moment(discard, player_state, round_players: List) -> Optional[List[Counter]]:
+    """
+    四名玩家在当前打出瞬间的手牌按 base 计数；若 discard 来自玩家 P，则 P 的手牌含本张打出牌（与延伸手牌判定一致）。
+    all_players_turns 不可用则返回 None。
+    """
+    all_turns = getattr(discard, "all_players_turns", None)
+    if all_turns is None or len(all_turns) != 4:
+        return None
+    hands_counts: List[Counter] = []
+    for pid in range(4):
+        t = all_turns[pid]
+        p_state = round_players[pid]
+        if t == 0:
+            hand = list(p_state.initial_hand)
+        elif t <= len(p_state.hand_tiles_history):
+            hand = list(p_state.hand_tiles_history[t - 1])
+        else:
+            hand = list(p_state.hand_tiles)
+        if pid == player_state.player_id:
+            hand.append(discard.tile)
+        hands_counts.append(Counter(tile // 4 for tile in hand))
+    return hands_counts
+
+
 class MatchValidator:
     """
     舍牌匹配后的统一约束验证器。
@@ -467,7 +500,10 @@ class MatchValidator:
 
     def __init__(self, params: Dict):
         self.params = params
-        self.prior_discard_exclusion = params.get("prior_discard_exclusion")
+        # 多条前段禁打（list of lines）时与单条一致：非空即启用校验
+        self.prior_discard_exclusion = normalize_prior_discard_exclusion_list(
+            params.get("prior_discard_exclusion")
+        )
         self.dora_constraint = params.get("dora_constraint")
         self.dora_position_spec = params.get("dora_position_spec") or []
         self.riichi_constraint = params.get("riichi_constraint")
@@ -519,7 +555,14 @@ class MatchValidator:
             return False
         if not self._check_hand_visible_constraints(discard, matched_variant, player_state, round_players):
             return False
+        if not self._check_player_visible_constraints(
+            discard, matched_variant, player_state, round_players
+        ):
+            return False
         if not self._check_target_discard_exclusion(discard, matched_variant, match_ctx):
+            return False
+        # 即时铳率：模式达成之前，目标玩家不得曾打出过任一假想目标牌（多目标取并集）
+        if not self._check_instant_prior_no_target_discard(matched_variant, match_ctx):
             return False
         return True
 
@@ -529,10 +572,9 @@ class MatchValidator:
         """禁打校验：前段禁打（prior_discard_exclusion）相关：匹配点之前不得出现禁止牌。"""
         if not self.prior_discard_exclusion:
             return True
-        excl_str = matched_variant.get("prior_discard_exclusion")
-        if not excl_str:
+        forbidden = get_prior_discard_exclusion_forbidden_bases(matched_variant)
+        if not forbidden:
             return True
-        forbidden = get_forbidden_bases_from_exclusion_str(excl_str)
         start_idx = matched_variant.get("matched_start_index")
         if start_idx is not None:
             prior_tiles = full_discards[:start_idx]
@@ -657,49 +699,26 @@ class MatchValidator:
         if not hvc:
             return True
 
-        # 获取当前瞬间所有玩家的巡目
         all_turns = getattr(discard, "all_players_turns", None)
-        if all_turns is None or len(all_turns) != 4:
+        hands_counts = _hands_counters_at_discard_moment(discard, player_state, round_players)
+        if hands_counts is None or all_turns is None:
             return True
 
-        # 1. 统计当前瞬间全场已暴露（非隐藏）的牌。
-        # 隐藏牌 = 4名玩家的手牌 + 牌山。
-        # 已暴露 = 舍牌 + 副露 + 宝牌指示牌。
+        # 1. 统计当前瞬间全场已暴露（非隐藏）的牌（舍牌+副露+表宝指示）。
         global_exposed = Counter()
         for p in round_players:
             p_turn = all_turns[p.player_id]
-            # 舍牌
             for d in p.discards:
                 if d.turn <= p_turn:
                     global_exposed[d.tile // 4] += 1
-            # 副露
             for c in p.calls:
                 if getattr(c, "from_discard_turn", 1) <= p_turn:
                     global_exposed[MjlogParser.string_to_tile(c.pai)] += 1
                     for cp in c.consumed:
                         global_exposed[MjlogParser.string_to_tile(cp)] += 1
-        # 宝牌指示牌
         if round_players:
             for ind in round_players[0].dora_indicators:
                 global_exposed[ind // 4] += 1
-
-        # 2. 统计当前瞬间各玩家的手牌
-        hands_counts = []
-        for pid in range(4):
-            t = all_turns[pid]
-            p_state = round_players[pid]
-            if t == 0:
-                hand = list(p_state.initial_hand)
-            elif t <= len(p_state.hand_tiles_history):
-                hand = list(p_state.hand_tiles_history[t - 1])
-            else:
-                hand = list(p_state.hand_tiles)
-            
-            # 若是当前行动玩家（满足模式的玩家），其手牌应包含刚刚打出的这张牌
-            if pid == player_state.player_id:
-                hand.append(discard.tile)
-            
-            hands_counts.append(Counter(tile // 4 for tile in hand))
 
         # 3. 计算牌山中剩余各牌的枚数
         # Wall(T) = 4 - Exposed(T) - Sum(Hand(all, T))
@@ -734,6 +753,32 @@ class MatchValidator:
                 if hand_c > max_c or (hand_c + wall_c) < min_c:
                     return False
         
+        return True
+
+    def _check_player_visible_constraints(
+        self, discard, matched_variant: Dict, player_state, round_players: List
+    ) -> bool:
+        """
+        玩家可见（player visible）：目标玩家手牌中该牌枚数 + 场上可见（visible_tiles 口径）须在范围内。
+        手牌为打出瞬间计数，与延伸手牌逻辑一致，含本张打出牌。
+        """
+        pvc = matched_variant.get("player_visible_constraints")
+        if not pvc:
+            return True
+        hands_counts = _hands_counters_at_discard_moment(discard, player_state, round_players)
+        if hands_counts is None:
+            return True
+        tp = player_state.player_id
+        for tile_str, (min_c, max_c) in pvc.items():
+            base_code = MjlogParser.string_to_tile(tile_str)
+            equiv_bases = MjlogParser.get_count_equivalent_bases(base_code)
+            hand_c = sum(hands_counts[tp][b] for b in equiv_bases)
+            field_c = sum(
+                c for t, c in player_state.visible_tiles.items() if t // 4 in equiv_bases
+            )
+            total = hand_c + field_c
+            if not (min_c <= total <= max_c):
+                return False
         return True
 
     def _check_target_discard_exclusion(
@@ -773,6 +818,42 @@ class MatchValidator:
                         target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
         if discard.tile // 4 in target_equiv:
             return False
+        return True
+
+    def _check_instant_prior_no_target_discard(self, matched_variant: Dict, match_ctx: Dict) -> bool:
+        """
+        即时铳率（instant deal-in）专用：本局内、达成舍牌模式的那一打「之前」，
+        目标玩家不得曾打出过任一统计用目标牌（多目标为 base 并集，含赤五等价）。
+        使用 discard_orig_i 遍历 player_state.discards，避免 grid 模式仅截断巡目窗口导致漏检。
+        """
+        if not self.use_deal_in_instant:
+            return True
+        player_state = match_ctx.get("player_state")
+        orig_i = match_ctx.get("discard_orig_i")
+        if player_state is None or orig_i is None:
+            return True
+        mapped_target = matched_variant.get("target")
+        if mapped_target is None:
+            return True
+        target_equiv: set = set()
+        if isinstance(mapped_target, list):
+            for t in mapped_target:
+                if t:
+                    target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
+        else:
+            target_equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
+        if not target_equiv:
+            return True
+        discards = getattr(player_state, "discards", None) or []
+        for i in range(int(orig_i)):
+            if i >= len(discards):
+                break
+            prev = discards[i]
+            t_base = getattr(prev, "tile", None)
+            if t_base is None:
+                continue
+            if (t_base // 4) in target_equiv:
+                return False
         return True
 
 
@@ -1254,7 +1335,7 @@ def _core_match_engine(
                 "jikaze": MjlogParser.get_jikaze(
                     player_state.player_id, player_state.oya, player_state.round_num
                 ),
-                "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
+                "bakaze": MjlogParser.get_bakaze(player_state.round_num),
                 "kyokuze_list": MjlogParser.get_kyokuze_list(
                     player_state.player_id, player_state.oya, player_state.round_num
                 ),
@@ -1341,6 +1422,7 @@ def _core_match_engine(
                     "prior_discards_for_exclusion": prior_discards_for_exclusion,
                     "multi_t": multi_t,
                     "item_combo": is_combo,
+                    "discard_orig_i": orig_i,
                 }
 
                 if not validator.validate_all(discard, matched_variant, match_ctx):
@@ -1408,6 +1490,7 @@ def _core_match_engine(
                 "turn_range": turn_range,
                 "first_turn_in_range": first_turn_in_range,
                 "prior_discards_for_exclusion": prior_discards_for_exclusion,
+                "discard_orig_i": orig_i,
             }
 
             for idx, (vars_p, _, item_combo) in enumerate(item_variants):
@@ -1454,6 +1537,28 @@ def _core_match_engine(
                 break  # Analyze 模式：首匹配即产出，不再尝试其余 item
 
 
+def _merge_instant_grid_detail(dst: Dict, src: Dict) -> None:
+    """将单条 log 的即时铳率矩阵增量合并到累加器（total、各目标 hits/points）。"""
+    dst["total"] = dst.get("total", 0) + src.get("total", 0)
+    dst_targets = dst.setdefault("targets", {})
+    for tk, st in src.get("targets", {}).items():
+        t = dst_targets.setdefault(tk, {"hits": 0, "points": 0})
+        t["hits"] += int(st.get("hits", 0))
+        t["points"] += int(st.get("points", 0))
+
+
+def _instant_grid_target_keys(multi_t: Optional[List]) -> List[str]:
+    """
+    与矩阵 worker 中按 multi_t 展开目标键一致（非 combo 项），供表头与 UI 勾选序列排序。
+    """
+    out: List[str] = []
+    for tiles, is_cb in multi_t or []:
+        if is_cb:
+            continue
+        out.append("".join(sorted(tiles)) if is_cb else tiles[0])
+    return out
+
+
 def _process_one_log_grid(task: Tuple) -> Dict:
     """
     Per-log 并行 worker：处理单条牌谱，返回该log 对各格的增量统计。
@@ -1462,8 +1567,11 @@ def _process_one_log_grid(task: Tuple) -> Dict:
     log_id, log_content, params = task
     use_tenpai = params.get("use_tenpai", False)
     use_related_tile = params.get("use_related_tile", False)
+    use_deal_in_instant = params.get("use_deal_in_instant", False)
     independence_filter = bool(params.get("independence_filter", False))
     grid_meta = params.get("grid_meta") or []
+    hypothetical_furiten_list = params.get("hypothetical_furiten_list") or []
+    norm_oya = bool(params.get("instant_normalize_oya_ron_to_ko", False))
 
     def _target_key(tiles: List[str], is_combo: bool) -> str:
         return "".join(sorted(tiles)) if is_combo else tiles[0]
@@ -1478,6 +1586,13 @@ def _process_one_log_grid(task: Tuple) -> Dict:
                 parsed_tenhou6 = json.loads(raw)
             except Exception:
                 parsed_tenhou6 = None
+        # 即时铳率（instant deal-in）矩阵：与主分析相同，需 tenhou6 事件流重放
+        round_payloads: List = []
+        if use_deal_in_instant:
+            if parsed_tenhou6 is not None:
+                round_payloads = extract_tenhou6_rounds(parsed_tenhou6)
+            else:
+                round_payloads = extract_tenhou6_rounds(_raw_to_tenhou6_for_instant(raw))
         pre_gs: Optional[List[GameState]] = None
         if parsed_tenhou6 is not None:
             try:
@@ -1493,9 +1608,12 @@ def _process_one_log_grid(task: Tuple) -> Dict:
         else:
             matches = _core_match_engine(raw, params, is_grid=True)
 
+        instant_analyzers: Dict = {}
+
         for m in matches:
             player_state = m["player_state"]
             round_players = m["round_players"]
+            round_idx = m["round_idx"]
             discard = m["discard"]
             orig_i = m["orig_i"]
             matched_variant = m["variant"]
@@ -1505,6 +1623,117 @@ def _process_one_log_grid(task: Tuple) -> Dict:
             multi_t = m.get("multi_t") or []
             is_combo = m.get("is_combo", False)
             tr_idx, pat_idx = m["matched_idx"]
+
+            k = (tr_idx, pat_idx)
+
+            # 矩阵 × 即时铳率：每格统计 {0: 非可铳, 1: 可铳}，与听牌矩阵同样用 merge_keys=[1] 展示占比
+            if use_deal_in_instant:
+                round_payload = round_payloads[round_idx] if round_idx < len(round_payloads) else None
+                if round_idx not in instant_analyzers and round_payload:
+                    try:
+                        rp_data, rp_events = round_payload
+                        instant_analyzers[round_idx] = RoundInstantDealInAnalyzer(
+                            rp_data, rp_events,
+                            player_state.round_num, player_state.oya,
+                            normalize_oya_ron_to_ko=norm_oya,
+                        )
+                    except Exception:
+                        logger.exception("即时铳率引擎初始化失败（矩阵 worker 本局跳过）")
+                        instant_analyzers[round_idx] = None
+                round_instant_analyzer = instant_analyzers.get(round_idx)
+                mapped_target = matched_variant.get("target")
+                mt_item = list(multi_t)
+                multi_target = len(mt_item) > 1
+                instant_eval: Dict = {}
+                instant_eval_multi: Dict = {}
+                excluded_this_match_by_hypothetical_furiten = False
+
+                if round_instant_analyzer:
+                    if multi_target:
+                        m_targets = matched_variant["target"]
+                        if isinstance(m_targets, str):
+                            m_targets = [m_targets]
+                        if len(m_targets) == len(mt_item):
+                            for j, (tiles, is_cb) in enumerate(mt_item):
+                                if is_cb:
+                                    continue
+                                tk = _target_key(tiles, is_cb)
+                                mapped_t = m_targets[j]
+                                instant_eval_multi[tk] = round_instant_analyzer.evaluate(
+                                    player_state.player_id, discard.turn, mapped_t
+                                )
+                            any_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
+                            if any_hit and hypothetical_furiten_list:
+                                tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                    round_instant_analyzer, player_state.player_id, discard.turn,
+                                    hypothetical_furiten_list, matched_variant.get("mapping"),
+                                    mapped_targets_to_skip=m_targets,
+                                    matched_variant=matched_variant,
+                                )
+                                if tiles_deal_in:
+                                    excluded_this_match_by_hypothetical_furiten = True
+                            first_tk = _target_key(mt_item[0][0], mt_item[0][1])
+                            instant_eval = instant_eval_multi.get(first_tk, {})
+                        else:
+                            raise ValueError(
+                                "多目标即时铳率：变体 target 与当前条目标数量不一致 "
+                                "(len(m_targets)=%s, len(mt_item)=%s)"
+                                % (len(m_targets), len(mt_item))
+                            )
+                    else:
+                        mapped_target_str = mapped_target if isinstance(mapped_target, str) else (
+                            mapped_target[0] if mapped_target else None
+                        )
+                        if mapped_target_str:
+                            instant_eval = round_instant_analyzer.evaluate(
+                                player_state.player_id, discard.turn, mapped_target_str
+                            )
+                        if instant_eval.get("deal_in_hit") and hypothetical_furiten_list:
+                            tiles_deal_in = _get_hypothetical_furiten_deal_in_tiles(
+                                round_instant_analyzer, player_state.player_id, discard.turn,
+                                hypothetical_furiten_list, matched_variant.get("mapping"),
+                                mapped_targets_to_skip=mapped_target_str,
+                                matched_variant=matched_variant,
+                            )
+                            if tiles_deal_in:
+                                excluded_this_match_by_hypothetical_furiten = True
+
+                cell_hit = False
+                if not excluded_this_match_by_hypothetical_furiten:
+                    if multi_target:
+                        cell_hit = any(ev.get("deal_in_hit") for ev in instant_eval_multi.values())
+                    else:
+                        cell_hit = bool(instant_eval.get("deal_in_hit"))
+                target_count = 1 if cell_hit else 0
+
+                if k not in result:
+                    result[k] = {0: 0, 1: 0, "_instant_detail": {"total": 0, "targets": {}}}
+                elif "_instant_detail" not in result[k]:
+                    result[k]["_instant_detail"] = {"total": 0, "targets": {}}
+                result[k][target_count] = result[k].get(target_count, 0) + 1
+                idetail = result[k]["_instant_detail"]
+                idetail["total"] += 1
+                # 按目标牌累计可铳次数与点数（多目标分开；假想振听排除则本样本对各目标均不计入可铳）
+                _tks_order = []
+                for _tiles, _is_cb in mt_item:
+                    if _is_cb:
+                        continue
+                    _tks_order.append(_target_key(_tiles, _is_cb))
+                for _tk in _tks_order:
+                    if _tk not in idetail["targets"]:
+                        idetail["targets"][_tk] = {"hits": 0, "points": 0}
+                    if excluded_this_match_by_hypothetical_furiten:
+                        continue
+                    if multi_target:
+                        _ev = instant_eval_multi.get(_tk, {})
+                        if _ev.get("deal_in_hit"):
+                            idetail["targets"][_tk]["hits"] += 1
+                            idetail["targets"][_tk]["points"] += int(_ev.get("deal_in_point", 0))
+                    else:
+                        if instant_eval.get("deal_in_hit"):
+                            idetail["targets"][_tk]["hits"] += 1
+                            idetail["targets"][_tk]["points"] += int(instant_eval.get("deal_in_point", 0))
+                continue
 
             # 计算 target_count（含 use_tenpai、use_related_tile、multi_t、is_combo）
             hand_after_by_index = honor_ctx.get("hand_after_by_index") or []
@@ -1614,6 +1843,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     use_deal_in_instant = params.get("use_deal_in_instant", False)
     multi_target = params.get("multi_target", False)
     independence_filter = bool(params.get("independence_filter", False))
+    use_yaku_hai_hand = bool(params.get("use_yaku_hai_hand", False))
     cap = params.get("cap", MATCHED_STATES_CAP)
     worker_matched_states_cap = max(
         1, min(cap, int(params.get("worker_matched_states_cap", cap)))
@@ -1631,7 +1861,19 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
     deal_in_hits = 0
     deal_in_point_sum = 0
     pattern_matches = [0] * len(items)
-    if params.get("multi_target"):
+    if use_yaku_hai_hand:
+        def _yh() -> Dict[int, int]:
+            return {i: 0 for i in range(6)}
+
+        # 聚合：役牌种类 kinds（0～5）与役牌「对」副数 pair_units（四桶：零对/一对/两对/三对及以上）
+        def _pu() -> Dict[int, int]:
+            return {i: 0 for i in range(4)}
+
+        pattern_distributions = [
+            {"kinds": _yh(), "pair_units": _pu()}
+            for _ in item_variants
+        ]
+    elif params.get("multi_target"):
         pattern_distributions = [
             {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or use_related_tile or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
              for t in item_multi_targets[idx]}
@@ -1779,7 +2021,29 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                 )
 
-            if use_tenpai:
+            # 役牌统计：按 player_id/oya/round_num 定役牌集合，聚合 kinds + pair_units（对副四桶）
+            yaku_hai_bundle = None
+            if use_yaku_hai_hand:
+                yaku_bases = MjlogParser.yaku_honor_bases_for_seat(
+                    player_state.player_id, player_state.oya, player_state.round_num
+                )
+                st = compute_yaku_hai_hand_stats(hand_at_turn, yaku_bases)
+                yaku_per_tile = yaku_hai_per_tile_counts(hand_at_turn, yaku_bases)
+                pattern_distributions[matched_idx]["kinds"][st["kinds"]] += 1
+                pattern_distributions[matched_idx]["pair_units"][
+                    yaku_pair_units_bucket(st["pair_kinds"])
+                ] += 1
+                target_count = st["pair_kinds"]
+                target_counts = None
+                yaku_hai_bundle = {
+                    **st,
+                    "pair_units": yaku_pair_units_bucket(st["pair_kinds"]),
+                    "per_tile": yaku_per_tile,
+                    "seat_yaku_labels": sorted(
+                        MjlogParser.tile_to_string(b * 4) for b in yaku_bases
+                    ),
+                }
+            elif use_tenpai:
                 target_count = 1 if is_tenpai(hand_at_turn) else 0
                 target_counts = None
             elif use_related_tile:
@@ -1935,7 +2199,9 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                             deal_in_hits += 1
                             deal_in_point_sum += int(instant_eval.get("deal_in_point", 0))
 
-            if len(mt_item) > 1 and target_counts:
+            if use_yaku_hai_hand:
+                pass
+            elif len(mt_item) > 1 and target_counts:
                 for k, cnt in target_counts.items():
                     pattern_distributions[matched_idx][k][cnt] = pattern_distributions[matched_idx][k].get(cnt, 0) + 1
             else:
@@ -1981,6 +2247,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     ms_entry["target_counts"] = target_counts
                 else:
                     ms_entry["target_count"] = target_count
+                if yaku_hai_bundle is not None:
+                    ms_entry["yaku_hai"] = yaku_hai_bundle
                 if use_deal_in_instant:
                     _slim_ie = _ipc_copy_instant_eval(instant_eval)
                     if excluded_this_match_by_hypothetical_furiten:
@@ -2043,6 +2311,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     sp_entry["target_counts"] = target_counts
                 else:
                     sp_entry["target_count"] = target_count
+                if yaku_hai_bundle is not None:
+                    sp_entry["yaku_hai"] = yaku_hai_bundle
                 if use_deal_in_instant:
                     _slim_sp = _ipc_copy_instant_eval(instant_eval)
                     if excluded_this_match_by_hypothetical_furiten:
@@ -2150,6 +2420,7 @@ class LiveAnalyzer:
         target_no_call: bool = False,  # 目标无副露：仅针对分析目标的玩家在满足舍牌模式的瞬间没有副露
         call_area_constraints: Optional[List[str]] = None,  # 副露区域约束，最多4个AND
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,  # 手牌可见枚数约束（延伸手牌）
+        player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,  # 玩家可见：目标玩家手牌+场上可见合并计数
         analysis_target: str = "target_count",  # "target_count"=目标牌存在 "tenpai"=是否听牌
         turn_range: Optional[Tuple[int, int]] = None,  # (min_turn, max_turn) 如(2, 8)
         sample_limit: Optional[int] = None,
@@ -2160,7 +2431,7 @@ class LiveAnalyzer:
         analysis_batch_size: Optional[int] = None,  # 每批从数据库读取的对局数，None 用默认ANALYSIS_BATCH_SIZE
         exclude_south4: bool = False,  # 南四局打法随点数变化大，True 时跳过
         exclude_south3: bool = False,  # True 时跳过南三局，可与 exclude_south4 同选
-        prior_discard_exclusion: Optional[str] = None,  # 前段不可打，与舍牌模式同步等价变换
+        prior_discard_exclusion: Optional[Union[str, List[str]]] = None,  # 前段不可打；多行/列表时每条并集禁打 base
         prior_discard_required: Optional[str] = None,  # 前段有打：匹配前须出现过该舍牌模式，语法同舍牌模式
         hypothetical_furiten_tiles: Optional[str] = None,  # 假想振听牌，如 6p 或 6p,7p；若也会放铳则不计入主铳率
         max_workers: Optional[int] = None,
@@ -2254,7 +2525,16 @@ class LiveAnalyzer:
                 if len(multi_t) > 1
                 else _target_str_for_variant(first_t[0], first_t[1])
             )
-            vars_p = generate_equivalent_variants(p, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required, hand_visible_constraints)
+            vars_p = generate_equivalent_variants(
+                p,
+                variant_target,
+                visible_constraints,
+                prior_discard_exclusion,
+                call_area_constraints,
+                prior_discard_required,
+                hand_visible_constraints,
+                player_visible_constraints,
+            )
             combo = first_t[1] if len(multi_t) == 1 else False
             item_variants.append((vars_p, t, combo))
 
@@ -2273,7 +2553,12 @@ class LiveAnalyzer:
         first_t0 = multi_targets[0]
         is_combo = first_t0[1] and len(multi_targets) == 1
         use_tenpai = (analysis_target == "tenpai")
+        use_yaku_hai_hand = (analysis_target == "yaku_hai_hand")
         multi_target = len(multi_targets) > 1
+        # 役牌统计不使用多目标存量语义，避免分布结构冲突（占位目标仍可生成变体）
+        if use_yaku_hai_hand:
+            multi_target = False
+            is_combo = False
         # 独立性筛选仅对「目标牌存量」有意义，其它分析目标忽略该开关
         eff_independence_filter = bool(independence_filter) and analysis_target == "target_count"
 
@@ -2295,7 +2580,22 @@ class LiveAnalyzer:
         outcome_wins_total = 0
         outcome_deal_ins_total = 0
         pattern_matches = [0] * len(items)
-        if multi_target:
+        if use_yaku_hai_hand:
+            # 役牌：kinds（0～5）+ pair_units（四桶）
+            def _yaku_hist_kinds() -> Dict[int, int]:
+                return {i: 0 for i in range(6)}
+
+            def _yaku_hist_pair_units() -> Dict[int, int]:
+                return {i: 0 for i in range(4)}
+
+            pattern_distributions = [
+                {
+                    "kinds": _yaku_hist_kinds(),
+                    "pair_units": _yaku_hist_pair_units(),
+                }
+                for _ in item_variants
+            ]
+        elif multi_target:
             pattern_distributions = [
                 {_target_key(t[0], t[1]): ({0: 0, 1: 0} if (use_tenpai or use_related_tile or t[1]) else {0: 0, 1: 0, 2: 0, 3: 0})
                  for t in item_multi_targets[idx]}
@@ -2348,12 +2648,12 @@ class LiveAnalyzer:
             "target_no_call": target_no_call,
             "call_area_constraints": call_area_constraints,
             "hand_visible_constraints": hand_visible_constraints,
+            "player_visible_constraints": player_visible_constraints,
             "call_area_constraint_sets": call_area_constraint_sets,
             "consumed_search_list": consumed_search_list,
             "exclude_south4": exclude_south4,
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
-            "hand_visible_constraints": hand_visible_constraints,
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
             "use_tenpai": use_tenpai,
@@ -2367,6 +2667,7 @@ class LiveAnalyzer:
             "worker_matched_states_cap": worker_matched_states_cap,
             "worker_sample_pool_cap": worker_sample_pool_cap,
             "independence_filter": eff_independence_filter,
+            "use_yaku_hai_hand": use_yaku_hai_hand,
         }
         if use_parallel:
             logger.info(f"开始分析（并行 workers={workers}）..")
@@ -2552,7 +2853,19 @@ class LiveAnalyzer:
 
         target_count_distribution = pattern_distributions[0]
         probability_distribution = {}
-        if multi_target:
+        if use_yaku_hai_hand:
+            n0 = max(1, pattern_matches[0])
+            probability_distribution = {
+                "kinds": {
+                    c: (target_count_distribution["kinds"].get(c, 0) / n0 * 100)
+                    for c in range(6)
+                },
+                "pair_units": {
+                    c: (target_count_distribution["pair_units"].get(c, 0) / n0 * 100)
+                    for c in range(4)
+                },
+            }
+        elif multi_target:
             target_tiles = [_target_key(t[0], t[1]) for t in multi_targets]
             for tk in target_tiles:
                 dist_t = target_count_distribution.get(tk, {0: 0, 1: 0, 2: 0, 3: 0})
@@ -2570,7 +2883,13 @@ class LiveAnalyzer:
         for idx, (p, t) in enumerate(items):
             dist = pattern_distributions[idx]
             mt = item_multi_targets[idx]
-            if len(mt) > 1:
+            if use_yaku_hai_hand:
+                ni = max(1, pattern_matches[idx])
+                prob = {
+                    "kinds": {c: (dist["kinds"].get(c, 0) / ni * 100) for c in range(6)},
+                    "pair_units": {c: (dist["pair_units"].get(c, 0) / ni * 100) for c in range(4)},
+                }
+            elif len(mt) > 1:
                 prob = {}
                 for tk in dist:
                     prob_t = {}
@@ -2589,7 +2908,7 @@ class LiveAnalyzer:
                 'matches': pattern_matches[idx],
                 'target_count_distribution': dist,
                 'probability_distribution': prob,
-                'is_combo': item_variants[idx][2],
+                'is_combo': False if use_yaku_hai_hand else item_variants[idx][2],
                 'multi_target': len(mt) > 1,
                 'target_tiles': [_target_key(x[0], x[1]) for x in mt] if len(mt) > 1 else None,
             }
@@ -2670,7 +2989,7 @@ class LiveAnalyzer:
 
         logger.info(f"analysis complete: matched {total_matches} states")
         # 样本一致性校验：抽查样本池中前若干条，确认 actual_pattern 能重新匹配
-        if sample_pool and total_matches > 0:
+        if sample_pool and total_matches > 0 and analysis_target != "yaku_hai_hand":
             check_n = min(20, len(sample_pool))
             fail_count = 0
             for s in sample_pool[:check_n]:
@@ -2679,6 +2998,7 @@ class LiveAnalyzer:
                 ok, err = verify_sample_consistency(
                     s, qp, tt, visible_constraints,
                     hand_visible_constraints=hand_visible_constraints,
+                    player_visible_constraints=player_visible_constraints,
                     prior_discard_exclusion=prior_discard_exclusion,
                     call_area_constraints=call_area_constraints,
                 )
@@ -2710,6 +3030,18 @@ class LiveAnalyzer:
                 pd = probability_distribution.get(tk, {})
                 td = target_count_distribution.get(tk, {})
                 logger.info(f"  {tk}: 0寮?{pd.get(0,0):.2f}% 1寮?{pd.get(1,0):.2f}% 2寮?{pd.get(2,0):.2f}% 3寮?{pd.get(3,0):.2f}%")
+        elif use_yaku_hai_hand:
+            pd_k = probability_distribution.get("kinds", {})
+            td_k = target_count_distribution.get("kinds", {})
+            parts_k = [f"{i}:{pd_k.get(i, 0):.1f}%({td_k.get(i, 0):,}例)" for i in range(6)]
+            logger.info("  役牌种类(>=1枚): %s", " ".join(parts_k))
+            pd_u = probability_distribution.get("pair_units", {})
+            td_u = target_count_distribution.get("pair_units", {})
+            _pu_names = ("零对", "一对", "两对", "三对及以上")
+            parts_u = [
+                f"{_pu_names[i]}:{pd_u.get(i, 0):.1f}%({td_u.get(i, 0):,}例)" for i in range(4)
+            ]
+            logger.info("  役牌对副数(每种役牌>=2枚计1副,刻子仍计1副): %s", " ".join(parts_u))
         elif use_tenpai:
             logger.info(f"  未听牌: {probability_distribution[0]:.2f}% ({target_count_distribution[0]:,} 例")
             logger.info(f"  听牌: {probability_distribution[1]:.2f}% ({target_count_distribution[1]:,} 例")
@@ -2736,6 +3068,7 @@ class LiveAnalyzer:
         dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         target_no_call: bool = False,
@@ -2746,7 +3079,7 @@ class LiveAnalyzer:
         should_cancel: Optional[Callable[[], bool]] = None,
         exclude_south4: bool = False,
         exclude_south3: bool = False,
-        prior_discard_exclusion: Optional[str] = None,
+        prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
         prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
     ) -> Dict:
@@ -2765,6 +3098,7 @@ class LiveAnalyzer:
             dora_position_spec=dora_position_spec,
             visible_constraints=visible_constraints,
             hand_visible_constraints=hand_visible_constraints,
+            player_visible_constraints=player_visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
             target_no_call=target_no_call,
@@ -2801,6 +3135,8 @@ class LiveAnalyzer:
         dora_constraint: Optional[str] = None,
         dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         target_no_call: bool = False,
@@ -2811,7 +3147,7 @@ class LiveAnalyzer:
         should_cancel: Optional[Callable[[], bool]] = None,
         exclude_south4: bool = False,
         exclude_south3: bool = False,
-        prior_discard_exclusion: Optional[str] = None,
+        prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
         prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
@@ -2826,6 +3162,8 @@ class LiveAnalyzer:
             dora_constraint=dora_constraint,
             dora_position_spec=dora_position_spec,
             visible_constraints=visible_constraints,
+            hand_visible_constraints=hand_visible_constraints,
+            player_visible_constraints=player_visible_constraints,
             riichi_constraint=riichi_constraint,
             call_constraint=call_constraint,
             target_no_call=target_no_call,
@@ -2869,6 +3207,7 @@ class LiveAnalyzer:
         dora_position_spec: Optional[List[int]] = None,
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         target_no_call: bool = False,
@@ -2880,11 +3219,13 @@ class LiveAnalyzer:
         analysis_batch_size: Optional[int] = None,
         exclude_south4: bool = False,
         exclude_south3: bool = False,
-        prior_discard_exclusion: Optional[str] = None,
+        prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
         prior_discard_required: Optional[str] = None,
         max_workers: Optional[int] = None,
         gc_interval_batches: Optional[int] = None,
         independence_filter: bool = False,
+        hypothetical_furiten_tiles: Optional[str] = None,
+        instant_normalize_oya_ron_to_ko: bool = False,
     ) -> Dict:
         """
         单次扫描批量分析：舍牌模式 × 巡目范围 网格，一次遍历数据库得到所有单格格的合并率。
@@ -2897,23 +3238,61 @@ class LiveAnalyzer:
         def _target_key(tiles: List[str], is_combo: bool) -> str:
             return "".join(sorted(tiles)) if is_combo else tiles[0]
 
+        def _target_str_for_variant_grid(tiles: List[str], is_combo: bool) -> str:
+            return "".join(tiles) if is_combo else tiles[0]
+
         use_tenpai = (analysis_target == "tenpai")
         use_related_tile = (analysis_target == "related_tile")
         # 是否为「即时铳率」分析模式；用于 _should_run_memory_maintenance 区分内存维护策略（即时铳率下不必每批都做 GC）
         use_deal_in_instant = (analysis_target == "deal_in_instant")
         eff_grid_independence = bool(independence_filter) and analysis_target == "target_count"
-        keys = [0, 1] if (use_tenpai or use_related_tile) else [0, 1, 2, 3]
+        keys = [0, 1] if (use_tenpai or use_related_tile or use_deal_in_instant) else [0, 1, 2, 3]
         merge_keys_f = [k for k in merge_keys if k in keys] or keys[:2]
+        hypothetical_furiten_list: List[str] = []
+        if use_deal_in_instant and hypothetical_furiten_tiles and str(hypothetical_furiten_tiles).strip():
+            hypothetical_furiten_list = [
+                x.strip()
+                for x in hypothetical_furiten_tiles.replace(",", " ").split()
+                if x.strip()
+            ]
+
+        # 与 MatchValidator 一致：归一化后非空才跑前段禁打分支（避免 list/str 判真不一致）
+        _prior_discard_exclusion_effective = normalize_prior_discard_exclusion_list(
+            prior_discard_exclusion
+        )
 
         # 棰勬瀯寤烘瘡鏍肩殑变体与元数据
         grid_meta = []  # [(tr_idx, pat_idx, turn_range, item_variants, item_multi_targets, is_combo), ...]
         consumed_search_list = []
         for pat_idx, (pattern, target) in enumerate(patterns):
             multi_t = parse_multi_targets(target)
+            # 与主分析即时铳率相同：禁止 combo 目标与「.」通配（与 GUI 校验一致，避免 worker 内才失败）
+            if use_deal_in_instant:
+                if multi_t[0][1]:
+                    raise ValueError(
+                        "即时铳率分析不支持 combo 目标牌（如 4s-5s），请使用逗号分隔的多目标（如 4s,5s）"
+                    )
+                if "." in target:
+                    raise ValueError(
+                        "即时铳率分析不支持目标通配符（如 5.p），请使用 5p 或 0p 明确指定"
+                    )
             first_t = multi_t[0]
-            variant_target = ("".join(first_t[0]) if first_t[1] else first_t[0][0])
+            # 与 analyze_discard_pattern 一致：多目标须把全部目标拼入 generate_equivalent_variants，
+            # 否则变体 target 只有第一项，即时铳率会报 len(m_targets)!=len(mt_item)
+            variant_target = (
+                ",".join(t[0][0] for t in multi_t)
+                if len(multi_t) > 1
+                else _target_str_for_variant_grid(first_t[0], first_t[1])
+            )
             vars_p = generate_equivalent_variants(
-                pattern, variant_target, visible_constraints, prior_discard_exclusion, call_area_constraints, prior_discard_required, hand_visible_constraints
+                pattern,
+                variant_target,
+                visible_constraints,
+                prior_discard_exclusion,
+                call_area_constraints,
+                prior_discard_required,
+                hand_visible_constraints,
+                player_visible_constraints,
             )
             is_combo = first_t[1] and len(multi_t) == 1
             cs = get_consumed_search_patterns(pattern)
@@ -2944,10 +3323,12 @@ class LiveAnalyzer:
         for tr_idx, pat_idx, _, _, multi_t, is_combo in grid_meta:
             k = (tr_idx, pat_idx)
             if k not in grid_dist:
-                if use_tenpai or use_related_tile or is_combo:
+                if use_deal_in_instant or use_tenpai or use_related_tile or is_combo:
                     grid_dist[k] = {0: 0, 1: 0}
                 else:
                     grid_dist[k] = {0: 0, 1: 0, 2: 0, 3: 0}
+        # 即时铳率矩阵专用累加器：与 worker 返回的 _instant_detail 合并（按格、按目标牌 hits/points）
+        grid_instant_accum: Optional[Dict] = {} if use_deal_in_instant else None
 
         if total_logs_hint is not None and total_logs_hint > 0:
             total_logs = total_logs_hint
@@ -2976,14 +3357,19 @@ class LiveAnalyzer:
             "target_no_call": target_no_call,
             "call_area_constraints": call_area_constraints,
             "hand_visible_constraints": hand_visible_constraints,
+            "player_visible_constraints": player_visible_constraints,
             "call_area_constraint_sets": grid_call_area_sets,
             "consumed_search_list": consumed_search_list,
             "exclude_south4": exclude_south4,
             "exclude_south3": exclude_south3,
             "riichi_any": riichi_any,
-            "hand_visible_constraints": hand_visible_constraints,
             "use_tenpai": use_tenpai,
             "use_related_tile": use_related_tile,
+            "use_deal_in_instant": use_deal_in_instant,
+            "hypothetical_furiten_list": hypothetical_furiten_list,
+            "instant_normalize_oya_ron_to_ko": (
+                bool(instant_normalize_oya_ron_to_ko) if use_deal_in_instant else False
+            ),
             "prior_discard_exclusion": prior_discard_exclusion,
             "prior_discard_required": prior_discard_required,
             "independence_filter": eff_grid_independence,
@@ -3042,7 +3428,16 @@ class LiveAnalyzer:
                         for (tr_idx, pat_idx), delta in per_log_result.items():
                             k = (tr_idx, pat_idx)
                             for count, n in delta.items():
+                                if count == "_instant_detail":
+                                    continue
                                 grid_dist[k][count] = grid_dist[k].get(count, 0) + n
+                            if grid_instant_accum is not None:
+                                idet = delta.get("_instant_detail")
+                                if isinstance(idet, dict):
+                                    acc = grid_instant_accum.setdefault(
+                                        k, {"total": 0, "targets": {}}
+                                    )
+                                    _merge_instant_grid_detail(acc, idet)
                         processed += 1
                         if progress_callback and (processed <= 10 or processed % 10 == 0):
                             progress_callback(processed, total_logs)
@@ -3070,283 +3465,298 @@ class LiveAnalyzer:
                             _trim_process_memory()
                             return {"table": {}, "total_logs_analyzed": processed, "elapsed_seconds": round(time.perf_counter() - t0, 1)}
                         try:
-                            raw = _get_raw_content(log_content)
-                            if riichi_any and _is_tenhou6_json(raw):
-                                if "riichi" not in raw and "reach" not in raw:
-                                    processed += 1
-                                    if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                        progress_callback(processed, total_logs)
-                                    continue
-                            if consumed_search_list and _is_tenhou6_json(raw):
-                                if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
-                                    processed += 1
-                                    if progress_callback and (processed <= 10 or processed % 10 == 0):
-                                        progress_callback(processed, total_logs)
-                                    continue
-                            game_states = parse_log_to_game_states(raw)
-                            round_size = 4
-
-                            for round_start in range(0, len(game_states), round_size):
-                                round_players = game_states[round_start:round_start + round_size]
-                                if len(round_players) < round_size:
-                                    break
-                                rn = getattr(round_players[0], "round_num", 0)
-                                if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
-                                    continue
-                                oya = getattr(round_players[0], "oya", 0)
-                                dora_str = None
-                                if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
-                                    dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
-                                    if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
-                                        continue
-                                if consumed_search_list:
-                                    if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
-                                        continue
-                                if call_constraint or target_no_call or call_area_constraints or call_area_constraint_sets:
-                                    if not round_could_satisfy_call_constraints(
-                                        round_players, call_constraint,
-                                        None if call_area_constraint_sets else call_area_constraints,
-                                        oya, call_area_constraint_sets=call_area_constraint_sets,
-                                        target_no_call=target_no_call,
-                                    ):
-                                        continue
-                                if riichi_any:
-                                    if not any(
-                                        any(getattr(d, "is_riichi_declaration", False) for d in p.discards)
-                                        for p in round_players
-                                    ):
-                                        continue
-
-                                for player_state in round_players:
-                                    if not target_no_call and call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
-                                        continue
-                                    if call_area_constraint_sets:
-                                        if not player_could_satisfy_any_call_area_constraints(player_state, oya, call_area_constraint_sets):
+                            if use_deal_in_instant:
+                                per_log_result = _process_one_log_grid((log_id, log_content, grid_params))
+                                for (tr_idx, pat_idx), delta in per_log_result.items():
+                                    k = (tr_idx, pat_idx)
+                                    for count, n in delta.items():
+                                        if count == "_instant_detail":
                                             continue
-                                    elif call_area_constraints and not player_could_satisfy_call_area_constraints(
-                                        player_state, oya, call_area_constraints
-                                    ):
+                                        grid_dist[k][count] = grid_dist[k].get(count, 0) + n
+                                    if grid_instant_accum is not None:
+                                        idet = delta.get("_instant_detail")
+                                        if isinstance(idet, dict):
+                                            acc = grid_instant_accum.setdefault(
+                                                k, {"total": 0, "targets": {}}
+                                            )
+                                            _merge_instant_grid_detail(acc, idet)
+                            else:
+                                raw = _get_raw_content(log_content)
+                                if riichi_any and _is_tenhou6_json(raw):
+                                    if "riichi" not in raw and "reach" not in raw:
+                                        processed += 1
+                                        if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                            progress_callback(processed, total_logs)
                                         continue
-
-                                    all_discards = [
-                                        (i, d) for i, d in enumerate(player_state.discards)
-                                        if hasattr(d, "turn") and hasattr(d, "tile")
-                                    ]
-                                    if not all_discards:
+                                if consumed_search_list and _is_tenhou6_json(raw):
+                                    if not any(log_contains_consumed(raw, cs) for cs in consumed_search_list):
+                                        processed += 1
+                                        if progress_callback and (processed <= 10 or processed % 10 == 0):
+                                            progress_callback(processed, total_logs)
                                         continue
-                                    discards_precomputed = [
-                                        (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
-                                        for _, d in all_discards
-                                    ]
-                                    discard_riichi_flags = [
-                                        getattr(all_discards[i][1], "is_riichi_declaration", False)
-                                        for i in range(len(all_discards))
-                                    ]
-                                    honor_ctx_base = {
-                                        "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                        "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
-                                        "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
-                                        "calls": getattr(player_state, "calls", []),
-                                        "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
-                                    }
-
-                                    for j, (orig_i, discard) in enumerate(all_discards):
-                                        discard_turn = discard.turn
-
-                                        for tr_idx, pat_idx, turn_range, vars_p, multi_t, is_combo in grid_meta:
-                                            min_turn, max_turn = turn_range
-                                            if not (min_turn <= discard_turn <= max_turn):
+                                game_states = parse_log_to_game_states(raw)
+                                round_size = 4
+    
+                                for round_start in range(0, len(game_states), round_size):
+                                    round_players = game_states[round_start:round_start + round_size]
+                                    if len(round_players) < round_size:
+                                        break
+                                    rn = getattr(round_players[0], "round_num", 0)
+                                    if (exclude_south4 and rn == 7) or (exclude_south3 and rn == 6):
+                                        continue
+                                    oya = getattr(round_players[0], "oya", 0)
+                                    dora_str = None
+                                    if dora_constraint and dora_constraint != "any" and round_players[0].dora_indicators:
+                                        dora_str = MjlogParser.tile_to_string(round_players[0].dora_indicators[0])
+                                        if dora_constraint not in ("dora_unrelated", "dora_matches_position") and not _dora_matches_constraint(dora_str, dora_constraint):
+                                            continue
+                                    if consumed_search_list:
+                                        if not any(round_has_matching_consumed(round_players, cs) for cs in consumed_search_list):
+                                            continue
+                                    if call_constraint or target_no_call or call_area_constraints or call_area_constraint_sets:
+                                        if not round_could_satisfy_call_constraints(
+                                            round_players, call_constraint,
+                                            None if call_area_constraint_sets else call_area_constraints,
+                                            oya, call_area_constraint_sets=call_area_constraint_sets,
+                                            target_no_call=target_no_call,
+                                        ):
+                                            continue
+                                    if riichi_any:
+                                        if not any(
+                                            any(getattr(d, "is_riichi_declaration", False) for d in p.discards)
+                                            for p in round_players
+                                        ):
+                                            continue
+    
+                                    for player_state in round_players:
+                                        if not target_no_call and call_constraint == "no_call" and len(getattr(player_state, "calls", []) or []) > 0:
+                                            continue
+                                        if call_area_constraint_sets:
+                                            if not player_could_satisfy_any_call_area_constraints(player_state, oya, call_area_constraint_sets):
                                                 continue
-                                            in_range_for_cell = [
-                                                (idx, dd) for idx, dd in all_discards
-                                                if min_turn <= dd.turn <= max_turn and dd.turn <= discard_turn
-                                            ]
-                                            if not in_range_for_cell or in_range_for_cell[-1][1] != discard:
-                                                continue
-                                            # 与正常模式一致：使用从开局到当前舍牌的完整序列，否则会漏掉「模式前半在巡目外」的匹配
-                                            orig_i = in_range_for_cell[-1][0]
-                                            full_discards_up_to_now = discards_precomputed[: orig_i + 1]
-                                            riichi_flags_for_cell = discard_riichi_flags[: orig_i + 1]
-                                            visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
-                                            hand_after_by_index = [
-                                                list(player_state.hand_tiles_history[i]) if i < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
-                                                for i in range(len(full_discards_up_to_now))
-                                            ]
-                                            honor_ctx = {
-                                                **honor_ctx_base,
-                                                "visible_tiles": visible_with_own,
-                                                "current_discard_turn": discard_turn,
-                                                "discard_riichi_flags": riichi_flags_for_cell,
-                                                "hand_after_by_index": hand_after_by_index,
-                                            }
-                                            pattern, target = patterns[pat_idx]
-                                            cs = get_consumed_search_patterns(pattern)
-                                            if cs:
-                                                if not round_has_matching_consumed(round_players, cs):
+                                        elif call_area_constraints and not player_could_satisfy_call_area_constraints(
+                                            player_state, oya, call_area_constraints
+                                        ):
+                                            continue
+    
+                                        all_discards = [
+                                            (i, d) for i, d in enumerate(player_state.discards)
+                                            if hasattr(d, "turn") and hasattr(d, "tile")
+                                        ]
+                                        if not all_discards:
+                                            continue
+                                        discards_precomputed = [
+                                            (MjlogParser.tile_to_string(d.tile), d.is_tsumogiri)
+                                            for _, d in all_discards
+                                        ]
+                                        discard_riichi_flags = [
+                                            getattr(all_discards[i][1], "is_riichi_declaration", False)
+                                            for i in range(len(all_discards))
+                                        ]
+                                        honor_ctx_base = {
+                                            "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
+                                            "bakaze": MjlogParser.get_bakaze(player_state.round_num),
+                                            "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
+                                            "calls": getattr(player_state, "calls", []),
+                                            "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
+                                        }
+    
+                                        for j, (orig_i, discard) in enumerate(all_discards):
+                                            discard_turn = discard.turn
+    
+                                            for tr_idx, pat_idx, turn_range, vars_p, multi_t, is_combo in grid_meta:
+                                                min_turn, max_turn = turn_range
+                                                if not (min_turn <= discard_turn <= max_turn):
                                                     continue
-                                                if not player_has_matching_consumed(player_state, cs):
+                                                in_range_for_cell = [
+                                                    (idx, dd) for idx, dd in all_discards
+                                                    if min_turn <= dd.turn <= max_turn and dd.turn <= discard_turn
+                                                ]
+                                                if not in_range_for_cell or in_range_for_cell[-1][1] != discard:
                                                     continue
-                                            matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
-                                            if not matched_variant:
-                                                continue
-                                            if prior_discard_exclusion:
-                                                excl_str = matched_variant.get("prior_discard_exclusion")
-                                                if excl_str:
-                                                    forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
-                                                    start_idx = matched_variant.get("matched_start_index")
-                                                    if start_idx is not None:
-                                                        prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
-                                                        # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
-                                                        if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
+                                                # 与正常模式一致：使用从开局到当前舍牌的完整序列，否则会漏掉「模式前半在巡目外」的匹配
+                                                orig_i = in_range_for_cell[-1][0]
+                                                full_discards_up_to_now = discards_precomputed[: orig_i + 1]
+                                                riichi_flags_for_cell = discard_riichi_flags[: orig_i + 1]
+                                                visible_with_own = _visible_tiles_with_own_discards(player_state.visible_tiles, full_discards_up_to_now)
+                                                hand_after_by_index = [
+                                                    list(player_state.hand_tiles_history[i]) if i < len(player_state.hand_tiles_history) else list(player_state.hand_tiles)
+                                                    for i in range(len(full_discards_up_to_now))
+                                                ]
+                                                honor_ctx = {
+                                                    **honor_ctx_base,
+                                                    "visible_tiles": visible_with_own,
+                                                    "current_discard_turn": discard_turn,
+                                                    "discard_riichi_flags": riichi_flags_for_cell,
+                                                    "hand_after_by_index": hand_after_by_index,
+                                                }
+                                                pattern, target = patterns[pat_idx]
+                                                cs = get_consumed_search_patterns(pattern)
+                                                if cs:
+                                                    if not round_has_matching_consumed(round_players, cs):
+                                                        continue
+                                                    if not player_has_matching_consumed(player_state, cs):
+                                                        continue
+                                                matched_variant = match_discard_to_variant(full_discards_up_to_now, vars_p, honor_ctx)
+                                                if not matched_variant:
+                                                    continue
+                                                if _prior_discard_exclusion_effective:
+                                                    forbidden = get_prior_discard_exclusion_forbidden_bases(matched_variant)
+                                                    if forbidden:
+                                                        start_idx = matched_variant.get("matched_start_index")
+                                                        if start_idx is not None:
+                                                            prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
+                                                            # string_to_tile 返回 base(0-36)，forbidden 亦为 base 集合，直接用 in，勿用 // 4
+                                                            if any(MjlogParser.string_to_tile(t[0]) in forbidden for t in prior_tiles):
+                                                                continue
+                                                        elif turn_range:
+                                                            first_turn_in_range = in_range_for_cell[0][1].turn
+                                                            prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
+                                                            # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
+                                                            if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                                continue
+                                                if matched_variant.get("prior_discard_required"):
+                                                    prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
+                                                    if prior_req_variants:
+                                                        start_idx = matched_variant.get("matched_start_index")
+                                                        if start_idx is not None and start_idx > 0:
+                                                            prior_tiles = full_discards_up_to_now[:start_idx]
+                                                        elif turn_range:
+                                                            first_turn_in_range = in_range_for_cell[0][1].turn
+                                                            prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
+                                                        else:
+                                                            prior_tiles = []
+                                                        if not prior_tiles:
                                                             continue
-                                                    elif turn_range:
-                                                        first_turn_in_range = in_range_for_cell[0][1].turn
-                                                        prior_discards = [d for d in player_state.discards if d.turn < first_turn_in_range]
-                                                        # d.tile 为 tile 码(0-147)，需 // 4 得 base 再与 forbidden 比较
-                                                        if any((d.tile // 4) in forbidden for d in prior_discards):
+                                                        if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
                                                             continue
-                                            if matched_variant.get("prior_discard_required"):
-                                                prior_req_variants = prior_required_pattern_to_variants(matched_variant["prior_discard_required"])
-                                                if prior_req_variants:
-                                                    start_idx = matched_variant.get("matched_start_index")
-                                                    if start_idx is not None and start_idx > 0:
-                                                        prior_tiles = full_discards_up_to_now[:start_idx]
-                                                    elif turn_range:
-                                                        first_turn_in_range = in_range_for_cell[0][1].turn
-                                                        prior_tiles = [(MjlogParser.tile_to_string(d.tile), d.is_tsumogiri) for d in player_state.discards if d.turn < first_turn_in_range]
+                                                if dora_constraint == "dora_unrelated" and dora_str:
+                                                    pattern_suit = None
+                                                    for elem in matched_variant["discard"]:
+                                                        t = elem[0] if isinstance(elem, tuple) else elem
+                                                        if len(t) >= 2 and t[-1] in "mps":
+                                                            pattern_suit = t[-1]
+                                                            break
+                                                    if pattern_suit and dora_str[-1] == pattern_suit:
+                                                        continue
+                                                if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
+                                                    pos_to_tile = matched_variant.get("position_to_tile") or {}
+                                                    skip_match = False
+                                                    for pos in dora_position_spec:
+                                                        tile_at_pos = pos_to_tile.get(pos)
+                                                        if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
+                                                            skip_match = True
+                                                            break
+                                                    if skip_match:
+                                                        continue
+                                                if riichi_constraint and riichi_constraint != "any":
+                                                    if riichi_constraint == "has_riichi" and not discard.riichi_happened:
+                                                        continue
+                                                    if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
+                                                        continue
+                                                if (call_constraint and call_constraint != "any") or target_no_call:
+                                                    if call_constraint == "has_call" and not discard.call_happened:
+                                                        continue
+                                                    if call_constraint == "no_call" and discard.call_happened:
+                                                        continue
+                                                    if target_no_call:
+                                                        if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
+                                                            continue
+                                                _ca = matched_variant.get("call_area_constraints") or call_area_constraints
+                                                if _ca:
+                                                    if not player_satisfies_call_area_constraints(
+                                                        player_state, round_players, player_state.oya, _ca,
+                                                        current_discard_turn=discard.turn,
+                                                    ):
+                                                        continue
+                                                mapped_target = matched_variant["target"]
+                                                target_equiv = None
+                                                if not use_tenpai and not use_related_tile:
+                                                    target_equiv = set()
+                                                    if len(multi_t) == 1:
+                                                        if is_combo:
+                                                            for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
+                                                                target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
+                                                        else:
+                                                            target_equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                                     else:
-                                                        prior_tiles = []
-                                                    if not prior_tiles:
+                                                        target_equiv = MjlogParser.get_bases_for_target_tile_str(
+                                                            mapped_target if isinstance(mapped_target, str) else mapped_target[0]
+                                                        )
+                                                        for tiles, ic in multi_t[1:]:
+                                                            for t in tiles:
+                                                                target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
+                                                    if discard.tile // 4 in target_equiv:
                                                         continue
-                                                    if not match_discard_pattern_contained(prior_tiles, prior_req_variants, honor_ctx):
-                                                        continue
-                                            if dora_constraint == "dora_unrelated" and dora_str:
-                                                pattern_suit = None
-                                                for elem in matched_variant["discard"]:
-                                                    t = elem[0] if isinstance(elem, tuple) else elem
-                                                    if len(t) >= 2 and t[-1] in "mps":
-                                                        pattern_suit = t[-1]
-                                                        break
-                                                if pattern_suit and dora_str[-1] == pattern_suit:
-                                                    continue
-                                            if dora_constraint == "dora_matches_position" and dora_position_spec and dora_str:
-                                                pos_to_tile = matched_variant.get("position_to_tile") or {}
-                                                skip_match = False
-                                                for pos in dora_position_spec:
-                                                    tile_at_pos = pos_to_tile.get(pos)
-                                                    if tile_at_pos is None or not _tile_str_eq(tile_at_pos, dora_str):
-                                                        skip_match = True
-                                                        break
-                                                if skip_match:
-                                                    continue
-                                            if riichi_constraint and riichi_constraint != "any":
-                                                if riichi_constraint == "has_riichi" and not discard.riichi_happened:
-                                                    continue
-                                                if riichi_constraint == "no_riichi" and _opponent_riichi_happened(discard):
-                                                    continue
-                                            if (call_constraint and call_constraint != "any") or target_no_call:
-                                                if call_constraint == "has_call" and not discard.call_happened:
-                                                    continue
-                                                if call_constraint == "no_call" and discard.call_happened:
-                                                    continue
-                                                if target_no_call:
-                                                    if any(getattr(c, "from_discard_turn", 1) <= discard.turn for c in getattr(player_state, "calls", [])):
-                                                        continue
-                                            _ca = matched_variant.get("call_area_constraints") or call_area_constraints
-                                            if _ca:
-                                                if not player_satisfies_call_area_constraints(
-                                                    player_state, round_players, player_state.oya, _ca,
-                                                    current_discard_turn=discard.turn,
-                                                ):
-                                                    continue
-                                            mapped_target = matched_variant["target"]
-                                            target_equiv = None
-                                            if not use_tenpai and not use_related_tile:
-                                                target_equiv = set()
-                                                if len(multi_t) == 1:
-                                                    if is_combo:
-                                                        for t in (mapped_target if isinstance(mapped_target, list) else [mapped_target]):
-                                                            target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
-                                                    else:
-                                                        target_equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
-                                                else:
+                                                elif use_related_tile:
                                                     target_equiv = MjlogParser.get_bases_for_target_tile_str(
                                                         mapped_target if isinstance(mapped_target, str) else mapped_target[0]
                                                     )
-                                                    for tiles, ic in multi_t[1:]:
-                                                        for t in tiles:
-                                                            target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
-                                                if discard.tile // 4 in target_equiv:
-                                                    continue
-                                            elif use_related_tile:
-                                                target_equiv = MjlogParser.get_bases_for_target_tile_str(
-                                                    mapped_target if isinstance(mapped_target, str) else mapped_target[0]
-                                                )
-
-                                            if orig_i < len(player_state.hand_tiles_history):
-                                                hand_at_turn = list(player_state.hand_tiles_history[orig_i])
-                                            else:
-                                                hand_at_turn = list(player_state.hand_tiles)
-                                            if use_tenpai:
-                                                target_count = 1 if is_tenpai(hand_at_turn) else 0
-                                            elif use_related_tile:
-                                                target_discard_idx = None
-                                                target_discard = None
-                                                for k in range(len(in_range_for_cell) - 1, -1, -1):
-                                                    idx, dd = in_range_for_cell[k]
-                                                    if dd.tile // 4 in target_equiv:
-                                                        target_discard_idx = idx
-                                                        target_discard = dd
-                                                        break
-                                                if target_discard_idx is not None and target_discard is not None:
-                                                    if target_discard_idx < len(player_state.hand_tiles_history):
-                                                        hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
-                                                    else:
-                                                        hand_at_target = list(player_state.hand_tiles)
-                                                    num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
-                                                    if num is not None and suit is not None:
-                                                        counts = hand_to_suit_counts(hand_at_target, suit)
-                                                        target_count = 1 if is_related_discard(num, counts) else 0
+    
+                                                if orig_i < len(player_state.hand_tiles_history):
+                                                    hand_at_turn = list(player_state.hand_tiles_history[orig_i])
+                                                else:
+                                                    hand_at_turn = list(player_state.hand_tiles)
+                                                if use_tenpai:
+                                                    target_count = 1 if is_tenpai(hand_at_turn) else 0
+                                                elif use_related_tile:
+                                                    target_discard_idx = None
+                                                    target_discard = None
+                                                    for k in range(len(in_range_for_cell) - 1, -1, -1):
+                                                        idx, dd = in_range_for_cell[k]
+                                                        if dd.tile // 4 in target_equiv:
+                                                            target_discard_idx = idx
+                                                            target_discard = dd
+                                                            break
+                                                    if target_discard_idx is not None and target_discard is not None:
+                                                        if target_discard_idx < len(player_state.hand_tiles_history):
+                                                            hand_at_target = list(player_state.hand_tiles_history[target_discard_idx])
+                                                        else:
+                                                            hand_at_target = list(player_state.hand_tiles)
+                                                        num, suit = base_to_discard_num_and_suit(target_discard.tile // 4)
+                                                        if num is not None and suit is not None:
+                                                            counts = hand_to_suit_counts(hand_at_target, suit)
+                                                            target_count = 1 if is_related_discard(num, counts) else 0
+                                                        else:
+                                                            target_count = 0
                                                     else:
                                                         target_count = 0
-                                                else:
-                                                    target_count = 0
-                                            elif len(multi_t) > 1:
-                                                tk = _target_key(multi_t[0][0], multi_t[0][1])
-                                                mt_item = multi_t
-                                                if multi_t[0][1]:
+                                                elif len(multi_t) > 1:
+                                                    tk = _target_key(multi_t[0][0], multi_t[0][1])
+                                                    mt_item = multi_t
+                                                    if multi_t[0][1]:
+                                                        hand_bases = [t // 4 for t in hand_at_turn]
+                                                        tc = 1 if all(
+                                                            any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
+                                                            for ts in multi_t[0][0]
+                                                        ) else 0
+                                                        target_count = _apply_combo_independence_filter(
+                                                            hand_at_turn, multi_t[0][0], tc, eff_grid_independence
+                                                        )
+                                                    else:
+                                                        equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
+                                                        target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
+                                                elif is_combo:
                                                     hand_bases = [t // 4 for t in hand_at_turn]
+                                                    mts = mapped_target if isinstance(mapped_target, list) else [mapped_target]
                                                     tc = 1 if all(
                                                         any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
-                                                        for ts in multi_t[0][0]
+                                                        for ts in mts
                                                     ) else 0
                                                     target_count = _apply_combo_independence_filter(
-                                                        hand_at_turn, multi_t[0][0], tc, eff_grid_independence
+                                                        hand_at_turn, mapped_target, tc, eff_grid_independence
                                                     )
                                                 else:
-                                                    equiv = MjlogParser.get_bases_for_target_tile_str(multi_t[0][0][0])
+                                                    equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
                                                     target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
-                                            elif is_combo:
-                                                hand_bases = [t // 4 for t in hand_at_turn]
-                                                mts = mapped_target if isinstance(mapped_target, list) else [mapped_target]
-                                                tc = 1 if all(
-                                                    any(hand_bases.count(b) >= 1 for b in MjlogParser.get_bases_for_target_tile_str(ts))
-                                                    for ts in mts
-                                                ) else 0
-                                                target_count = _apply_combo_independence_filter(
-                                                    hand_at_turn, mapped_target, tc, eff_grid_independence
-                                                )
-                                            else:
-                                                equiv = MjlogParser.get_bases_for_target_tile_str(mapped_target)
-                                                target_count = min(sum(1 for tile in hand_at_turn if tile // 4 in equiv), 3)
-
-                                            k = (tr_idx, pat_idx)
-                                            dist = grid_dist[k]
-                                            if target_count in dist:
-                                                dist[target_count] += 1
-                                            else:
-                                                dist[target_count] = 1
-
+    
+                                                k = (tr_idx, pat_idx)
+                                                dist = grid_dist[k]
+                                                if target_count in dist:
+                                                    dist[target_count] += 1
+                                                else:
+                                                    dist[target_count] = 1
+    
                         except Exception as e:
                             logger.error(f"解析对局 {log_id} 失败: {e}")
                             continue
@@ -3389,7 +3799,11 @@ class LiveAnalyzer:
             total_m = sum(dist.values())
             table_counts[(tr_idx, pat_idx)] = total_m
             is_combo_cell = cell_combo.get((tr_idx, pat_idx), False)
-            k_list = [0, 1] if (use_tenpai or use_related_tile or is_combo_cell) else [0, 1, 2, 3]
+            k_list = (
+                [0, 1]
+                if (use_tenpai or use_related_tile or is_combo_cell or use_deal_in_instant)
+                else [0, 1, 2, 3]
+            )
             if total_m == 0:
                 prob = 0.0
                 table_dist[(tr_idx, pat_idx)] = {k: 0.0 for k in k_list}
@@ -3401,13 +3815,39 @@ class LiveAnalyzer:
             table[(tr_idx, pat_idx)] = round(prob, 2)
 
         logger.info(f"批量分析完成: 处理 {processed:,} 场对局")
-        return {
+        out_grid: Dict = {
             "table": table,
             "table_dist": table_dist,
             "table_counts": table_counts,
             "total_logs_analyzed": processed,
             "elapsed_seconds": round(time.perf_counter() - t0, 1),
         }
+        # 即时铳率矩阵：附加按目标牌的率/点/铳度，供 GUI 分目标展示与勾选合并（arithmetic mean）
+        if use_deal_in_instant and grid_instant_accum is not None:
+            instant_matrix_meta: Dict[int, List[str]] = {}
+            for tr_idx, pat_idx, _, _, multi_t, _ in grid_meta:
+                if pat_idx not in instant_matrix_meta:
+                    instant_matrix_meta[pat_idx] = _instant_grid_target_keys(multi_t)
+            instant_matrix_cells: Dict = {}
+            for k in grid_dist.keys():
+                acc = grid_instant_accum.get(k, {"total": 0, "targets": {}})
+                total_cell = int(acc.get("total", 0))
+                by_target: Dict[str, Dict] = {}
+                for tk, st in acc.get("targets", {}).items():
+                    hits = int(st.get("hits", 0))
+                    points = int(st.get("points", 0))
+                    rate = (hits / total_cell) if total_cell > 0 else 0.0
+                    p_avg = (points / hits) if hits > 0 else 0.0
+                    by_target[tk] = {
+                        "hits": hits,
+                        "rate": rate,
+                        "point_avg": p_avg,
+                        "intensity": rate * p_avg,
+                    }
+                instant_matrix_cells[k] = {"total": total_cell, "by_target": by_target}
+            out_grid["instant_matrix_cells"] = instant_matrix_cells
+            out_grid["instant_matrix_meta"] = instant_matrix_meta
+        return out_grid
 
     def collect_verification_samples(
         self,
@@ -3420,6 +3860,7 @@ class LiveAnalyzer:
         dora_position_spec: Optional[List[int]] = None,  # 宝牌=模式第N张时使用
         visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+        player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
         riichi_constraint: Optional[str] = None,
         call_constraint: Optional[str] = None,
         target_no_call: bool = False,
@@ -3432,7 +3873,7 @@ class LiveAnalyzer:
         analysis_batch_size: Optional[int] = None,
         exclude_south4: bool = False,
         exclude_south3: bool = False,
-        prior_discard_exclusion: Optional[str] = None,
+        prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
         prior_discard_required: Optional[str] = None,
         call_area_constraints: Optional[List[str]] = None,
         gc_interval_batches: Optional[int] = None,
@@ -3491,7 +3932,16 @@ class LiveAnalyzer:
                             if (not s.get("deal_in_hit")) and str(s.get("furiten_state", "none")) != "none"
                         ]
             if target_count_filter is not None:
-                if target_tile_filter and any("target_counts" in s for s in candidates):
+                if analysis_target == "yaku_hai_hand":
+                    def _yaku_sample_match(s: Dict) -> bool:
+                        yh = s.get("yaku_hai") or {}
+                        pk = int(yh.get("pair_kinds", 0))
+                        if target_count_filter == YAKU_HAI_PAIR_FILTER_GE3:
+                            return pk >= 3
+                        return pk == target_count_filter
+
+                    candidates = [s for s in candidates if _yaku_sample_match(s)]
+                elif target_tile_filter and any("target_counts" in s for s in candidates):
                     candidates = [s for s in candidates if s.get("target_counts", {}).get(target_tile_filter) == target_count_filter]
                 elif any("target_counts" in s for s in candidates):
                     # 多模式但未指定具体 target_tile_filter 时，按主模式统计
@@ -3510,11 +3960,16 @@ class LiveAnalyzer:
             prior_discard_exclusion,
             call_area_constraints,
             prior_discard_required,
-            hand_visible_constraints=hand_visible_constraints,
+            hand_visible_constraints,
+            player_visible_constraints,
         )
         consumed_search = get_consumed_search_patterns(query_pattern)
         riichi_search = pattern_has_riichi(query_pattern)
         samples = []
+        # 离线样本扫描与 grid 内联校验共用：归一化前段禁打列表
+        _prior_discard_exclusion_effective = normalize_prior_discard_exclusion_list(
+            prior_discard_exclusion
+        )
 
         # 初始化验证器，用于手牌可见枚数等约束校验
         validator = MatchValidator({
@@ -3627,7 +4082,7 @@ class LiveAnalyzer:
                             ]
                             honor_ctx_base = {
                                 "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                "bakaze": ["东", "南", "西", "北"][player_state.round_num // 4],
+                                "bakaze": MjlogParser.get_bakaze(player_state.round_num),
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                                 "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
@@ -3655,19 +4110,38 @@ class LiveAnalyzer:
                                 if not matched_variant:
                                     continue
 
-                                # 排除：若未打出牌就是目标牌，不计入
                                 mapped_target = matched_variant["target"]
                                 mapped_target_str = mapped_target if isinstance(mapped_target, str) else (mapped_target[0] if mapped_target else None)
                                 sample_is_combo = matched_variant.get("is_combo", False)
-                                if sample_is_combo:
-                                    target_equiv = set()
-                                    for t in mapped_target:
-                                        target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
-                                    if discard.tile // 4 in target_equiv:
-                                        continue
+                                # 即时铳率：允许「达成巡」打出目标牌；但本局此前不得曾打过任一目标准许牌（与 MatchValidator 一致）
+                                if use_deal_in_instant:
+                                    _te_inst = set()
+                                    if isinstance(mapped_target, list):
+                                        for _t in mapped_target:
+                                            if _t:
+                                                _te_inst |= MjlogParser.get_bases_for_target_tile_str(_t)
+                                    else:
+                                        _te_inst = MjlogParser.get_bases_for_target_tile_str(mapped_target)
+                                    if _te_inst:
+                                        _bad_prior_inst = False
+                                        for _pi in range(orig_i):
+                                            if _pi < len(player_state.discards):
+                                                if (player_state.discards[_pi].tile // 4) in _te_inst:
+                                                    _bad_prior_inst = True
+                                                    break
+                                        if _bad_prior_inst:
+                                            continue
                                 else:
-                                    if discard.tile // 4 in MjlogParser.get_bases_for_target_tile_str(mapped_target):
-                                        continue
+                                    # 目标牌存量等：当前这一打不能就是目标牌（或 combo 全量）
+                                    if sample_is_combo:
+                                        target_equiv = set()
+                                        for t in mapped_target:
+                                            target_equiv |= MjlogParser.get_bases_for_target_tile_str(t)
+                                        if discard.tile // 4 in target_equiv:
+                                            continue
+                                    else:
+                                        if discard.tile // 4 in MjlogParser.get_bases_for_target_tile_str(mapped_target):
+                                            continue
 
                                 # 结局过滤
                                 rw = getattr(player_state, "round_winners", [])
@@ -3723,10 +4197,9 @@ class LiveAnalyzer:
                                     if deal_in_filter == "furiten" and (instant_eval.get("deal_in_hit") or str(instant_eval.get("furiten_state", "none")) == "none"):
                                         continue
 
-                                if prior_discard_exclusion:
-                                    excl_str = matched_variant.get("prior_discard_exclusion")
-                                    if excl_str:
-                                        forbidden = get_forbidden_bases_from_exclusion_str(excl_str)  # base 0-36 集合
+                                if _prior_discard_exclusion_effective:
+                                    forbidden = get_prior_discard_exclusion_forbidden_bases(matched_variant)
+                                    if forbidden:
                                         start_idx = matched_variant.get("matched_start_index")
                                         if start_idx is not None:
                                             prior_tiles = full_discards_up_to_now[:start_idx]  # [(tile_str, is_tsumogiri), ...]
@@ -3806,6 +4279,13 @@ class LiveAnalyzer:
                                 hvc = matched_variant.get("hand_visible_constraints")
                                 if hvc:
                                     if not validator._check_hand_visible_constraints(discard, matched_variant, player_state, round_players):
+                                        continue
+
+                                pvc = matched_variant.get("player_visible_constraints")
+                                if pvc:
+                                    if not validator._check_player_visible_constraints(
+                                        discard, matched_variant, player_state, round_players
+                                    ):
                                         continue
 
                                 # 排除：若未打出牌就是目标牌，不计入（与主统计逻辑一致）
@@ -4031,7 +4511,8 @@ def verify_sample_consistency(
     target_tile: str,
     visible_constraints: Optional[Dict] = None,
     hand_visible_constraints: Optional[Dict] = None,
-    prior_discard_exclusion: Optional[str] = None,
+    player_visible_constraints: Optional[Dict] = None,
+    prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
     call_area_constraints: Optional[List[str]] = None,
     prior_discard_required: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
@@ -4058,7 +4539,8 @@ def verify_sample_consistency(
             prior_discard_exclusion,
             call_area_constraints,
             prior_discard_required,
-            hand_visible_constraints=hand_visible_constraints,
+            hand_visible_constraints,
+            player_visible_constraints,
         )
         
         # 补充上下文，支持 r (立直) 及 zf/kf (自风/客风) 占位符校验
@@ -4068,7 +4550,7 @@ def verify_sample_consistency(
         
         ctx = {
             "jikaze": MjlogParser.get_jikaze(player_id, oya, round_num),
-            "bakaze": ["东", "南", "西", "北"][round_num // 4],
+            "bakaze": MjlogParser.get_bakaze(round_num),
             "kyokuze_list": MjlogParser.get_kyokuze_list(player_id, oya, round_num),
             "discard_riichi_flags": riichi_flags,
             "current_discard_turn": sample.get("turn"),
@@ -4129,12 +4611,14 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
     use_outcome = (analysis_target == "outcome")
     use_instant = (analysis_target == "deal_in_instant")
     use_related_tile = (analysis_target == "related_tile")
+    use_yaku_hai = (analysis_target == "yaku_hai_hand")
     is_combo = False if (use_tenpai or use_related_tile) else (samples[0].get("is_combo", False) if samples else False)
     has_multi = bool(samples and samples[0].get("target_counts"))
     target_label = (
         "即时铳率" if use_instant
         else "和铳率" if use_outcome
         else "关联牌" if use_related_tile
+        else "役牌手持" if use_yaku_hai
         else (target_tile if use_tenpai else (
             f"{target_tile} (combo)" if is_combo else (f"{target_tile} (multi-target)" if has_multi else target_tile)
         ))
@@ -4149,6 +4633,9 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         mt = s.get("mapped_target")
         if use_outcome or use_instant:
             mt_set = set()
+        elif use_yaku_hai:
+            yh = s.get("yaku_hai") or {}
+            mt_set = set(yh.get("per_tile") or {})
         elif has_multi and s.get("target_counts"):
             mt_set = _target_counts_display_set(s["target_counts"])
         else:
@@ -4167,6 +4654,19 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         wind = MjlogParser.get_player_wind(s["player_id"], s["oya"])
         if use_outcome:
             target_line = f"  结局:        {_outcome_label(s)}"
+        elif use_yaku_hai:
+            yh = s.get("yaku_hai") or {}
+            pt = yh.get("per_tile") or {}
+            sy = yh.get("seat_yaku_labels") or []
+            _pu_l = ("零对", "一对", "两对", "三对及以上")
+            _pu_i = yh.get("pair_units")
+            if _pu_i is None:
+                _pu_i = yaku_pair_units_bucket(int(yh.get("pair_kinds", 0)))
+            _pu_i = int(max(0, min(3, int(_pu_i))))
+            target_line = (
+                f"  本座役牌:    {','.join(sy)}\n"
+                f"  役牌统计:    种类{yh.get('kinds')} 役牌对副:{_pu_l[_pu_i]} | 枚数 {pt}"
+            )
         elif use_related_tile:
             target_line = f"  关联牌:      {'是' if s.get('target_count') else '否'}"
         elif use_instant:
@@ -4207,7 +4707,8 @@ def format_samples_for_display(samples: List[Dict], query_pattern_str: str, targ
         if not use_tenpai and not use_outcome:
             if has_multi and s.get("target_counts"):
                 block.append(f"  Visible targets: {s['visible_target']}")
-            elif not use_instant:
+            elif not use_instant and not use_yaku_hai:
+                # 役牌手持使用占位目标牌，Visible 易误解为「北等舍牌算役牌」；役牌只计此时点手牌
                 block.append(
                     f"  Visible {_fmt_target(mt)}: {s['visible_target']}{'' if s.get('is_combo') else ' tiles'}"
                 )

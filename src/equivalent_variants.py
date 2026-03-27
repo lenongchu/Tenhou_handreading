@@ -70,6 +70,52 @@ def get_forbidden_bases_from_exclusion_str(prior_str: str) -> frozenset:
     return _forbidden_bases_from_parsed_tile(parsed)
 
 
+def normalize_prior_discard_exclusion_list(
+    prior: Optional[Union[str, List[str]]],
+) -> List[str]:
+    """
+    将 API / GUI 传入的前段禁打规范为非空字符串列表。
+    单条 str 内可含换行，每行一条表达式，禁止牌 base 在各条解析结果上做并集（union）。
+    """
+    if prior is None:
+        return []
+    if isinstance(prior, str):
+        return [
+            ln.strip()
+            for ln in prior.replace("\r\n", "\n").split("\n")
+            if ln.strip()
+        ]
+    out: List[str] = []
+    for x in prior:
+        if isinstance(x, str) and x.strip():
+            out.append(x.strip())
+    return out
+
+
+def get_prior_discard_exclusion_forbidden_bases(matched_variant: Dict) -> frozenset:
+    """
+    从匹配变体得到前段禁打的禁止 base 并集（0-36）。
+    优先读 prior_discard_exclusions；否则回退 prior_discard_exclusion（旧变体单字段）。
+    """
+    raw = matched_variant.get("prior_discard_exclusions")
+    items: List[str] = []
+    if raw is not None:
+        if isinstance(raw, str):
+            if raw.strip():
+                items = [raw.strip()]
+        else:
+            items = [str(x).strip() for x in raw if str(x).strip()]
+    if not items:
+        s = matched_variant.get("prior_discard_exclusion")
+        if isinstance(s, str) and s.strip():
+            items = [s.strip()]
+    out: set = set()
+    for excl in items:
+        # 每条表达式独立 parse，再并集（OR 语义在单条内已由 get_forbidden_bases 处理）
+        out |= get_forbidden_bases_from_exclusion_str(excl)
+    return frozenset(out)
+
+
 def _forbidden_bases_from_parsed_tile(tile: str) -> frozenset:
     """从解析后的单元素（@n:m、@o:4m,2m 等）计算禁止 base 集合。返回 base 0-36（非 tile 码 0-147）。"""
     if tile.startswith(NOT_PREFIX):
@@ -1390,10 +1436,11 @@ def generate_equivalent_variants(
     discard_pattern: List[str],
     target_tile: str,
     visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
-    prior_discard_exclusion: Optional[str] = None,
+    prior_discard_exclusion: Optional[Union[str, List[str]]] = None,
     call_area_constraints: Optional[List[str]] = None,
     prior_discard_required: Optional[str] = None,
     hand_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
+    player_visible_constraints: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> List[Dict]:
     """
     根据舍牌序列、目标牌、可见牌约束，生成所有等价变体。
@@ -1405,6 +1452,9 @@ def generate_equivalent_variants(
     """
     if not discard_pattern:
         return []
+
+    # 多条前段禁打：每行/每项独立映射后与单条并集禁止 base（见 get_prior_discard_exclusion_forbidden_bases）
+    prior_list = normalize_prior_discard_exclusion_list(prior_discard_exclusion)
 
     parsed_pattern = [parse_discard_element(p) for p in discard_pattern]
     target_tiles, is_combo = parse_target_tiles(target_tile)
@@ -1441,7 +1491,6 @@ def generate_equivalent_variants(
     # 纯字牌模式：舍牌无花色，但若目标牌为数牌/赤五，仍按目标牌花色生成等价变体（如 apr + 3p -> 3m/3p/3s）
     if not has_number:
         honor_variants = _expand_pure_honor_pattern(parsed_pattern)
-        prior = prior_discard_exclusion.strip() if prior_discard_exclusion else None
         prior_req = prior_discard_required.strip() if prior_discard_required else None
         call_area = list(call_area_constraints) if call_area_constraints else None
         # 从目标牌中收集花色（数牌、赤五）
@@ -1462,15 +1511,22 @@ def generate_equivalent_variants(
                     target_new = target_new[0] if len(target_new) == 1 else target_new
                     visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
                     hand_visible_new = _transform_hand_visible_constraints_with_mapping(hand_visible_constraints, mapping)
-                    prior_mapped = _apply_suit_mapping_to_string(prior, mapping) if prior else None
+                    player_visible_new = _transform_hand_visible_constraints_with_mapping(
+                        player_visible_constraints, mapping
+                    )
+                    prior_mapped_list = [
+                        _apply_suit_mapping_to_string(x, mapping) for x in prior_list
+                    ]
                     prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
                     call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in (call_area or [])]
                     result.append({
                         "discard": p, "target": target_new,
                         "visible_constraints": visible_new,
                         "hand_visible_constraints": hand_visible_new,
+                        "player_visible_constraints": player_visible_new,
                         "is_combo": is_combo,
-                        "prior_discard_exclusion": prior_mapped, "prior_discard_required": prior_req_mapped,
+                        "prior_discard_exclusions": prior_mapped_list,
+                        "prior_discard_required": prior_req_mapped,
                         "call_area_constraints": call_area_new,
                         "mapping": mapping,
                     })
@@ -1482,7 +1538,9 @@ def generate_equivalent_variants(
                 "discard": p, "target": t,
                 "visible_constraints": dict(visible_constraints) if visible_constraints else {},
                 "hand_visible_constraints": dict(hand_visible_constraints) if hand_visible_constraints else {},
-                "is_combo": is_combo, "prior_discard_exclusion": prior,
+                "player_visible_constraints": dict(player_visible_constraints) if player_visible_constraints else {},
+                "is_combo": is_combo,
+                "prior_discard_exclusions": list(prior_list),
                 "prior_discard_required": prior_req, "call_area_constraints": call_area, "mapping": mapping
             }
             for p in honor_variants
@@ -1501,7 +1559,12 @@ def generate_equivalent_variants(
         target_new = target_new[0] if len(target_new) == 1 else target_new
         visible_new = _transform_visible_constraints_with_mapping(visible_constraints, mapping)
         hand_visible_new = _transform_hand_visible_constraints_with_mapping(hand_visible_constraints, mapping)
-        prior_mapped = _apply_suit_mapping_to_string(prior_discard_exclusion.strip(), mapping) if prior_discard_exclusion else None
+        player_visible_new = _transform_hand_visible_constraints_with_mapping(
+            player_visible_constraints, mapping
+        )
+        prior_mapped_list = [
+            _apply_suit_mapping_to_string(x, mapping) for x in prior_list
+        ]
         prior_req = prior_discard_required.strip() if prior_discard_required else None
         prior_req_mapped = _apply_suit_mapping_to_string(prior_req, mapping) if prior_req else None
         call_area_new = [_apply_suit_mapping_to_string(s, mapping) for s in call_area_constraints] if call_area_constraints else None
@@ -1510,8 +1573,9 @@ def generate_equivalent_variants(
             "target": target_new,
             "visible_constraints": visible_new,
             "hand_visible_constraints": hand_visible_new,
+            "player_visible_constraints": player_visible_new,
             "is_combo": is_combo,
-            "prior_discard_exclusion": prior_mapped,
+            "prior_discard_exclusions": prior_mapped_list,
             "prior_discard_required": prior_req_mapped,
             "call_area_constraints": call_area_new,
             "mapping": mapping,

@@ -27,12 +27,26 @@ from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtGui import QIntValidator
 
 from .data_downloader import DataDownloader
-from .live_analyzer import LiveAnalyzer, get_database_stats, format_samples_for_display
+from .live_analyzer import (
+    LiveAnalyzer,
+    get_database_stats,
+    format_samples_for_display,
+    YAKU_HAI_PAIR_FILTER_GE3,
+)
 from .equivalent_variants import split_discard_pattern, parse_multi_targets
 from .ui.styles import _get_app_stylesheet
 from .ui.components import RangeSlider, DiscreteRangeSlider, TileIllustrationWidget
 from .ui.workers import DownloadThread, QueryThread, OutcomeQueryThread, SampleThread, GridQueryThread, BatchChartThread, DbStatusThread
-from .ui.dialogs import SampleDialog, ArchiveViewDialog, PatternHelpDialog, TargetHelpDialog, TileIllustrationDialog, MatrixDisplayDialog, BatchChartDialog
+from .ui.dialogs import (
+    SampleDialog,
+    ArchiveViewDialog,
+    PatternHelpDialog,
+    TargetHelpDialog,
+    TileIllustrationDialog,
+    MatrixDisplayDialog,
+    BatchChartDialog,
+    instant_matrix_export_tsv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +133,15 @@ def _build_pattern_summary(result: dict) -> str:
     multi = result.get("multi_pattern", False)
     pr_list = result.get("pattern_results", []) if multi else []
     use_tenpai = result.get("analysis_target") == "tenpai"
+    use_yaku_hai = result.get("analysis_target") == "yaku_hai_hand"
     if multi and pr_list:
         parts = [
-            f"{pr['pattern_str']} → {'听牌' if use_tenpai else pr['target']}"
+            f"{pr['pattern_str']} → {'听牌' if use_tenpai else ('役牌' if use_yaku_hai else pr['target'])}"
             for pr in pr_list
         ]
         return "  |  ".join(parts)
     qp = result.get("query_pattern_str", "") or "-".join(result.get("query_pattern", []))
-    target = "听牌" if use_tenpai else result.get("target_tile", "")
+    target = "听牌" if use_tenpai else ("役牌统计" if use_yaku_hai else result.get("target_tile", ""))
     return f"{qp} → {target}"
 
 
@@ -257,6 +272,7 @@ class MainWindow(QMainWindow):
         self._pattern_checkboxes = []  # 多模式勾选框列表
         self.visible_constraint_row_refs = []  # 场上可见枚数约束引用
         self.hand_visible_constraint_row_refs = []  # 手牌可见枚数约束引用
+        self.player_visible_constraint_row_refs = []  # 玩家可见（手牌+场上合并计数）约束引用
         self._archive_entries: List[Dict[str, Any]] = []  # 存档条目列表
         self._archive_folders: List[Dict[str, Any]] = []  # 文件夹列表 [{id, name}, ...]
 
@@ -563,31 +579,34 @@ class MainWindow(QMainWindow):
         exclude_south_row.addWidget(self.exclude_south3_check)
         exclude_south_row.addStretch()
         right_layout.addLayout(exclude_south_row)
-        prior_excl_row = QHBoxLayout()
-        prior_excl_row.addWidget(QLabel("前段禁打:"))
-        self.prior_discard_exclusion_input = QLineEdit()
-        self.prior_discard_exclusion_input.setPlaceholderText("例: NOTm 或 4mOR2m")
+        # 前段禁打与有打同一行：禁打框限制最大宽度（短规则居多），剩余空间给「前段有打」长模式串
+        prior_pair_row = QHBoxLayout()
+        prior_pair_row.addWidget(QLabel("前段禁打:"))
+        self.prior_discard_exclusion_input = QTextEdit()
+        self.prior_discard_exclusion_input.setPlaceholderText("每行一条表达式（换行），多条并集禁打")
         self.prior_discard_exclusion_input.setToolTip(
-            "巡目范围开始前，该玩家不能打出这些牌。支持 NOTm/p/s、[25]m、4mOR2m 等，与舍牌模式同步等价变换"
+            "巡目范围开始前，该玩家不能打出这些牌。每行一条表达式，多条之间为并集禁打。"
+            "支持 NOTm/p/s、[25]m、4mOR2m 等，与舍牌模式同步等价变换（equivalent mapping）。"
         )
+        self.prior_discard_exclusion_input.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.prior_discard_exclusion_input.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.prior_discard_exclusion_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.prior_discard_exclusion_input.setFixedHeight(46)
         self.prior_discard_exclusion_input.setMinimumWidth(140)
-        self.prior_discard_exclusion_input.setMaximumWidth(200)
-        prior_excl_row.addWidget(self.prior_discard_exclusion_input)
-        prior_excl_row.addStretch()
-        right_layout.addLayout(prior_excl_row)
+        self.prior_discard_exclusion_input.setMaximumWidth(280)
+        self.prior_discard_exclusion_input.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        prior_pair_row.addWidget(self.prior_discard_exclusion_input)
 
-        prior_req_row = QHBoxLayout()
-        prior_req_row.addWidget(QLabel("前段有打:"))
+        prior_pair_row.addWidget(QLabel("前段有打:"))
         self.prior_discard_required_input = QLineEdit()
         self.prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
         self.prior_discard_required_input.setToolTip(
             "匹配前须出现过该舍牌模式，语法同舍牌模式。前段有打 … 舍牌模式，中间不要求；与主模式同步等价变换"
         )
         self.prior_discard_required_input.setMinimumWidth(140)
-        self.prior_discard_required_input.setMaximumWidth(200)
-        prior_req_row.addWidget(self.prior_discard_required_input)
-        prior_req_row.addStretch()
-        right_layout.addLayout(prior_req_row)
+        self.prior_discard_required_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        prior_pair_row.addWidget(self.prior_discard_required_input, stretch=1)
+        right_layout.addLayout(prior_pair_row)
 
         # 副露区域约束（目标玩家必须有这些副露，AND 关系，最多 4 个）
         call_area_row = QHBoxLayout()
@@ -671,6 +690,40 @@ class MainWindow(QMainWindow):
         self.hand_visible_constraint_row_refs = []
         right_layout.addWidget(self.hand_visible_constraint_scroll)
         self._add_hand_visible_constraint_row()
+
+        # 玩家可见枚数（目标玩家手牌中含牌枚数 + 场上可见，与「场上可见」同源统计）
+        right_layout.addSpacing(4)
+        pvc_header = QHBoxLayout()
+        pvc_header.addWidget(QLabel("玩家可见枚数 (手牌+场上)"))
+        self.add_player_visible_constraint_btn = QPushButton("+ 添加")
+        self.add_player_visible_constraint_btn.setFixedWidth(72)
+        self.add_player_visible_constraint_btn.clicked.connect(self._add_player_visible_constraint_row)
+        pvc_header.addWidget(self.add_player_visible_constraint_btn)
+        pvc_help_btn = QPushButton("?")
+        pvc_help_btn.setFixedWidth(24)
+        pvc_help_btn.setToolTip("玩家可见枚数说明")
+        pvc_help_btn.clicked.connect(self._show_player_visible_help)
+        pvc_header.addWidget(pvc_help_btn)
+        pvc_header.addStretch()
+        right_layout.addLayout(pvc_header)
+        self.player_visible_constraint_scroll = QScrollArea()
+        self.player_visible_constraint_scroll.setWidgetResizable(True)
+        self.player_visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.player_visible_constraint_scroll.setMinimumHeight(52)
+        self.player_visible_constraint_scroll.setMaximumHeight(100)
+        self.player_visible_constraint_rows_widget = QWidget()
+        self.player_visible_constraint_rows_widget.setMinimumWidth(596)
+        self.player_visible_constraint_rows_layout = QGridLayout(self.player_visible_constraint_rows_widget)
+        self.player_visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.player_visible_constraint_rows_layout.setSpacing(2)
+        self.player_visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.player_visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.player_visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.player_visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.player_visible_constraint_scroll.setWidget(self.player_visible_constraint_rows_widget)
+        self.player_visible_constraint_row_refs = []
+        right_layout.addWidget(self.player_visible_constraint_scroll)
+        self._add_player_visible_constraint_row()
         
         # 分析目标 + 样本上限 + 匹配状态保留条数
         opts_row = QHBoxLayout()
@@ -680,13 +733,15 @@ class MainWindow(QMainWindow):
         self.analysis_target_combo.addItem("是否听牌", "tenpai")
         self.analysis_target_combo.addItem("关联牌判断", "related_tile")
         self.analysis_target_combo.addItem("和铳率", "outcome")
+        self.analysis_target_combo.addItem("役牌手持统计", "yaku_hai_hand")
         self.analysis_target_combo.setMinimumWidth(100)
         self.analysis_target_combo.setToolTip(
             "目标牌存量：统计手牌中目标牌数量；"
             "是否听牌：统计匹配时已听牌/未听牌比例；"
             "关联牌判断：按目标牌在模式中最后一次出现的那一打，判断是否关联牌（与手牌搭子距离≤2）；"
             "舍牌模式中若要规定「某张打出时必为关联牌」，请在数牌后加后缀 k（如 2pk），详见舍牌模式 ? 帮助；"
-            "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）"
+            "和铳率：统计达成模式后该局和了率与放铳率（无需输入目标牌）；"
+            "役牌手持统计：按自风/场风/三元统计该座役牌在手——役牌种类(≥1枚)分布，以及役牌对副数(每种役牌≥2枚计1副，刻子仍计1副)之零对/一对/两对/三对及以上，无需目标牌"
         )
         self.analysis_target_combo.currentIndexChanged.connect(self._on_analysis_target_changed)
         opts_row.addWidget(self.analysis_target_combo)
@@ -771,6 +826,79 @@ class MainWindow(QMainWindow):
 
         del_btn.clicked.connect(do_remove)
 
+    def _instant_add_turn_range_pair(self, layout: QHBoxLayout, add_btn: Optional[QPushButton] = None):
+        """铳率页：添加一组巡目输入（与主分析 `_add_turn_range_pair` 同款语义）。"""
+        container = QWidget()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        edit = QLineEdit()
+        edit.setPlaceholderText("1-6")
+        edit.setFixedWidth(56)
+        edit.setMaxLength(6)
+        edit.setToolTip("最小-最大巡目，如 1-6；多组即矩阵分析")
+        row.addWidget(edit)
+        del_btn = QPushButton("×")
+        del_btn.setFixedSize(22, 22)
+        del_btn.setToolTip("删除此组巡目范围")
+        row.addWidget(del_btn)
+        if add_btn is not None:
+            idx = layout.indexOf(add_btn)
+            layout.insertWidget(idx, container)
+        else:
+            layout.addWidget(container)
+        self._instant_turn_range_edits.append(edit)
+        self._instant_turn_range_containers.append((container, edit))
+
+        def do_remove():
+            if len(self._instant_turn_range_edits) <= 1:
+                edit.clear()
+                return
+            layout.removeWidget(container)
+            container.deleteLater()
+            self._instant_turn_range_edits.remove(edit)
+            self._instant_turn_range_containers.remove((container, edit))
+
+        del_btn.clicked.connect(do_remove)
+
+    def _instant_get_turn_ranges_from_ui(self) -> List[Tuple[int, int]]:
+        """铳率页巡目：多行输入有效行优先（去重保序）；若全空则用连续巡目 SpinBox 退化为单段。"""
+        seen = set()
+        turn_ranges = []
+        for edit in getattr(self, "_instant_turn_range_edits", []):
+            line = edit.text().strip()
+            if not line:
+                continue
+            tr = _parse_turn_range(line)
+            if tr and tr not in seen:
+                seen.add(tr)
+                turn_ranges.append(tr)
+        if not turn_ranges:
+            t_lo = self.instant_turn_min.value()
+            t_hi = self.instant_turn_max.value()
+            if t_lo <= t_hi:
+                turn_ranges = [(t_lo, t_hi)]
+        return turn_ranges
+
+    def _sync_instant_turn_ranges_to_main_edits(self):
+        """将铳率页巡目（多行或连续巡目回退）同步到主分析页的矩阵巡目输入与滑块。"""
+        tr_list = self._instant_get_turn_ranges_from_ui()
+        if not tr_list:
+            return
+        row_layout = getattr(self, "_turn_ranges_row_layout", None)
+        add_btn = getattr(self, "_add_turn_range_btn", None)
+        while len(self._turn_range_edits) < len(tr_list) and row_layout and add_btn:
+            self._add_turn_range_pair(row_layout, add_btn)
+        for i, (a, b) in enumerate(tr_list):
+            if i < len(self._turn_range_edits):
+                self._turn_range_edits[i].setText("%d-%d" % (a, b))
+        for i in range(len(tr_list), len(self._turn_range_edits)):
+            self._turn_range_edits[i].clear()
+        t_lo = min(r[0] for r in tr_list)
+        t_hi = max(r[1] for r in tr_list)
+        self.turn_range_slider.setRange(t_lo, t_hi)
+
     def _get_turn_ranges_from_ui(self) -> List[Tuple[int, int]]:
         """从巡目范围输入框读取有效范围列表（去重保留顺序）。留空则跳过，全部留空时由滑块决定"""
         seen = set()
@@ -834,7 +962,8 @@ class MainWindow(QMainWindow):
             return
         data = self.analysis_target_combo.currentData() or ""
         is_outcome = data == "outcome"
-        hide_target = is_outcome
+        is_yaku_hai = data == "yaku_hai_hand"
+        hide_target = is_outcome or is_yaku_hai
         for pattern_edit, target_edit, arrow_label, target_help_btn, del_btn, row in getattr(
             self, "_pattern_row_widgets", []
         ):
@@ -1062,31 +1191,33 @@ class MainWindow(QMainWindow):
         exclude_south_row.addStretch()
         c_layout.addLayout(exclude_south_row)
 
-        prior_excl_row = QHBoxLayout()
-        prior_excl_row.addWidget(QLabel("前段禁打:"))
-        self.instant_prior_discard_exclusion_input = QLineEdit()
-        self.instant_prior_discard_exclusion_input.setPlaceholderText("例: NOTm 或 4mOR2m")
+        instant_prior_pair_row = QHBoxLayout()
+        instant_prior_pair_row.addWidget(QLabel("前段禁打:"))
+        self.instant_prior_discard_exclusion_input = QTextEdit()
+        self.instant_prior_discard_exclusion_input.setPlaceholderText("每行一条表达式（换行），多条并集禁打")
         self.instant_prior_discard_exclusion_input.setToolTip(
-            "巡目范围开始前，该玩家不能打出这些牌。支持 NOTm/p/s、[25]m、4mOR2m 等，与舍牌模式同步等价变换"
+            "巡目范围开始前，该玩家不能打出这些牌。每行一条表达式，多条之间为并集禁打。"
+            "支持 NOTm/p/s、[25]m、4mOR2m 等，与舍牌模式同步等价变换（equivalent mapping）。"
         )
+        self.instant_prior_discard_exclusion_input.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.instant_prior_discard_exclusion_input.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.instant_prior_discard_exclusion_input.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.instant_prior_discard_exclusion_input.setFixedHeight(46)
         self.instant_prior_discard_exclusion_input.setMinimumWidth(140)
-        self.instant_prior_discard_exclusion_input.setMaximumWidth(200)
-        prior_excl_row.addWidget(self.instant_prior_discard_exclusion_input)
-        prior_excl_row.addStretch()
-        c_layout.addLayout(prior_excl_row)
+        self.instant_prior_discard_exclusion_input.setMaximumWidth(280)
+        self.instant_prior_discard_exclusion_input.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        instant_prior_pair_row.addWidget(self.instant_prior_discard_exclusion_input)
 
-        prior_req_row = QHBoxLayout()
-        prior_req_row.addWidget(QLabel("前段有打:"))
+        instant_prior_pair_row.addWidget(QLabel("前段有打:"))
         self.instant_prior_discard_required_input = QLineEdit()
         self.instant_prior_discard_required_input.setPlaceholderText("例: [29]m-3pf")
         self.instant_prior_discard_required_input.setToolTip(
             "匹配前须出现过该舍牌模式，语法同舍牌模式。前段有打 … 舍牌模式，中间不要求；与主模式同步等价变换"
         )
         self.instant_prior_discard_required_input.setMinimumWidth(140)
-        self.instant_prior_discard_required_input.setMaximumWidth(200)
-        prior_req_row.addWidget(self.instant_prior_discard_required_input)
-        prior_req_row.addStretch()
-        c_layout.addLayout(prior_req_row)
+        self.instant_prior_discard_required_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        instant_prior_pair_row.addWidget(self.instant_prior_discard_required_input, stretch=1)
+        c_layout.addLayout(instant_prior_pair_row)
 
         call_area_row = QHBoxLayout()
         call_area_row.addWidget(QLabel("副露区域:"))
@@ -1168,11 +1299,77 @@ class MainWindow(QMainWindow):
         c_layout.addWidget(self.instant_hand_visible_constraint_scroll)
         self._instant_add_hand_visible_constraint_row()
 
+        c_layout.addSpacing(4)
+        pvc_header_i = QHBoxLayout()
+        pvc_header_i.addWidget(QLabel("玩家可见枚数 (手牌+场上)"))
+        self.instant_add_player_visible_constraint_btn = QPushButton("+ 添加")
+        self.instant_add_player_visible_constraint_btn.setFixedWidth(72)
+        self.instant_add_player_visible_constraint_btn.clicked.connect(
+            self._instant_add_player_visible_constraint_row
+        )
+        pvc_header_i.addWidget(self.instant_add_player_visible_constraint_btn)
+        pvc_help_btn_i = QPushButton("?")
+        pvc_help_btn_i.setFixedWidth(24)
+        pvc_help_btn_i.setToolTip("玩家可见枚数说明")
+        pvc_help_btn_i.clicked.connect(self._show_player_visible_help)
+        pvc_header_i.addWidget(pvc_help_btn_i)
+        pvc_header_i.addStretch()
+        c_layout.addLayout(pvc_header_i)
+        self.instant_player_visible_constraint_scroll = QScrollArea()
+        self.instant_player_visible_constraint_scroll.setWidgetResizable(True)
+        self.instant_player_visible_constraint_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.instant_player_visible_constraint_scroll.setMinimumHeight(52)
+        self.instant_player_visible_constraint_scroll.setMaximumHeight(100)
+        self.instant_player_visible_constraint_rows_widget = QWidget()
+        self.instant_player_visible_constraint_rows_widget.setMinimumWidth(596)
+        self.instant_player_visible_constraint_rows_layout = QGridLayout(
+            self.instant_player_visible_constraint_rows_widget
+        )
+        self.instant_player_visible_constraint_rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.instant_player_visible_constraint_rows_layout.setSpacing(2)
+        self.instant_player_visible_constraint_rows_layout.setHorizontalSpacing(8)
+        self.instant_player_visible_constraint_rows_layout.setVerticalSpacing(4)
+        self.instant_player_visible_constraint_rows_layout.setColumnStretch(0, 0)
+        self.instant_player_visible_constraint_rows_layout.setColumnStretch(1, 0)
+        self.instant_player_visible_constraint_scroll.setWidget(
+            self.instant_player_visible_constraint_rows_widget
+        )
+        self.instant_player_visible_constraint_row_refs = []
+        c_layout.addWidget(self.instant_player_visible_constraint_scroll)
+        self._instant_add_player_visible_constraint_row()
+
         constraints_group.setLayout(c_layout)
         layout.addWidget(constraints_group)
 
+        # 多组巡目（与主分析矩阵一致）：有填写则参与矩阵；全空时用下方连续巡目 SpinBox
+        tr_head = QHBoxLayout()
+        tr_head.addWidget(QLabel("巡目范围（多组即矩阵；全空则用下方连续巡目）:"))
+        instant_tr_help = QPushButton("?")
+        instant_tr_help.setFixedWidth(28)
+        instant_tr_help.setToolTip("巡目范围使用说明")
+        instant_tr_help.clicked.connect(self._show_turn_range_help)
+        tr_head.addWidget(instant_tr_help)
+        tr_head.addStretch()
+        layout.addLayout(tr_head)
+        self._instant_turn_range_edits = []
+        self._instant_turn_range_containers = []
+        instant_tr_row = QHBoxLayout()
+        instant_tr_row.setSpacing(6)
+        self._instant_turn_ranges_row_layout = instant_tr_row
+        self._instant_add_turn_range_pair(instant_tr_row, None)
+        self._instant_add_turn_range_btn = QPushButton("+ 添加")
+        self._instant_add_turn_range_btn.setToolTip("添加一组巡目范围")
+        self._instant_add_turn_range_btn.clicked.connect(
+            lambda: self._instant_add_turn_range_pair(
+                instant_tr_row, self._instant_add_turn_range_btn
+            )
+        )
+        instant_tr_row.addWidget(self._instant_add_turn_range_btn)
+        instant_tr_row.addStretch()
+        layout.addLayout(instant_tr_row)
+
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("巡目范围:"))
+        row2.addWidget(QLabel("连续巡目（仅当上方全空时生效）:"))
         self.instant_turn_min = QSpinBox()
         self.instant_turn_min.setRange(1, 18)
         self.instant_turn_min.setValue(1)
@@ -1395,6 +1592,65 @@ class MainWindow(QMainWindow):
             hand_visible_constraints[tile] = (min_count, max_count)
         return hand_visible_constraints
 
+    def _instant_rebuild_player_visible_constraint_grid(self):
+        layout = self.instant_player_visible_constraint_rows_layout
+        parent = self.instant_player_visible_constraint_rows_widget
+        if not layout or not parent:
+            return
+        while layout.count():
+            layout.takeAt(0)
+        for i, (_, _, row_widget) in enumerate(self.instant_player_visible_constraint_row_refs):
+            row_widget.setParent(parent)
+            layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
+
+    def _instant_add_player_visible_constraint_row(self):
+        row_widget = QWidget(self.instant_player_visible_constraint_rows_widget)
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 5p")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("合计"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.instant_player_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        idx = len(self.instant_player_visible_constraint_row_refs) - 1
+        self.instant_player_visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
+
+        def do_remove():
+            if self.instant_player_visible_constraint_rows_layout:
+                self.instant_player_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.instant_player_visible_constraint_row_refs = [
+                r for r in self.instant_player_visible_constraint_row_refs if r[2] != row_widget
+            ]
+            self._instant_rebuild_player_visible_constraint_grid()
+
+        remove_btn.clicked.connect(do_remove)
+
+    def _instant_get_player_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        out = {}
+        for tile_edit, range_slider, _ in self.instant_player_visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            out[tile] = (min_count, max_count)
+        return out
+
     def _sync_instant_constraints_to_main(self):
         """将即时铳率页的约束与参数同步到主分析页控件。"""
         # 宝牌约束
@@ -1419,8 +1675,8 @@ class MainWindow(QMainWindow):
         self.exclude_south3_check.setChecked(self.instant_exclude_south3_check.isChecked())
 
         # 前段禁打 / 前段有打
-        self.prior_discard_exclusion_input.setText(
-            self.instant_prior_discard_exclusion_input.text().strip()
+        self.prior_discard_exclusion_input.setPlainText(
+            self.instant_prior_discard_exclusion_input.toPlainText().strip()
         )
         self.prior_discard_required_input.setText(
             self.instant_prior_discard_required_input.text().strip()
@@ -1460,16 +1716,31 @@ class MainWindow(QMainWindow):
                 tile_edit.setText(tile)
                 range_slider.setRange(min_count, max_count)
 
+        instant_p_constraints = list(self._instant_get_player_visible_constraints_from_ui().items())
+        for _, _, row_widget in list(self.player_visible_constraint_row_refs):
+            self.player_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+        self.player_visible_constraint_row_refs.clear()
+        if not instant_p_constraints:
+            self._add_player_visible_constraint_row()
+        else:
+            for tile, (min_count, max_count) in instant_p_constraints:
+                self._add_player_visible_constraint_row()
+                tile_edit, range_slider, _ = self.player_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(min_count, max_count)
+
         # 样本上限、匹配保留
         self.sample_limit_input.setValue(self.instant_sample_limit_input.value())
         self.matched_states_cap_spin.setValue(self.instant_matched_states_cap_spin.value())
+        self._sync_instant_turn_ranges_to_main_edits()
 
     def _start_instant_deal_in_analysis(self):
-        tmin = self.instant_turn_min.value()
-        tmax = self.instant_turn_max.value()
-        if tmin > tmax:
-            QMessageBox.warning(self, "输入错误", "巡目范围最小值不能大于最大值")
-            return
+        turn_ranges_inst = self._instant_get_turn_ranges_from_ui()
+        for tmin, tmax in turn_ranges_inst:
+            if tmin > tmax:
+                QMessageBox.warning(self, "输入错误", "巡目范围最小值不能大于最大值")
+                return
 
         # 从铳率分析页多行收集 (pattern, target) 原始字符串
         items = []
@@ -1527,9 +1798,7 @@ class MainWindow(QMainWindow):
 
         self._sync_instant_constraints_to_main()
         self._forced_analysis_target = "deal_in_instant"
-        self.turn_range_slider.setRange(tmin, tmax)
-        for edit in getattr(self, "_turn_range_edits", []):
-            edit.clear()
+        # 巡目已在 _sync_instant_constraints_to_main 末尾同步到主界面列表
 
         self.instant_status_label.setText("已提交分析，进度与结果请查看“查询结果”页。")
         self.main_tab.setCurrentIndex(2)
@@ -1994,33 +2263,93 @@ class MainWindow(QMainWindow):
             else:
                 rows.append(_instant_row(pattern, result.get('target_tile', ''), result))
         else:
-            header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
-            rows = [header]
-
-            def _row(pattern: str, target: str, prob: dict) -> str:
-                """生成一行数据，prob 为 {0:%, 1:%, ...} 概率分布"""
-                p0 = prob.get(0, 0)
-                p1 = prob.get(1, 0)
-                p2 = prob.get(2, 0)
-                p3 = prob.get(3, 0)
-                return f"{pattern}\t{target}\t{turn_str}\t{p0:.2f}\t{p1:.2f}\t{p2:.2f}\t{p3:.2f}"
-
-            if multi and pr_list:
-                for pr in pr_list:
-                    prob = pr.get('probability_distribution', {})
-                    target = "听牌" if use_tenpai else pr.get('target', '')
-                    rows.append(_row(pr['pattern_str'], target, prob))
-            else:
-                prob = result.get('probability_distribution', {})
-                pattern = result.get('query_pattern_str', '') or '-'.join(result.get('query_pattern', []))
-                target = "听牌" if use_tenpai else result.get('target_tile', '')
-                multi_target = result.get('multi_target', False)
-                if multi_target:
-                    for tk in result.get('target_tiles', []):
-                        pt = prob.get(tk, {})
-                        rows.append(_row(pattern, tk, pt))
+            use_yaku_hai = result.get("analysis_target") == "yaku_hai_hand"
+            if use_yaku_hai:
+                # 役牌：种类 0～5 与对副四桶分列导出（Excel 友好）
+                hdr_k = "舍牌模式\t役牌种类(≥1枚)\t巡目范围\t0\t1\t2\t3\t4\t5+"
+                hdr_u = "舍牌模式\t役牌对副数\t巡目范围\t零对\t一对\t两对\t三对及以上"
+                rows = [hdr_k]
+                if multi and pr_list:
+                    for pr in pr_list:
+                        pdim = pr.get("probability_distribution") or {}
+                        sk = pdim.get("kinds", {})
+                        rows.append(
+                            pr["pattern_str"]
+                            + "\t役牌种类\t"
+                            + turn_str
+                            + "\t"
+                            + "\t".join(f"{sk.get(i, 0):.2f}" for i in range(6))
+                        )
+                    rows.append("")
+                    rows.append(hdr_u)
+                    for pr in pr_list:
+                        pdim = pr.get("probability_distribution") or {}
+                        su = pdim.get("pair_units", {})
+                        rows.append(
+                            pr["pattern_str"]
+                            + "\t役牌对副\t"
+                            + turn_str
+                            + "\t"
+                            + "\t".join(f"{su.get(i, 0):.2f}" for i in range(4))
+                        )
                 else:
-                    rows.append(_row(pattern, target, prob))
+                    pattern = result.get("query_pattern_str", "") or "-".join(
+                        result.get("query_pattern", [])
+                    )
+                    pdim = result.get("probability_distribution") or {}
+                    sk = pdim.get("kinds", {})
+                    rows.append(
+                        pattern
+                        + "\t役牌种类\t"
+                        + turn_str
+                        + "\t"
+                        + "\t".join(f"{sk.get(i, 0):.2f}" for i in range(6))
+                    )
+                    rows.append("")
+                    rows.append(hdr_u)
+                    su = pdim.get("pair_units", {})
+                    rows.append(
+                        pattern
+                        + "\t役牌对副\t"
+                        + turn_str
+                        + "\t"
+                        + "\t".join(f"{su.get(i, 0):.2f}" for i in range(4))
+                    )
+            else:
+                header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
+                rows = [header]
+
+                def _row(pattern: str, target: str, prob: dict) -> str:
+                    """生成一行数据，prob 为 {0:%, 1:%, ...} 概率分布"""
+                    p0 = prob.get(0, 0)
+                    p1 = prob.get(1, 0)
+                    p2 = prob.get(2, 0)
+                    p3 = prob.get(3, 0)
+                    return f"{pattern}\t{target}\t{turn_str}\t{p0:.2f}\t{p1:.2f}\t{p2:.2f}\t{p3:.2f}"
+
+                if multi and pr_list:
+                    for pr in pr_list:
+                        if pr.get("multi_target") and pr.get("target_tiles"):
+                            for tk in pr["target_tiles"]:
+                                pt = (pr.get("probability_distribution") or {}).get(tk, {})
+                                rows.append(_row(pr["pattern_str"], tk, pt))
+                        else:
+                            prob = pr.get("probability_distribution", {})
+                            target = "听牌" if use_tenpai else pr.get("target", "")
+                            rows.append(_row(pr["pattern_str"], target, prob))
+                else:
+                    prob = result.get("probability_distribution", {})
+                    pattern = result.get("query_pattern_str", "") or "-".join(
+                        result.get("query_pattern", [])
+                    )
+                    target = "听牌" if use_tenpai else result.get("target_tile", "")
+                    multi_target = result.get("multi_target", False)
+                    if multi_target:
+                        for tk in result.get("target_tiles", []):
+                            pt = prob.get(tk, {})
+                            rows.append(_row(pattern, tk, pt))
+                    else:
+                        rows.append(_row(pattern, target, prob))
 
         rows.append("")
         rows.append(f"总匹配样本数\t{result.get('total_matches', 0)}")
@@ -2171,6 +2500,123 @@ class MainWindow(QMainWindow):
             return
         use_tenpai = result.get("analysis_target") == "tenpai"
         use_related_tile = result.get("analysis_target") == "related_tile"
+        use_yaku_hai = result.get("analysis_target") == "yaku_hai_hand"
+        if use_yaku_hai:
+            merge_lines = [f"合并结果（役牌手持）：总匹配 {_fmt_int(total_matches)} 次"]
+            merged_k = {i: 0 for i in range(6)}
+            for pr in checked:
+                sub = (pr.get("target_count_distribution") or {}).get("kinds", {})
+                for i in range(6):
+                    merged_k[i] += sub.get(i, 0)
+            seg_k = []
+            for i in range(6):
+                pct = (merged_k[i] / total_matches * 100) if total_matches > 0 else 0
+                seg_k.append(f"{i}:{pct:.1f}%({_fmt_int(merged_k[i])}例)")
+            merge_lines.append("  役牌种类(≥1枚): " + " ".join(seg_k))
+            merged_u = {i: 0 for i in range(4)}
+            for pr in checked:
+                sub = (pr.get("target_count_distribution") or {}).get("pair_units", {})
+                for i in range(4):
+                    merged_u[i] += sub.get(i, 0)
+            _pu_nm = ("零对", "一对", "两对", "三对及以上")
+            seg_u = []
+            for i in range(4):
+                pct = (merged_u[i] / total_matches * 100) if total_matches > 0 else 0
+                seg_u.append(f"{_pu_nm[i]}:{pct:.1f}%({_fmt_int(merged_u[i])}例)")
+            merge_lines.append("  役牌对副数: " + " ".join(seg_u))
+            merge_lines.append("")
+            merge_lines.append(f"总匹配样本数（合计勾选）\t{total_matches}")
+            self.merged_result_label.setText("\n".join(merge_lines))
+            tr = result.get("turn_range")
+            turn_str = f"{tr[0]}-{tr[1]}巡" if tr else "不限"
+            excel_rows = ["舍牌模式\t役牌种类(≥1枚)\t巡目范围\t0\t1\t2\t3\t4\t5+"]
+            for pr in checked:
+                pdim = pr.get("probability_distribution") or {}
+                sub_pr = pdim.get("kinds", {})
+                cells = "\t".join(f"{sub_pr.get(i, 0):.2f}" for i in range(6))
+                excel_rows.append(f"{pr['pattern_str']}\t役牌种类\t{turn_str}\t{cells}")
+            excel_rows.append("舍牌模式\t役牌对副\t巡目范围\t零对\t一对\t两对\t三对及以上")
+            for pr in checked:
+                pdim = pr.get("probability_distribution") or {}
+                sub_pr = pdim.get("pair_units", {})
+                cells = "\t".join(f"{sub_pr.get(i, 0):.2f}" for i in range(4))
+                excel_rows.append(f"{pr['pattern_str']}\t役牌对副\t{turn_str}\t{cells}")
+            excel_rows.append("")
+            excel_rows.append(f"总匹配样本数\t{total_matches}")
+            excel_rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
+            self._excel_clipboard_text = "\n".join(excel_rows)
+            return
+        # 存量多目标（如多个搭子）：分布按目标嵌套，不能与单目标一样用 d.get(0) 合并
+        multi_pr_target = (
+            not use_tenpai
+            and not use_related_tile
+            and any(pr.get("multi_target") for pr in checked)
+        )
+        if multi_pr_target:
+            seen_tk = set()
+            all_tiles = []
+            for pr in checked:
+                for tk in pr.get("target_tiles") or []:
+                    if tk not in seen_tk:
+                        seen_tk.add(tk)
+                        all_tiles.append(tk)
+                if not pr.get("multi_target") and pr.get("target"):
+                    tk0 = pr["target"]
+                    if tk0 not in seen_tk:
+                        seen_tk.add(tk0)
+                        all_tiles.append(tk0)
+            tr = result.get("turn_range")
+            turn_str = f"{tr[0]}-{tr[1]}巡" if tr else "不限"
+            header = "舍牌模式\t目标牌\t巡目范围\t0张\t1张\t2张\t3张"
+            merge_lines = [f"合并结果（多目标存量）：总匹配 {_fmt_int(total_matches)} 次"]
+            base_rows = [header]
+            for pr in checked:
+                if pr.get("multi_target") and pr.get("target_tiles"):
+                    for tk in pr["target_tiles"]:
+                        pt = (pr.get("probability_distribution") or {}).get(tk, {})
+                        base_rows.append(
+                            f"{pr['pattern_str']}\t{tk}\t{turn_str}\t"
+                            f"{pt.get(0, 0):.2f}\t{pt.get(1, 0):.2f}\t"
+                            f"{pt.get(2, 0):.2f}\t{pt.get(3, 0):.2f}"
+                        )
+                else:
+                    prob = pr.get("probability_distribution", {})
+                    pt = pr.get("target", "")
+                    base_rows.append(
+                        f"{pr['pattern_str']}\t{pt}\t{turn_str}\t"
+                        f"{prob.get(0, 0):.2f}\t{prob.get(1, 0):.2f}\t"
+                        f"{prob.get(2, 0):.2f}\t{prob.get(3, 0):.2f}"
+                    )
+            for tk in all_tiles:
+                merged_dist = {0: 0, 1: 0, 2: 0, 3: 0}
+                for pr in checked:
+                    d = pr.get("target_count_distribution") or {}
+                    if pr.get("multi_target"):
+                        sub = d.get(tk, {})
+                    else:
+                        sub = d if pr.get("target") == tk else {}
+                    if isinstance(sub, dict):
+                        for c in (0, 1, 2, 3):
+                            merged_dist[c] += sub.get(c, 0)
+                probs_tk = [
+                    (merged_dist[k] / total_matches * 100) if total_matches > 0 else 0
+                    for k in (0, 1, 2, 3)
+                ]
+                merge_lines.append(
+                    f"  {tk}: 有0张 {probs_tk[0]:.1f}% 有1张 {probs_tk[1]:.1f}% "
+                    f"有2张 {probs_tk[2]:.1f}% 有3张 {probs_tk[3]:.1f}%"
+                )
+                base_rows.append(
+                    f"【合并】\t{tk}\t{turn_str}\t"
+                    f"{probs_tk[0]:.2f}\t{probs_tk[1]:.2f}\t"
+                    f"{probs_tk[2]:.2f}\t{probs_tk[3]:.2f}"
+                )
+            base_rows.append("")
+            base_rows.append(f"总匹配样本数\t{total_matches}")
+            base_rows.append(f"分析耗时(秒)\t{result.get('elapsed_seconds', 0):.1f}")
+            self.merged_result_label.setText("\n".join(merge_lines))
+            self._excel_clipboard_text = "\n".join(base_rows)
+            return
         keys = [0, 1] if (use_tenpai or use_related_tile) else [0, 1, 2, 3]
         merged_dist = {k: 0 for k in keys}
         for pr in checked:
@@ -2437,6 +2883,73 @@ class MainWindow(QMainWindow):
             hand_visible_constraints[tile] = (min_count, max_count)
         return hand_visible_constraints
 
+    def _rebuild_player_visible_constraint_grid(self):
+        layout = self.player_visible_constraint_rows_layout
+        parent = self.player_visible_constraint_rows_widget
+        if not layout or not parent:
+            return
+        while layout.count():
+            layout.takeAt(0)
+        for i, (_, _, row_widget) in enumerate(self.player_visible_constraint_row_refs):
+            row_widget.setParent(parent)
+            layout.addWidget(row_widget, i // 2, i % 2)
+            row_widget.show()
+
+    def _add_player_visible_constraint_row(self):
+        row_widget = QWidget(self.player_visible_constraint_rows_widget)
+        row_widget.setFixedWidth(292)
+        row_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 8, 2)
+        row_layout.setSpacing(4)
+        tile_edit = QLineEdit()
+        tile_edit.setPlaceholderText("牌，如 5p")
+        tile_edit.setFixedWidth(52)
+        row_layout.addWidget(tile_edit)
+        row_layout.addWidget(QLabel("合计"))
+        range_slider = DiscreteRangeSlider()
+        row_layout.addWidget(range_slider)
+        row_layout.addWidget(QLabel("枚"))
+        remove_btn = QPushButton("X")
+        remove_btn.setFixedSize(32, 24)
+        remove_btn.setToolTip("删除此行")
+        row_layout.addWidget(remove_btn)
+        self.player_visible_constraint_row_refs.append((tile_edit, range_slider, row_widget))
+        idx = len(self.player_visible_constraint_row_refs) - 1
+        self.player_visible_constraint_rows_layout.addWidget(row_widget, idx // 2, idx % 2)
+        row_widget.show()
+
+        def do_remove():
+            self.player_visible_constraint_rows_layout.removeWidget(row_widget)
+            row_widget.deleteLater()
+            self.player_visible_constraint_row_refs.remove((tile_edit, range_slider, row_widget))
+            self._rebuild_player_visible_constraint_grid()
+
+        remove_btn.clicked.connect(do_remove)
+
+    def _get_player_visible_constraints_from_ui(self) -> Dict[str, Tuple[int, int]]:
+        out = {}
+        for tile_edit, range_slider, _ in self.player_visible_constraint_row_refs:
+            tile = tile_edit.text().strip()
+            if not tile:
+                continue
+            min_count, max_count = range_slider.getRange()
+            if min_count > max_count:
+                continue
+            out[tile] = (min_count, max_count)
+        return out
+
+    def _show_player_visible_help(self):
+        QMessageBox.information(
+            self,
+            "玩家可见枚数说明",
+            "约束对象：达成舍牌模式的玩家（目标玩家）。\n\n"
+            "合计枚数 = 该玩家在当前打出瞬间手牌中的该牌枚数（含本张打出牌，与延伸手牌对自家口径一致）"
+            "+ 场上可见枚数（与「场上可见枚数」相同统计：visible_tiles，含舍牌/副露/宝牌指示等已暴露牌）。\n\n"
+            "若某牌设「合计 3-3」，则手牌中该牌与场上该牌之和必须恰为 3。\n"
+            "可与「场上可见」「手牌可见」同时使用；三者独立校验。",
+        )
+
     def _show_hand_visible_help(self):
         """显示手牌可见枚数说明"""
         QMessageBox.information(
@@ -2462,7 +2975,13 @@ class MainWindow(QMainWindow):
                 continue
             lines.append("模式=%s→%s" % (pt, tg or ""))
         analysis = self.analysis_target_combo.currentData() or "target_count"
-        analysis_map = {"target_count": "目标牌存量", "tenpai": "是否听牌", "related_tile": "关联牌判断", "outcome": "和铳率"}
+        analysis_map = {
+            "target_count": "目标牌存量",
+            "tenpai": "是否听牌",
+            "related_tile": "关联牌判断",
+            "outcome": "和铳率",
+            "yaku_hai_hand": "役牌手持统计",
+        }
         lines.append("分析=%s" % analysis_map.get(analysis, "目标牌存量"))
         # 仅「目标牌存量」有意义；与 execute_query 中 independence_on 口径一致
         if analysis == "target_count" and getattr(self, "independence_filter_check", None):
@@ -2510,9 +3029,10 @@ class MainWindow(QMainWindow):
             lines.append("目标无副露=是")
         lines.append("南三=%s" % ("是" if self.exclude_south3_check.isChecked() else "否"))
         lines.append("南四=%s" % ("是" if self.exclude_south4_check.isChecked() else "否"))
-        prior = self.prior_discard_exclusion_input.text().strip()
-        if prior:
-            lines.append("前段禁打=%s" % prior)
+        prior_plain = self.prior_discard_exclusion_input.toPlainText().strip()
+        if prior_plain:
+            for pline in [x.strip() for x in prior_plain.splitlines() if x.strip()]:
+                lines.append("前段禁打=%s" % pline)
         prior_req = self.prior_discard_required_input.text().strip()
         if prior_req:
             lines.append("前段有打=%s" % prior_req)
@@ -2524,6 +3044,8 @@ class MainWindow(QMainWindow):
             lines.append("可见=%s:%d-%d" % (tile, lo, hi))
         for tile, (lo, hi) in self._get_hand_visible_constraints_from_ui().items():
             lines.append("手牌可见=%s:%d-%d" % (tile, lo, hi))
+        for tile, (lo, hi) in self._get_player_visible_constraints_from_ui().items():
+            lines.append("玩家可见=%s:%d-%d" % (tile, lo, hi))
         sample_limit = self.sample_limit_input.value()
         if sample_limit != 10000:
             lines.append("样本上限=%d" % sample_limit)
@@ -2542,10 +3064,24 @@ class MainWindow(QMainWindow):
                 continue
             lines.append("模式=%s→%s" % (pt, tg))
         lines.append("分析=即时铳率")
-        t_min = self.instant_turn_min.value()
-        t_max = self.instant_turn_max.value()
-        if t_min != 1 or t_max != 18:
-            lines.append("巡目=%d-%d" % (t_min, t_max))
+        inst_trs = []
+        seen_s = set()
+        for edit in getattr(self, "_instant_turn_range_edits", []):
+            line = edit.text().strip()
+            if not line:
+                continue
+            tr = _parse_turn_range(line)
+            if tr and tr not in seen_s:
+                seen_s.add(tr)
+                inst_trs.append(tr)
+        if inst_trs:
+            for t_min, t_max in inst_trs:
+                lines.append("巡目范围=%d-%d" % (t_min, t_max))
+        else:
+            t_min = self.instant_turn_min.value()
+            t_max = self.instant_turn_max.value()
+            if t_min != 1 or t_max != 18:
+                lines.append("巡目=%d-%d" % (t_min, t_max))
         if self.instant_dora_any_radio.isChecked():
             lines.append("宝牌=不问")
         elif self.instant_dora_irrelevant_radio.isChecked():
@@ -2579,9 +3115,10 @@ class MainWindow(QMainWindow):
             lines.append("目标无副露=是")
         lines.append("南三=%s" % ("是" if self.instant_exclude_south3_check.isChecked() else "否"))
         lines.append("南四=%s" % ("是" if self.instant_exclude_south4_check.isChecked() else "否"))
-        prior = self.instant_prior_discard_exclusion_input.text().strip()
-        if prior:
-            lines.append("前段禁打=%s" % prior)
+        prior_plain = self.instant_prior_discard_exclusion_input.toPlainText().strip()
+        if prior_plain:
+            for pline in [x.strip() for x in prior_plain.splitlines() if x.strip()]:
+                lines.append("前段禁打=%s" % pline)
         prior_req = self.instant_prior_discard_required_input.text().strip()
         if prior_req:
             lines.append("前段有打=%s" % prior_req)
@@ -2593,6 +3130,8 @@ class MainWindow(QMainWindow):
             lines.append("可见=%s:%d-%d" % (tile, lo, hi))
         for tile, (lo, hi) in self._instant_get_hand_visible_constraints_from_ui().items():
             lines.append("手牌可见=%s:%d-%d" % (tile, lo, hi))
+        for tile, (lo, hi) in self._instant_get_player_visible_constraints_from_ui().items():
+            lines.append("玩家可见=%s:%d-%d" % (tile, lo, hi))
         furiten = self.instant_hypothetical_furiten_input.text().strip()
         if furiten:
             lines.append("假想振听=%s" % furiten)
@@ -2629,11 +3168,11 @@ class MainWindow(QMainWindow):
                 continue
             k, _, v = line.partition("=")
             k, v = k.strip(), v.strip()
-            if k in ("模式", "副露区域", "可见", "手牌可见", "巡目范围"):
+            if k in ("模式", "副露区域", "可见", "手牌可见", "玩家可见", "巡目范围", "前段禁打"):
                 data.setdefault(k, []).append(v)
             else:
                 data[k] = v
-        for k in ("模式", "副露区域", "可见", "手牌可见", "巡目范围"):
+        for k in ("模式", "副露区域", "可见", "手牌可见", "玩家可见", "巡目范围", "前段禁打"):
             if k in data and isinstance(data[k], str):
                 data[k] = [data[k]]
         return data if data else None
@@ -2662,13 +3201,43 @@ class MainWindow(QMainWindow):
                 else:
                     pattern_edit.clear()
                     target_edit.clear()
-            t_min, t_max = 1, 18
-            turn = data.get("巡目", "")
-            if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
-                a, b = turn.split("-")
-                t_min, t_max = int(a), int(b)
-            self.instant_turn_min.setValue(max(1, min(18, t_min)))
-            self.instant_turn_max.setValue(max(1, min(18, t_max)))
+            turn_range_strs = data.get("巡目范围") or []
+            if isinstance(turn_range_strs, str):
+                turn_range_strs = [turn_range_strs]
+            turn_range_strs = [s for s in turn_range_strs if isinstance(s, str) and _parse_turn_range(s)]
+            if turn_range_strs:
+                row_layout = getattr(self, "_instant_turn_ranges_row_layout", None)
+                add_btn = getattr(self, "_instant_add_turn_range_btn", None)
+                while (
+                    len(self._instant_turn_range_edits) < len(turn_range_strs)
+                    and row_layout
+                    and add_btn
+                ):
+                    self._instant_add_turn_range_pair(row_layout, add_btn)
+                for i, s in enumerate(turn_range_strs):
+                    if i < len(self._instant_turn_range_edits):
+                        tr = _parse_turn_range(s)
+                        self._instant_turn_range_edits[i].setText(
+                            "%d-%d" % (tr[0], tr[1]) if tr else s
+                        )
+                for i in range(len(turn_range_strs), len(self._instant_turn_range_edits)):
+                    self._instant_turn_range_edits[i].clear()
+                all_ok = [x for x in (_parse_turn_range(s) for s in turn_range_strs) if x]
+                if all_ok:
+                    t_lo = min(r[0] for r in all_ok)
+                    t_hi = max(r[1] for r in all_ok)
+                    self.instant_turn_min.setValue(max(1, min(18, t_lo)))
+                    self.instant_turn_max.setValue(max(1, min(18, t_hi)))
+            else:
+                t_min, t_max = 1, 18
+                turn = data.get("巡目", "")
+                if isinstance(turn, str) and re.match(r"^\d+-\d+$", turn):
+                    a, b = turn.split("-")
+                    t_min, t_max = int(a), int(b)
+                self.instant_turn_min.setValue(max(1, min(18, t_min)))
+                self.instant_turn_max.setValue(max(1, min(18, t_max)))
+                for edit in getattr(self, "_instant_turn_range_edits", []):
+                    edit.clear()
             self._apply_share_string_dora(data, instant=True)
             self._apply_share_string_riichi_call_south(data, instant=True)
             self._apply_share_string_prior_call_area(data, instant=True)
@@ -2704,7 +3273,13 @@ class MainWindow(QMainWindow):
                 else:
                     pattern_edit.clear()
                     target_edit.clear()
-            analysis_map = {"目标牌存量": "target_count", "是否听牌": "tenpai", "关联牌判断": "related_tile", "和铳率": "outcome"}
+            analysis_map = {
+                "目标牌存量": "target_count",
+                "是否听牌": "tenpai",
+                "关联牌判断": "related_tile",
+                "和铳率": "outcome",
+                "役牌手持统计": "yaku_hai_hand",
+            }
             target = analysis_map.get(data.get("分析", "目标牌存量"), "target_count")
             for i in range(self.analysis_target_combo.count()):
                 if self.analysis_target_combo.itemData(i) == target:
@@ -2825,19 +3400,23 @@ class MainWindow(QMainWindow):
         s4.setChecked((data.get("南四") or "否") == "是")
 
     def _apply_share_string_prior_call_area(self, data: Dict[str, Any], instant: bool):
-        prior = (data.get("前段禁打") or "").strip()
+        praw = data.get("前段禁打")
+        if isinstance(praw, list):
+            prior = "\n".join(str(x).strip() for x in praw if str(x).strip())
+        else:
+            prior = (str(praw).strip() if praw else "")
         prior_req = (data.get("前段有打") or "").strip()
         areas = data.get("副露区域")
         if not isinstance(areas, list):
             areas = [areas] if areas else []
         areas = [str(x).strip() for x in areas if x][:4]
         if instant:
-            self.instant_prior_discard_exclusion_input.setText(prior)
+            self.instant_prior_discard_exclusion_input.setPlainText(prior)
             self.instant_prior_discard_required_input.setText(prior_req)
             for i, le in enumerate(self.instant_call_area_inputs):
                 le.setText(areas[i] if i < len(areas) else "")
         else:
-            self.prior_discard_exclusion_input.setText(prior)
+            self.prior_discard_exclusion_input.setPlainText(prior)
             self.prior_discard_required_input.setText(prior_req)
             for i, le in enumerate(self.call_area_inputs):
                 le.setText(areas[i] if i < len(areas) else "")
@@ -2883,6 +3462,26 @@ class MainWindow(QMainWindow):
                 if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
                     h_entries.append((parts[0], int(parts[1]), int(parts[2])))
 
+        p_vis = data.get("玩家可见") or []
+        if not isinstance(p_vis, list):
+            p_vis = [p_vis] if p_vis else []
+        p_entries = []
+        for v in p_vis:
+            v = str(v).strip()
+            if not v:
+                continue
+            if ":" in v:
+                tile, _, rng = v.partition(":")
+                tile = tile.strip()
+                rng = rng.strip()
+                if re.match(r"^\d+-\d+$", rng):
+                    lo, hi = int(rng.split("-")[0]), int(rng.split("-")[1])
+                    p_entries.append((tile, max(0, min(4, lo)), max(0, min(4, hi))))
+            else:
+                parts = v.split()
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    p_entries.append((parts[0], int(parts[1]), int(parts[2])))
+
         if instant:
             # 场上可见
             for _, _, row_widget in list(self.instant_visible_constraint_row_refs):
@@ -2908,6 +3507,17 @@ class MainWindow(QMainWindow):
                 range_slider.setRange(lo, hi)
             if not h_entries:
                 self._instant_add_hand_visible_constraint_row()
+            for _, _, row_widget in list(self.instant_player_visible_constraint_row_refs):
+                self.instant_player_visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.instant_player_visible_constraint_row_refs.clear()
+            for tile, lo, hi in p_entries:
+                self._instant_add_player_visible_constraint_row()
+                tile_edit, range_slider, _ = self.instant_player_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not p_entries:
+                self._instant_add_player_visible_constraint_row()
         else:
             # 场上可见
             for _, _, row_widget in list(self.visible_constraint_row_refs):
@@ -2933,6 +3543,17 @@ class MainWindow(QMainWindow):
                 range_slider.setRange(lo, hi)
             if not h_entries:
                 self._add_hand_visible_constraint_row()
+            for _, _, row_widget in list(self.player_visible_constraint_row_refs):
+                self.player_visible_constraint_rows_layout.removeWidget(row_widget)
+                row_widget.deleteLater()
+            self.player_visible_constraint_row_refs.clear()
+            for tile, lo, hi in p_entries:
+                self._add_player_visible_constraint_row()
+                tile_edit, range_slider, _ = self.player_visible_constraint_row_refs[-1]
+                tile_edit.setText(tile)
+                range_slider.setRange(lo, hi)
+            if not p_entries:
+                self._add_player_visible_constraint_row()
 
     def _show_generate_share_dialog(self, from_instant: bool):
         """弹出对话框展示分享串并复制到剪贴板。from_instant 为 True 时从铳率分析页生成。"""
@@ -2993,14 +3614,15 @@ class MainWindow(QMainWindow):
         use_instant = (analysis_target == "deal_in_instant")
         use_outcome = (analysis_target == "outcome")
         use_related_tile = (analysis_target == "related_tile")
-        require_target = not (use_tenpai or use_outcome)  # 关联牌判断需目标牌（分析该牌的关联度）
+        use_yaku_hai = (analysis_target == "yaku_hai_hand")
+        require_target = not (use_tenpai or use_outcome or use_yaku_hai)
         query_items = self._get_pattern_items(require_target=require_target)
         if not query_items:
             msg = "请至少输入一个舍牌模式"
             if require_target:
                 msg += "和对应的目标牌"
-            elif use_outcome:
-                msg += "（和铳率无需目标牌）"
+            elif use_outcome or use_yaku_hai:
+                msg += "（和铳率/役牌统计无需目标牌）"
             QMessageBox.warning(self, "输入错误", msg)
             return
         first_pattern, first_target = query_items[0]
@@ -3061,6 +3683,9 @@ class MainWindow(QMainWindow):
 
         # 手牌可见枚数
         hand_visible_constraints = self._get_hand_visible_constraints_from_ui()
+
+        # 玩家可见（手牌+场上合计）
+        player_visible_constraints = self._get_player_visible_constraints_from_ui()
         
         # 样本上限
         sample_limit = self.sample_limit_input.value()
@@ -3071,8 +3696,9 @@ class MainWindow(QMainWindow):
             turn_min, turn_max = self.turn_range_slider.getRange()
             if turn_min <= turn_max:
                 turn_ranges = [(turn_min, turn_max)]
-        use_grid = len(turn_ranges) > 1 and not (use_outcome or use_instant)  # 和铳率/即时铳率不支持矩阵分析
-        if (use_outcome or use_instant) and turn_ranges:
+        # 多巡目矩阵：和铳率仍不支持；即时铳率已与主分析对齐（GridQueryThread + deal_in_instant）
+        use_grid = len(turn_ranges) > 1 and not use_outcome and not use_yaku_hai
+        if (use_outcome or use_instant or use_yaku_hai) and turn_ranges:
             t_min = min(r[0] for r in turn_ranges)
             t_max = max(r[1] for r in turn_ranges)
             turn_range = None if (t_min == 1 and t_max == 18) else (t_min, t_max)
@@ -3111,6 +3737,7 @@ class MainWindow(QMainWindow):
             "instant_normalize_oya_ron_to_ko": instant_normalize_oya_ron_to_ko if use_instant else False,
             "visible_constraints": visible_constraints if visible_constraints else None,
             "hand_visible_constraints": hand_visible_constraints if hand_visible_constraints else None,
+            "player_visible_constraints": player_visible_constraints if player_visible_constraints else None,
             "dora_constraint": dora_constraint,
             "dora_position_spec": dora_position_spec,
             "riichi_constraint": riichi_constraint,
@@ -3124,7 +3751,9 @@ class MainWindow(QMainWindow):
             "analysis_batch_size": analysis_batch_size,
             "exclude_south4": self.exclude_south4_check.isChecked(),
             "exclude_south3": self.exclude_south3_check.isChecked(),
-            "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+            "prior_discard_exclusion": (
+                self.prior_discard_exclusion_input.toPlainText().strip() or None
+            ),
             "prior_discard_required": self.prior_discard_required_input.text().strip() or None,
             "hypothetical_furiten_tiles": hypothetical_furiten,
             "max_workers": self.max_workers_spin.value(),
@@ -3172,6 +3801,7 @@ class MainWindow(QMainWindow):
         use_related_tile = self.last_query_params.get("analysis_target") == "related_tile"
         use_instant = self.last_query_params.get("analysis_target") == "deal_in_instant"
         use_outcome = self.last_query_params.get("analysis_target") == "outcome"
+        use_yaku_hai = self.last_query_params.get("analysis_target") == "yaku_hai_hand"
         is_combo = self.last_query_params.get("is_combo", False)
         if use_instant:
             if self.sample_target_combo.count() != 4 or self.sample_target_combo.itemText(1) != "可铳":
@@ -3189,6 +3819,15 @@ class MainWindow(QMainWindow):
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "非关联":
                 self.sample_target_combo.clear()
                 self.sample_target_combo.addItems(["全部", "非关联", "关联"])
+        elif use_yaku_hai:
+            # 与主统计口径一致：零对/一对/两对/三对及以上（筛选用 pair_kinds；末项为 ≥3）
+            _yaku_sample_items = ["全部", "零对", "一对", "两对", "三对及以上"]
+            if (
+                self.sample_target_combo.count() != len(_yaku_sample_items)
+                or self.sample_target_combo.itemText(1) != "零对"
+            ):
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(_yaku_sample_items)
         elif is_combo:
             if self.sample_target_combo.count() != 3 or self.sample_target_combo.itemText(1) != "没有":
                 self.sample_target_combo.clear()
@@ -3211,6 +3850,13 @@ class MainWindow(QMainWindow):
             deal_in_filter = None
             outcome_filter = None
             target_count_filter = None if idx == 0 else (1 if idx == 2 else 0)  # 0=非关联 1=关联
+        elif use_yaku_hai:
+            deal_in_filter = None
+            outcome_filter = None
+            # idx 1～3：pair_kinds 精确为 0/1/2；idx 4：pair_kinds ≥ 3（见 YAKU_HAI_PAIR_FILTER_GE3）
+            target_count_filter = None if idx == 0 else (
+                YAKU_HAI_PAIR_FILTER_GE3 if idx == 4 else (idx - 1)
+            )
         else:
             deal_in_filter = None
             outcome_filter = None
@@ -3285,6 +3931,8 @@ class MainWindow(QMainWindow):
                 target_tile = "听牌"  # 样本展示用
             elif self.last_query_params.get("analysis_target") == "outcome":
                 target_tile = "和铳率"  # 样本展示用
+            elif self.last_query_params.get("analysis_target") == "yaku_hai_hand":
+                target_tile = "役牌手持"  # 样本展示用
             try:
                 text = format_samples_for_display(
                     samples,
@@ -3374,11 +4022,17 @@ class MainWindow(QMainWindow):
                 self.last_query_params = {"analysis_target": result.get("analysis_target", "target_count")}
                 n_pat = len(result.get("patterns", []))
                 n_tr = len(result.get("turn_ranges", []))
+                _is_inst_grid = result.get("analysis_target") == "deal_in_instant"
                 summary = (
                     f"矩阵分析完成：{n_pat} 模式 × {n_tr} 巡目，共 {n_pat * n_tr} 格\n"
                     f"分析半庄数: {_fmt_int(result.get('total_logs_analyzed', 0))}\n"
                     f"分析耗时: {result.get('elapsed_seconds', 0):.1f} 秒\n\n"
-                    "点击「展示矩阵」查看每格样本数，并可勾选 0/1/2/3 张后复制 Excel 格式。"
+                    + (
+                        "本结果为即时铳率矩阵：「展示矩阵」中按每个目标牌分别显示铳率(%)、平均铳点、铳度；"
+                        "可勾选「模式·目标」列，行末为勾选列的算术平均。主窗口「复制 Excel」导出同上（默认全选列）。\n"
+                        if _is_inst_grid
+                        else "点击「展示矩阵」查看每格样本数，并可勾选 0/1/2/3 张后复制 Excel 格式。"
+                    )
                 )
                 self.result_text.setText(summary)
                 self.multi_merge_widget.setVisible(False)
@@ -3386,29 +4040,37 @@ class MainWindow(QMainWindow):
                 self.matrix_display_btn.setEnabled(True)
                 header_col = result.get("header_col", [])
                 header_row = result.get("header_row", [])
-                _merge_keys = [1] if result.get("analysis_target") in ("tenpai", "related_tile") else [1, 2]
-                _tbl = {}
-                for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
-                    _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
-                _counts = result.get("table_counts", {})
-                header_two = []
-                for h in header_col:
-                    header_two.append(h)
-                    header_two.append(f"{h}(n)")
-                _rows = ["巡目范围\t" + "\t".join(header_two)]
-                for tr_idx, lbl in enumerate(header_row):
-                    _cells = [lbl]
-                    for pat_idx in range(len(header_col)):
-                        v = _tbl.get((tr_idx, pat_idx), "")
-                        n = _counts.get((tr_idx, pat_idx))
-                        if n is not None:
-                            _cells.append(str(v) if v != "" and v is not None else "")
-                            _cells.append(str(n))
-                        else:
-                            _cells.append(str(v) if v != "" else "")
-                            _cells.append("")
-                    _rows.append("\t".join(_cells))
-                self._excel_clipboard_text = "\n".join(_rows)
+                if _is_inst_grid and result.get("instant_matrix_cells"):
+                    self._excel_clipboard_text = instant_matrix_export_tsv(result, None)
+                else:
+                    _merge_keys = (
+                        [1]
+                        if result.get("analysis_target")
+                        in ("tenpai", "related_tile", "deal_in_instant")
+                        else [1, 2]
+                    )
+                    _tbl = {}
+                    for (tr_idx, pat_idx), dist in result.get("table_dist", {}).items():
+                        _tbl[(tr_idx, pat_idx)] = round(sum(dist.get(k, 0) for k in _merge_keys), 2)
+                    _counts = result.get("table_counts", {})
+                    header_two = []
+                    for h in header_col:
+                        header_two.append(h)
+                        header_two.append(f"{h}(n)")
+                    _rows = ["巡目范围\t" + "\t".join(header_two)]
+                    for tr_idx, lbl in enumerate(header_row):
+                        _cells = [lbl]
+                        for pat_idx in range(len(header_col)):
+                            v = _tbl.get((tr_idx, pat_idx), "")
+                            n = _counts.get((tr_idx, pat_idx))
+                            if n is not None:
+                                _cells.append(str(v) if v != "" and v is not None else "")
+                                _cells.append(str(n))
+                            else:
+                                _cells.append(str(v) if v != "" else "")
+                                _cells.append("")
+                        _rows.append("\t".join(_cells))
+                    self._excel_clipboard_text = "\n".join(_rows)
                 self.copy_excel_btn.setEnabled(True)
                 self.save_archive_btn.setEnabled(True)
                 self.main_tab.setCurrentIndex(2)
@@ -3461,6 +4123,8 @@ class MainWindow(QMainWindow):
                 "dora_constraint": dora_constraint,
                 "dora_position_spec": self._parse_dora_position_spec() if self.dora_matches_position_radio.isChecked() else [],
                 "visible_constraints": visible_constraints if visible_constraints else None,
+                "hand_visible_constraints": self._get_hand_visible_constraints_from_ui() or None,
+                "player_visible_constraints": self._get_player_visible_constraints_from_ui() or None,
                 "riichi_constraint": riichi_constraint,
                 "call_constraint": call_constraint,
                 "call_area_constraints": call_area_constraints,
@@ -3470,7 +4134,9 @@ class MainWindow(QMainWindow):
                 "total_logs_hint": total_logs_hint,
                 "exclude_south4": self.exclude_south4_check.isChecked(),
             "exclude_south3": self.exclude_south3_check.isChecked(),
-                "prior_discard_exclusion": self.prior_discard_exclusion_input.text().strip() or None,
+                "prior_discard_exclusion": (
+                    self.prior_discard_exclusion_input.toPlainText().strip() or None
+                ),
                 "prior_discard_required": self.prior_discard_required_input.text().strip() or None,
                 "analysis_batch_size": self.analysis_batch_size_spin.value(),
                 "gc_interval_batches": self.gc_interval_batches_spin.value(),
@@ -3488,12 +4154,23 @@ class MainWindow(QMainWindow):
             use_related_tile = (result.get("analysis_target") == "related_tile")
             use_instant = (result.get("analysis_target") == "deal_in_instant")
             if result.get("multi_pattern") and pr_list:
+                use_yaku_hai = result.get("analysis_target") == "yaku_hai_hand"
                 for pr in pr_list:
-                    lbl = f"{pr['pattern_str']} → 听牌" if use_tenpai else (f"{pr['pattern_str']} → 关联牌" if use_related_tile else f"{pr['pattern_str']} → {pr['target']}")
+                    lbl = (
+                        f"{pr['pattern_str']} → 听牌" if use_tenpai
+                        else (f"{pr['pattern_str']} → 关联牌" if use_related_tile
+                              else (f"{pr['pattern_str']} → 役牌" if use_yaku_hai else f"{pr['pattern_str']} → {pr['target']}")
+                              )
+                    )
                     self.sample_pattern_combo.addItem(lbl)
             else:
                 first_pattern, first_target = query_items[0]
-                lbl = "-".join(first_pattern) + (" → 听牌" if use_tenpai else (" → 关联牌" if use_related_tile else f" → {first_target}"))
+                use_yaku_hai = result.get("analysis_target") == "yaku_hai_hand"
+                lbl = "-".join(first_pattern) + (
+                    " → 听牌" if use_tenpai
+                    else (" → 关联牌" if use_related_tile
+                          else (" → 役牌" if use_yaku_hai else f" → {first_target}"))
+                )
                 self.sample_pattern_combo.addItem(lbl)
             # 多目标时：目标牌下拉（全部/6s/2m/5p）
             self.sample_target_tile_combo.clear()
@@ -3512,6 +4189,11 @@ class MainWindow(QMainWindow):
                 self.sample_target_combo.addItems(["全部", "未听牌", "听牌"])
             elif use_related_tile:
                 self.sample_target_combo.addItems(["全部", "非关联", "关联"])
+            elif result.get("analysis_target") == "yaku_hai_hand":
+                self.sample_target_combo.clear()
+                self.sample_target_combo.addItems(
+                    ["全部", "零对", "一对", "两对", "三对及以上"]
+                )
             else:
                 any_single = any(not pr.get("is_combo", True) for pr in pr_list) if pr_list else True
                 if result.get("multi_pattern") and any_single:
@@ -3530,8 +4212,13 @@ class MainWindow(QMainWindow):
                 use_related_tile = (result.get("analysis_target") == "related_tile")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")
                 lines = ["查询完成！\n", f"总匹配数: {_fmt_int(result['total_matches'])}\n"]
+                use_yaku_hai = (result.get("analysis_target") == "yaku_hai_hand")
                 for pr in pr_list:
-                    pr_label = f"{pr['pattern_str']} → 听牌" if use_tenpai else (f"{pr['pattern_str']} → 关联牌" if use_related_tile else f"{pr['pattern_str']} → {pr['target']}")
+                    pr_label = (
+                        f"{pr['pattern_str']} → 听牌" if use_tenpai
+                        else (f"{pr['pattern_str']} → 关联牌" if use_related_tile
+                              else (f"{pr['pattern_str']} → 役牌" if use_yaku_hai else f"{pr['pattern_str']} → {pr['target']}"))
+                    )
                     tcd = pr.get('target_count_distribution', {})
                     lines.append(f"  {pr_label}: {_fmt_int(pr['matches'])} 次")
                     if use_instant:
@@ -3544,6 +4231,23 @@ class MainWindow(QMainWindow):
                                     f"平均铳点 {s.get('point_avg', 0):.1f} | 铳度 {s.get('intensity', 0):.2f}"
                                 )
                         continue
+                    elif use_yaku_hai:
+                        pdim = pr.get("probability_distribution") or {}
+                        sub_tk = tcd.get("kinds", {})
+                        sub_pk = pdim.get("kinds", {})
+                        seg_k = " ".join(
+                            f"{i}:{sub_pk.get(i, 0):.1f}%({_fmt_int(sub_tk.get(i, 0))}例)"
+                            for i in range(6)
+                        )
+                        lines.append(f"    役牌种类(≥1枚): {seg_k}")
+                        sub_tu = tcd.get("pair_units", {})
+                        sub_pu = pdim.get("pair_units", {})
+                        _yl = ("零对", "一对", "两对", "三对及以上")
+                        seg_u = " ".join(
+                            f"{_yl[i]}:{sub_pu.get(i, 0):.1f}%({_fmt_int(sub_tu.get(i, 0))}例)"
+                            for i in range(4)
+                        )
+                        lines.append(f"    役牌对副数: {seg_u}")
                     elif use_tenpai:
                         lines.append(
                             f"    未听牌: {pr['probability_distribution'][0]:.1f}% ({_fmt_int(tcd.get(0, 0))} 例)  "
@@ -3605,7 +4309,9 @@ class MainWindow(QMainWindow):
                 use_tenpai = (result.get("analysis_target") == "tenpai")
                 use_related_tile = (result.get("analysis_target") == "related_tile")
                 use_instant = (result.get("analysis_target") == "deal_in_instant")
+                use_yaku_hai = (result.get("analysis_target") == "yaku_hai_hand")
                 multi_target = result.get("multi_target", False)
+                is_combo = result.get("is_combo", False)
                 if use_instant and multi_target and result.get("multi_instant_stats"):
                     stats = result["multi_instant_stats"]
                     lines = [
@@ -3657,6 +4363,24 @@ class MainWindow(QMainWindow):
                         f"  关联: {result['probability_distribution'][1]:.2f}% ({_fmt_int(result['target_count_distribution'][1])} 例)"
                     )
                     target_label = "分析目标: 关联牌"
+                elif use_yaku_hai:
+                    tcd = result.get("target_count_distribution", {})
+                    pdim = result.get("probability_distribution", {})
+                    sub_tk = tcd.get("kinds", {})
+                    sub_pk = pdim.get("kinds", {})
+                    line_k = "  役牌种类(≥1枚，自风/场风/三元按座): " + " ".join(
+                        f"{i}:{sub_pk.get(i, 0):.2f}% ({_fmt_int(sub_tk.get(i, 0))} 例)"
+                        for i in range(6)
+                    )
+                    sub_tu = tcd.get("pair_units", {})
+                    sub_pu = pdim.get("pair_units", {})
+                    _yl = ("零对", "一对", "两对", "三对及以上")
+                    line_u = "  役牌对副数(每种≥2枚计1副，刻子仍计1副): " + " ".join(
+                        f"{_yl[i]}:{sub_pu.get(i, 0):.2f}% ({_fmt_int(sub_tu.get(i, 0))} 例)"
+                        for i in range(4)
+                    )
+                    dist_text = line_k + "\n" + line_u
+                    target_label = "分析目标: 役牌手持统计（无需填目标牌；种类 0–5 为桶上限）"
                 elif multi_target:
                     tcd = result.get('target_count_distribution', {})
                     prob_d = result.get('probability_distribution', {})

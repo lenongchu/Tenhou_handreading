@@ -67,7 +67,8 @@
  ├── 4. 逐巡：equivalent_variants.match_discard_to_variant() 匹配
  ├── 5. tenpai_utils.is_tenpai() 听牌判断
  ├── 6. instant_deal_in.RoundInstantDealInAnalyzer()（analysis_target="deal_in_instant" 时）
- └── 7. 写入 game_states / visible_tile_stats，返回概率
+ ├── 7. yaku_hai_hand_stats（analysis_target="yaku_hai_hand" 时，役牌手持 kinds + pair_units 分布）
+ └── 8. 写入 game_states / visible_tile_stats，返回概率
  │
  ▼
  database (tenhou.db): logs | game_states | visible_tile_stats
@@ -82,7 +83,7 @@
 | `iter_valid_discards` | 生成器：扁平化遍历局→玩家→舍牌，统一前置过滤（南三南四、宝牌、消耗牌、副露、立直、巡目等） |
 | `MatchValidator` | 匹配后统一约束校验（禁打、前段有打、宝牌、立直、副露、可见牌、目标牌排除） |
 | `_core_match_engine` | 核心匹配引擎：预检 → 解析 → `iter_valid_discards` → 变体匹配 → `MatchValidator`，产出匹配样本迭代器 |
-| `_process_one_log_analyze` | 主界面 per-log worker：调用 `_core_match_engine(is_grid=False)`，聚合统计（target_count、即时铳率、sample_pool 等） |
+| `_process_one_log_analyze` | 主界面 per-log worker：调用 `_core_match_engine(is_grid=False)`，聚合统计（target_count、即时铳率、役牌手持分布、sample_pool 等） |
 | `_process_one_log_grid` | 矩阵 per-log worker：调用 `_core_match_engine(is_grid=True)`，按 cell 聚合 target_count 分布 |
 
 Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` 及返回结构不可变更。
@@ -111,6 +112,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 | 被依赖模块 | 依赖方 |
 |-----------|--------|
 | `mjlog_parser` | database, tenhou6_adapter, pattern_matcher, live_analyzer, equivalent_variants |
+| `yaku_hai_hand_stats` | live_analyzer |
 | `equivalent_variants` | live_analyzer, tile_illustration |
 | `tenpai_utils` | live_analyzer |
 | `instant_deal_in` | live_analyzer（即时铳率/完整振听/理论 ron 点） |
@@ -284,7 +286,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 | 模块 | 职责 | 关键类/函数 |
 |------|------|-------------|
-| `mjlog_parser` | 牌谱数据结构、牌编码工具 | GameState, Discard, CallInfo, TileUtils |
+| `mjlog_parser` | 牌谱数据结构、牌编码工具 | GameState, Discard, CallInfo, TileUtils；`get_bakaze`、`yaku_honor_bases_for_seat` |
 | `tenhou6_adapter` | tenhou6 JSON → GameState | _parse_round_from_tenhou6 |
 | `equivalent_variants` | 舍牌模式解析、等价变体、约束匹配 | generate_equivalent_variants, parse_target_tiles, match_discard_to_variant |
 | `live_analyzer` | 实时分析：模式匹配 + 概率计算 | LiveAnalyzer.analyze, get_database_stats；内部：iter_valid_discards, MatchValidator, _core_match_engine, _process_one_log_analyze/grid |
@@ -293,6 +295,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 | `tenpai_utils` | 听牌判断 | is_tenpai (mahjong 库) |
 | `related_tile_utils` | 关联牌判断 | is_related_discard, hand_to_suit_counts |
 | `taatsu_independence` | 搭子独立性筛选（可选） | combo_passes_independence_filter |
+| `yaku_hai_hand_stats` | 役牌手持统计（匹配时点手牌） | `compute_yaku_hai_hand_stats`, `yaku_pair_units_bucket`, `yaku_hai_per_tile_counts` |
 | `gui_app` | PyQt5 桌面界面 | 入口 |
 | `data_downloader` | 调用 houou-logs 下载牌谱 | DataDownloader |
 | `tile_illustration` | 舍牌示意图渲染 | render_illustration_to_qimage |
@@ -319,7 +322,8 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 2. **入库**：convert_xml_to_tenhou6 / process_all_logs → `logs` 表
 3. **分析（常规）**：LiveAnalyzer 从 logs 读牌谱 → tenhou6_adapter 解析 → 逐巡生成 GameState → 匹配模式 → 写入 game_states
 4. **分析（即时铳率）**：analysis_target=`deal_in_instant` 时，按 tenhou6 事件流重放 → instant_deal_in 判定当巡可荣和/振听/理论点
-5. **查询**：用户输入舍牌模式 → equivalent_variants 解析 → live_analyzer 查库 → 返回概率分布或即时铳率指标
+5. **分析（役牌手持）**：analysis_target=`yaku_hai_hand` 时，在匹配时点按座计算役牌集合并统计手牌三维分布（见 **六.2**）
+6. **查询**：用户输入舍牌模式 → equivalent_variants 解析 → live_analyzer 查库 → 返回概率分布、即时铳率或役牌手持指标
 
 ---
 
@@ -389,6 +393,38 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 
 ---
 
+## 六.2 役牌手持统计 (Yaku Honor Hand Stats)
+
+### 概念与口径
+
+主分析 **分析目标** 可选 **「役牌手持统计」**（`analysis_target="yaku_hai_hand"`）。在舍牌模式匹配的**当巡时点**，对**目标玩家**手牌统计立直**役牌**（自风、场风、三元）。自风与场风相同时 base 集合自动去重。
+
+- **无需填写目标牌**：界面隐藏目标列；内部仍用占位目标生成等价变体。
+- **役牌集合**：`TileUtils.yaku_honor_bases_for_seat(player_id, oya, round_num)`。**自风**为 `get_jikaze`＝`get_player_wind(player_id, oya)`（仅相对亲家座位，勿与 `round_num//4` 混算，否则南场等会误把客风当役牌、`yp` 误匹配北等）；场风为 `get_bakaze(round_num)`（与 `honor_ctx["bakaze"]` 一致，超长局下标封顶）。
+
+### 汇总分布（展示维）
+
+| 键 | 含义 |
+|----|------|
+| `kinds` | 手中至少 1 枚的役牌**种类**数，直方图键 0～5（**5** = ≥5 的上限桶） |
+| `pair_units` | 由 `pair_kinds`（至少 2 枚的役牌种类数，3/4 枚仍只计 1 副对）映射为四桶：0=零对、1=一对、2=两对、3=三对及以上 |
+
+`target_count_distribution` / `probability_distribution` 为嵌套：`{"kinds": {0…5}, "pair_units": {0…3}}`。`compute_yaku_hai_hand_stats` 仍返回 `pair_kinds`、`triple_kinds` 等，写入样本 `yaku_hai` 供明细与筛选；汇总**不再**单独展示 `triple_kinds` 直方图。
+
+### 实现与 GUI
+
+- `yaku_hai_hand_stats.py`：`compute_yaku_hai_hand_stats`、`yaku_pair_units_bucket`、`yaku_hai_per_tile_counts`
+- `live_analyzer`：`use_yaku_hai_hand` 聚合；`collect_verification_samples` 可按「零对/一对/两对/三对及以上」筛选（末项对应 `pair_kinds≥3`，常数 `YAKU_HAI_PAIR_FILTER_GE3`）
+- `gui_app`：选项、结果/合并/Excel、生成样本
+- **多组巡目**：与和铳率相同合并巡目，不跑役牌专用矩阵
+- **样本一致性抽查**：该模式下不对 `sample_pool` 做 `verify_sample_consistency` 抽查
+
+### 维护
+
+调整役牌定义时同步改 `mjlog_parser`（`get_bakaze` / `yaku_honor_bases_for_seat`）、`yaku_hai_hand_stats`、`live_analyzer` 与本节。
+
+---
+
 ## 七、维护约定
 
 - **代码注释**：编写或修改代码时，在每一段有逻辑意义的代码旁增加注释；注释用中文，技术术语附英文括注。详见 `.cursor/skills/code-comments/SKILL.md`。
@@ -398,6 +434,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 - **修改等价/映射逻辑**：确保 `generate_equivalent_variants` 与 `_dora_matches_constraint` 语义一致
 - **添加新约束**：在 equivalent_variants 中扩展占位符或 `match_discard_to_variant`
 - **修改即时铳率/振听逻辑**：改 `instant_deal_in` 与 `live_analyzer` 的 `analysis_target="deal_in_instant"` 分支，保持“当巡时点”口径
+- **修改役牌手持统计**：改 `yaku_hai_hand_stats.py`、`mjlog_parser.TileUtils.get_bakaze` / `yaku_honor_bases_for_seat` 与 `live_analyzer` 的 `yaku_hai_hand` 分支及 `gui_app`；说明见 **六.2**。
 - **修改铳率分析页（GUI）**：改 `gui_app` 中“铳率分析”分页；约束项需与主分析页保持同能力（宝牌/立直/副露/南三南四/副露区域/场上可见枚数）。铳率分析页支持**多条舍牌模式**（可添加多行“模式 + 目标牌”），满足任一即计入，与主分析页一致。
 - **矩阵分析与主分析同步**：主界面矩阵分析（`GridQueryThread`）与批量折线图（`BatchChartThread`）均调用 `analyze_discard_pattern_grid`。新增主分析约束或参数时，必须同步更新两处传给 grid 的 shared/shared_filtered 白名单，确保 `prior_discard_exclusion`、`prior_discard_required`、`gc_interval_batches` 等与主分析一致。**性能优化也需同步**：流式链路为 `BackgroundLogFetcher`（`fetchmany` 分块入队）+ `_RowTaskPrefetcher` + `_iter_pool_results_bounded`（勿在主线程用生成器包办 `next_batch`）；Python 3.11+ 可在 `live_analyzer.PARALLEL_MAX_TASKS_PER_CHILD` 设正数启用 `max_tasks_per_child`（默认 `None` 不轮换，避免过小值导致子进程频繁重启、批间停顿）；若主分析调整 `_clamp_analysis_batch_size`、`BACKGROUND_FETCHER_QUEUE_MAX_BATCHES` 等，矩阵/grid 路径需一并跟进。参考：`gui_app.GridQueryThread.run`、`gui_app.BatchChartThread.run`、`live_analyzer.analyze_discard_pattern`。
 - **规则参考**：`.cursor/skills/riichi-mahjong-rules/reference.md`、`Riichi-rules-2016-EN.pdf`
@@ -428,6 +465,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
     *   `outcome_won` / `outcome_deal_in`：和牌/放铳标记。
     *   `deal_in_hit` / `deal_in_point`：即时铳率判定及其理论点。
     *   `target_count` / `target_counts`：目标牌在手牌中的实际枚数。
+    *   `yaku_hai`：`analysis_target="yaku_hai_hand"` 时役牌三维统计与 `per_tile` 等。
 2.  **样本池缓存 (sample_pool)**：前 N 条（由 `sample_pool_cap` 控制）符合条件的完整数据会被存入 `sample_pool` 字典列表。
 
 ### 8.2 生成验证样本 (Sample Extraction)
