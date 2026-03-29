@@ -38,6 +38,8 @@ class GameState:
     """游戏状态快照"""
     player_id: int                      # 玩家编号（0-3）
     round_num: int = 0                  # 小局号（0=东1, 1=东2, 2=东3, 3=东4, 4=南1...）
+    # 谱面场风（来自 tenhou6 的 data.bakaze）：与连庄/流局后的局进度一致，勿仅用「全局第几手」推算
+    bakaze: Optional[str] = None        # 东/南/西/北；None 时 resolve_bakaze 回退 get_bakaze(round_num)
     honba: int = 0                      # 本场数（连庄次数）
     oya: int = 0                        # 该局亲家（庄家）的 player_id
     discards: List[Discard] = field(default_factory=list)  # 本家舍牌序列
@@ -176,18 +178,31 @@ class TileUtils:
     @staticmethod
     def get_bakaze(round_num: int) -> str:
         """
-        场风（round wind）：东一至东四为东，南一至南四为南…
-        与 honor_ctx 一致；超长局下标封顶，避免 round_num//4 越界。
+        场风（round wind）**回退**口径：仅当 GameState 未带谱面 `bakaze` 时使用。
+        由 round_num=field_offset+(kyoku-1) 反推东四圈/南四圈…；超长局下标封顶。
+        正常天凤谱请用 `resolve_bakaze(round_num, game_state.bakaze)`。
         """
         winds = ("东", "南", "西", "北")
         idx = min(max(round_num // 4, 0), len(winds) - 1)
         return winds[idx]
 
     @staticmethod
-    def yaku_honor_bases_for_seat(player_id: int, oya: int, round_num: int) -> Set[int]:
-        """立直役牌 base 集合：自风、场风（连风时 set 自动去重）、三元。"""
+    def resolve_bakaze(round_num: int, bakaze: Optional[str] = None) -> str:
+        """
+        场风：优先谱面记录的东/南/西/北（与 kyoku、连庄、流局后的进度一致）；
+        bakaze 为 None 时回退 `get_bakaze(round_num)`（legacy/XML 等）。
+        """
+        if bakaze:
+            return bakaze
+        return TileUtils.get_bakaze(round_num)
+
+    @staticmethod
+    def yaku_honor_bases_for_seat(
+        player_id: int, oya: int, round_num: int, bakaze: Optional[str] = None
+    ) -> Set[int]:
+        """立直役牌 base 集合：自风、场风（连风时 set 自动去重）、三元。场风优先 `bakaze` 谱面值。"""
         ji = TileUtils.get_jikaze(player_id, oya, round_num)
-        ba = TileUtils.get_bakaze(round_num)
+        ba = TileUtils.resolve_bakaze(round_num, bakaze)
         return {
             TileUtils.string_to_tile(ji),
             TileUtils.string_to_tile(ba),
@@ -201,6 +216,18 @@ class TileUtils:
         """客风：3 个非自风的风牌"""
         jikaze = TileUtils.get_jikaze(player_id, oya, round_num)
         return [w for w in ("东", "南", "西", "北") if w != jikaze]
+
+    @staticmethod
+    def get_kyokuze_excluding_bakaze_list(
+        player_id: int, oya: int, round_num: int, bakaze: Optional[str] = None
+    ) -> List[str]:
+        """
+        客风去掉场风：在客风三元组中剔除场风牌；连风（自风=场风）时与 get_kyokuze_list 相同。
+        kfx 占位符与同意的 pkfx 碰占位均以此为准。
+        """
+        kf = TileUtils.get_kyokuze_list(player_id, oya, round_num)
+        ba = TileUtils.resolve_bakaze(round_num, bakaze)
+        return [w for w in kf if w != ba]
 
     @classmethod
     def base_to_honor_str(cls, base: int) -> str:

@@ -1335,7 +1335,9 @@ def _core_match_engine(
                 "jikaze": MjlogParser.get_jikaze(
                     player_state.player_id, player_state.oya, player_state.round_num
                 ),
-                "bakaze": MjlogParser.get_bakaze(player_state.round_num),
+                "bakaze": MjlogParser.resolve_bakaze(
+                    player_state.round_num, getattr(player_state, "bakaze", None)
+                ),
                 "kyokuze_list": MjlogParser.get_kyokuze_list(
                     player_state.player_id, player_state.oya, player_state.round_num
                 ),
@@ -1493,6 +1495,12 @@ def _core_match_engine(
                 "discard_orig_i": orig_i,
             }
 
+            # 多模式：默认可对同一巡分别记录每条舍牌模式的命中（matched_idx 对应真实命中的行），
+            # 以便役牌手持等场景的 pattern 分布与 sample_pool 按模式筛选一致。
+            # 即时铳率 + 多模式：各模式目标牌可能不同，全局铳点/铳率仍保持「首条命中即停」以免重复计数与歧义。
+            leave_after_first_match = bool(
+                params.get("use_deal_in_instant", False) and len(items) > 1
+            )
             for idx, (vars_p, _, item_combo) in enumerate(item_variants):
                 if idx >= len(items):
                     break
@@ -1534,7 +1542,8 @@ def _core_match_engine(
                     "variant": matched_variant,
                     "honor_ctx": honor_ctx,
                 }
-                break  # Analyze 模式：首匹配即产出，不再尝试其余 item
+                if leave_after_first_match:
+                    break
 
 
 def _merge_instant_grid_detail(dst: Dict, src: Dict) -> None:
@@ -1976,6 +1985,8 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
         else:
             match_engine_iter = _core_match_engine(raw, params, is_grid=False)
 
+        # 同一巡可被多行舍牌模式同时命中；和牌/放铳结局只计一次，避免 total_matches 膨胀时结局重复累计
+        seen_outcome_phys: set = set()
         for m in match_engine_iter:
             matched_idx = m["matched_idx"]
             player_state = m["player_state"]
@@ -2005,10 +2016,18 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             pattern_matches[matched_idx] += 1
             rw = getattr(player_state, "round_winners", [])
             rdi = getattr(player_state, "round_deal_in", None)
-            if rw and player_state.player_id in rw:
-                outcome_wins += 1
-            if rdi is not None and rdi == player_state.player_id:
-                outcome_deal_ins += 1
+            _phys_key_out = (
+                player_state.player_id,
+                player_state.round_num,
+                player_state.honba,
+                orig_i,
+            )
+            if _phys_key_out not in seen_outcome_phys:
+                seen_outcome_phys.add(_phys_key_out)
+                if rw and player_state.player_id in rw:
+                    outcome_wins += 1
+                if rdi is not None and rdi == player_state.player_id:
+                    outcome_deal_ins += 1
 
             if orig_i < len(player_state.hand_tiles_history):
                 hand_at_turn = list(player_state.hand_tiles_history[orig_i])
@@ -2025,7 +2044,10 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
             yaku_hai_bundle = None
             if use_yaku_hai_hand:
                 yaku_bases = MjlogParser.yaku_honor_bases_for_seat(
-                    player_state.player_id, player_state.oya, player_state.round_num
+                    player_state.player_id,
+                    player_state.oya,
+                    player_state.round_num,
+                    getattr(player_state, "bakaze", None),
                 )
                 st = compute_yaku_hai_hand_stats(hand_at_turn, yaku_bases)
                 yaku_per_tile = yaku_hai_per_tile_counts(hand_at_turn, yaku_bases)
@@ -2238,6 +2260,7 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     )
                 ms_entry = {
                     "round_num": player_state.round_num,
+                    "bakaze": getattr(player_state, "bakaze", None),
                     "turn": discard.turn,
                     "actual_pattern": hand_discard_strings,
                     "mapped_target": mapped_target,
@@ -2297,7 +2320,10 @@ def _process_one_log_analyze(task: Tuple) -> Dict:
                     getattr(player_state, "calls", []) or [], discard.turn
                 )
                 sp_entry = {
-                    "log_id": log_id, "round_num": player_state.round_num, "honba": player_state.honba,
+                    "log_id": log_id,
+                    "round_num": player_state.round_num,
+                    "bakaze": getattr(player_state, "bakaze", None),
+                    "honba": player_state.honba,
                     "oya": player_state.oya, "player_id": player_state.player_id, "turn": discard.turn,
                     "actual_pattern": hand_discard_strings.copy() if hand_discard_strings else [],
                     "mapped_target": mapped_target,
@@ -3555,7 +3581,9 @@ class LiveAnalyzer:
                                         ]
                                         honor_ctx_base = {
                                             "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                            "bakaze": MjlogParser.get_bakaze(player_state.round_num),
+                                            "bakaze": MjlogParser.resolve_bakaze(
+                                                player_state.round_num, getattr(player_state, "bakaze", None)
+                                            ),
                                             "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                             "calls": getattr(player_state, "calls", []),
                                             "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
@@ -4082,7 +4110,9 @@ class LiveAnalyzer:
                             ]
                             honor_ctx_base = {
                                 "jikaze": MjlogParser.get_jikaze(player_state.player_id, player_state.oya, player_state.round_num),
-                                "bakaze": MjlogParser.get_bakaze(player_state.round_num),
+                                "bakaze": MjlogParser.resolve_bakaze(
+                                    player_state.round_num, getattr(player_state, "bakaze", None)
+                                ),
                                 "kyokuze_list": MjlogParser.get_kyokuze_list(player_state.player_id, player_state.oya, player_state.round_num),
                                 "calls": getattr(player_state, "calls", []),
                                 "dora_indicators": getattr(round_players[0], "dora_indicators", None) or getattr(player_state, "dora_indicators", []),
@@ -4550,7 +4580,7 @@ def verify_sample_consistency(
         
         ctx = {
             "jikaze": MjlogParser.get_jikaze(player_id, oya, round_num),
-            "bakaze": MjlogParser.get_bakaze(round_num),
+            "bakaze": MjlogParser.resolve_bakaze(round_num, sample.get("bakaze")),
             "kyokuze_list": MjlogParser.get_kyokuze_list(player_id, oya, round_num),
             "discard_riichi_flags": riichi_flags,
             "current_discard_turn": sample.get("turn"),

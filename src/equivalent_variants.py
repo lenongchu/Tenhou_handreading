@@ -24,10 +24,14 @@ from .mjlog_parser import MjlogParser
 from .related_tile_utils import is_related_discard, hand_to_suit_counts, base_to_discard_num_and_suit
 
 
-# 字牌占位符：z=任意字牌, zf=自风, kf=客风, yp=役牌(自风/场风/三元), ap=安牌(满足其一：该字牌可见1-3枚 或 非场风非三元可见0张，不含本张), z1/z2/z3=互不相同的字牌, kf1/kf2/kf3=互不相同的客风
-HONOR_PLACEHOLDERS = frozenset({"z", "zt", "zf", "kf", "yp", "ap", "z1", "z2", "z3", "kf1", "kf2", "kf3"})
+# 字牌占位符：z=任意字牌, zf=自风, kf=客风, kfx=客风不含场风, yp=役牌(自风/场风/三元),
+# ap=安牌（满足其一，不含本张：① 该字牌可见1–3枚；② 该牌为非场风非三元且该牌种可见0枚）。场风用 context["bakaze"]（须为 resolve_bakaze 结果）。
+# z1/z2/z3=互异字牌, kf1/kf2/kf3=互异客风
+HONOR_PLACEHOLDERS = frozenset(
+    {"z", "zt", "zf", "kf", "kfx", "yp", "ap", "z1", "z2", "z3", "kf1", "kf2", "kf3"}
+)
 HONOR_NAMES = ("东", "南", "西", "北", "白", "发", "中")
-# 1z-4z 风牌对应中文，用于 @p:kf 客风校验
+# 1z-4z 风牌对应中文，用于 @p:kf / @p:kfx 风位校验
 Z_TO_WIND = {"1z": "东", "2z": "南", "3z": "西", "4z": "北"}
 
 # 赤五输入：0m=赤5m, 0p=赤5p, 0s=赤5s（编码独立 base 34/35/36，与 5m/5p/5s 视为不同牌）
@@ -173,6 +177,15 @@ def _wind_to_z(wind: str) -> str:
     return m.get(wind, wind)
 
 
+def _kfx_wind_names_from_ctx(ctx: dict) -> List[str]:
+    """客风不含场风：在 kyokuze_list 上剔除 bakaze（中文风名）；无场风上下文时退回全客风。"""
+    kyo = list(ctx.get("kyokuze_list") or ())
+    ba = ctx.get("bakaze")
+    if not ba:
+        return kyo
+    return [w for w in kyo if w != ba]
+
+
 # tenhou-paifu-to-json 的 consumed 可能为 "1z"/"3z" 或 "东"/"西" 等，需统一为 1z-7z 再与 yakuhai_set 比较
 HONOR_TO_Z = {"东": "1z", "南": "2z", "西": "3z", "北": "4z", "白": "5z", "发": "6z", "中": "7z"}
 
@@ -212,6 +225,9 @@ def parse_call_area_constraint(s: str) -> Optional[Tuple[str, Optional[List[str]
             return ("pon", None, "yp")
         if rest == "kfkf":
             return ("pon", None, "kf")
+        # 客风碰但不含场风（与 pkfx 写法一致：pkfx = p + kfxkfx）
+        if rest == "kfxkfx":
+            return ("pon", None, "kfx")
         tiles = _split_tiles(rest)
         if len(tiles) >= 2:
             return ("pon", tiles, None)
@@ -243,8 +259,10 @@ def player_could_satisfy_call_area_constraints(player_state, oya: int, constrain
     player_id = getattr(player_state, "player_id", 0)
     jikaze_name = MjlogParser.get_jikaze(player_id, oya, round_num)
     jikaze_z = _wind_to_z(jikaze_name)
-    field = round_num // 4
-    bakaze_name = ["东", "南", "西", "北"][field]
+    # 场风优先谱面 bakaze（tenhou6 data.bakaze），与 round_num 推导可能不一致（超长东场等）
+    bakaze_name = MjlogParser.resolve_bakaze(
+        round_num, getattr(player_state, "bakaze", None)
+    )
     bakaze_z = _wind_to_z(bakaze_name)
     yakuhai_set = {jikaze_z, bakaze_z, "5z", "6z", "7z"}
     kyokuze_z = [_wind_to_z(w) for w in MjlogParser.get_kyokuze_list(player_id, oya, round_num)]
@@ -271,6 +289,16 @@ def player_could_satisfy_call_area_constraints(player_state, oya: int, constrain
                     found = True
             elif placeholder == "kf":
                 if len(got_z) >= 2 and got_z[0] == got_z[1] and got_z[0] in kyokuze_z:
+                    found = True
+            elif placeholder == "kfx":
+                # 客风碰且碰的不能是场风：consumed 两枚须落在「客风\场风」集合
+                kfx_z = [
+                    _wind_to_z(w)
+                    for w in MjlogParser.get_kyokuze_excluding_bakaze_list(
+                        player_id, oya, round_num, getattr(player_state, "bakaze", None)
+                    )
+                ]
+                if len(got_z) >= 2 and got_z[0] == got_z[1] and got_z[0] in kfx_z:
                     found = True
             elif tiles:
                 if len(got) == len(tiles) and sorted(got) == sorted(tiles):
@@ -394,8 +422,9 @@ def player_satisfies_call_area_constraints(
     player_id = getattr(player_state, "player_id", 0)
     jikaze_name = MjlogParser.get_jikaze(player_id, oya, round_num)
     jikaze_z = _wind_to_z(jikaze_name)
-    field = round_num // 4
-    bakaze_name = ["东", "南", "西", "北"][field]
+    bakaze_name = MjlogParser.resolve_bakaze(
+        round_num, getattr(player_state, "bakaze", None)
+    )
     bakaze_z = _wind_to_z(bakaze_name)
     yakuhai_set = {jikaze_z, bakaze_z, "5z", "6z", "7z"}
     kyokuze_z = [_wind_to_z(w) for w in MjlogParser.get_kyokuze_list(player_id, oya, round_num)]
@@ -420,6 +449,17 @@ def player_satisfies_call_area_constraints(
             used_indices.add(idx)
         elif placeholder == "kf":
             idx = _find_kf_call_index(calls, ev_type, kyokuze_z, used_indices)
+            if idx is None:
+                return False
+            used_indices.add(idx)
+        elif placeholder == "kfx":
+            kfx_z = [
+                _wind_to_z(w)
+                for w in MjlogParser.get_kyokuze_excluding_bakaze_list(
+                    player_id, oya, round_num, getattr(player_state, "bakaze", None)
+                )
+            ]
+            idx = _find_kf_call_index(calls, ev_type, kfx_z, used_indices)
             if idx is None:
                 return False
             used_indices.add(idx)
@@ -466,8 +506,8 @@ def get_consumed_search_patterns(query_pattern: List[str]) -> List[ConsumedSearc
     规律：c/p 后面的字符即 consumed 内容，直接对应 JSON 中 "consumed": ["x","y"]。
 
     例：c6s8s → ["consumed": ["6s","8s"]]；p1z1z → ["consumed": ["1z","1z"]]
-    pkfkf（客风碰）：生成 ["1z","1z"],["2z","2z"],["3z","3z"],["4z","4z"] 的 OR 搜索，
-    预过滤通过后再在匹配阶段判断该 ?z 是否为该玩家的客风。
+    pkfkf / pkfxkfx（客风碰 / 客风不含场风碰）：生成四风 1z～4z 双张的 OR 搜索；
+    log 与局级预过滤与 kf 相同；匹配阶段 @p:kf / @p:kfx 再按座与场风严格校验。
     """
     result: List[ConsumedSearchItem] = []
     for elem in query_pattern:
@@ -486,7 +526,8 @@ def get_consumed_search_patterns(query_pattern: List[str]) -> List[ConsumedSearc
                 result.append(("chii", tiles[:2]))
         elif s_lower.startswith("p") and len(s) >= 2:
             rest = s_lower[1:]
-            if rest == "kfkf":
+            # pkfkf 与 pkfxkfx：预搜 OR 同为四风（偏宽松）；真约束在 match 的 @p:kf / @p:kfx
+            if rest == "kfkf" or rest == "kfxkfx":
                 result.append([
                     ("pon", ["1z", "1z"]),
                     ("pon", ["2z", "2z"]),
@@ -495,7 +536,8 @@ def get_consumed_search_patterns(query_pattern: List[str]) -> List[ConsumedSearc
                 ])
                 continue
             tiles = _split_tiles(rest)
-            if len(tiles) >= 2 and "z" in rest:
+            # 标准碰 consumed 为两枚相同牌（字牌或数牌）；旧逻辑仅 "z" in rest 会漏掉 p1m1m
+            if len(tiles) >= 2 and tiles[0] == tiles[1]:
                 result.append(("pon", tiles[:2]))
     return result
 
@@ -619,36 +661,37 @@ def _is_honor_tile(tile_str: str) -> bool:
     return False
 
 
-# 风牌 base 27-30（东=27,南=28,西=29,北=30），用于安牌「非场风、非三元」判定
-_WIND_BASES = {27, 28, 29, 30}
+# 三元牌 base（白/发/中），安牌分支②须排除（与场风同属役牌范畴）
+_SANGEN_BASES = frozenset({31, 32, 33})
 
 
 def _ap_condition_met(visible_tiles, tile_str: str, bakaze: Optional[str]) -> bool:
     """
-    安牌条件（OR）：(1) 场上可见1-3枚该字牌（不含本张） 或 (2) 可见0张的非场风、非三元字牌（不含本张）。
-    满足其一即为安牌，不会因额外条件减少样本。
+    安牌（safe-tile 模式匹配，OR，不含本张舍牌）：
+    (1) 该字牌场上可见 1–3 枚；或
+    (2) 打出的牌为「非场风、非三元」字牌，且该牌种场上可见 0 枚。
+    bakaze 须为东/南/西/北（与 context 中 resolve_bakaze 一致）。
     """
     if not visible_tiles or not _is_honor_tile(tile_str):
         return False
+    # string_to_tile 对字牌返回 base 27–33，与 visible 键用 tile//4 一致，不可再 //4
     tile_base = MjlogParser.string_to_tile(tile_str)
-    base = tile_base // 4
     equiv = MjlogParser.get_count_equivalent_bases(tile_base)
     count_this = sum(c for t, c in visible_tiles.items() if t // 4 in equiv)
     count_this_excl = max(0, count_this - 1)
-    # (1) 该字牌场上可见1-3枚（不含本张）
+    # (1) 该字牌场上可见 1–3 枚（不含本张）
     if 1 <= count_this_excl <= 3:
         return True
-    # (2) 非场风、非三元字牌可见0张（不含本张）
+    # (2) 非场风、非三元，且该牌种未见（不含本张）
     if not bakaze:
         return False
-    bakaze_base = MjlogParser.string_to_tile(bakaze) // 4
-    non_bakaze_sangen_bases = _WIND_BASES - {bakaze_base}
-    for b in non_bakaze_sangen_bases:
-        count_b = sum(c for t, c in visible_tiles.items() if t // 4 == b)
-        count_b_excl = max(0, count_b - (1 if base == b else 0))
-        if count_b_excl != 0:
-            return False
-    return True
+    try:
+        bakaze_base = MjlogParser.string_to_tile(bakaze)
+    except ValueError:
+        return False
+    if tile_base == bakaze_base or tile_base in _SANGEN_BASES:
+        return False
+    return count_this_excl == 0
 
 
 def _tile_base_eq(a: str, b: str) -> bool:
@@ -673,15 +716,21 @@ def _parse_call_element(s: str) -> Optional[Tuple[str, bool]]:
         idx = s_lower.index("c")
         if idx > 0 and idx < len(s) - 1:
             return (f"{CALL_PREFIX}c:{s}", False)  # 4mc3m5m
-    # 碰：p1z1z 或 pkfkf、pzfzf、pypyp
+    # 碰：p1z1z、数牌对碰 p1m1m / p9m9m / p0m0m（赤）或 pkfkf、pzfzf、pypyp
     if s_lower.startswith("p") and len(s) >= 2:
         rest = s_lower[1:]
         if rest == "kfkf":
             return (f"{CALL_PREFIX}p:kf", False)
+        if rest == "kfxkfx":
+            return (f"{CALL_PREFIX}p:kfx", False)
         if rest == "zfzf":
             return (f"{CALL_PREFIX}p:zf", False)
         if rest == "ypyp":
             return (f"{CALL_PREFIX}p:yp", False)
+        # 万/饼/索对子碰：须为同型两枚（JSON consumed 如 ["1m","1m"]）
+        m_dup = re.match(r"^((?:0|[1-9])[mps])\1$", rest, re.IGNORECASE)
+        if m_dup:
+            return (f"{CALL_PREFIX}p:{rest}", False)
         if len(rest) >= 4 and rest[0].isdigit() and rest[1] == "z":
             return (f"{CALL_PREFIX}p:{rest}", False)  # p1z1z -> @p:1z1z
     return None
@@ -715,8 +764,8 @@ def parse_discard_element(s: str) -> Tuple[str, Optional[bool]]:
     "3m" -> ("3m", False) 手切
     "0m","0p","0s" -> 赤5m/赤5p/赤5s
     "4mc3m5m" -> 用 3m5m 吃 4m；"c5m6m" -> 用 56m 吃 4m 或 7m
-    "p1z1z" -> 用两个东碰；"pkfkf" -> 客风碰
-    "z" -> ("z", False) 任意字牌；"zf"/"kf" 等
+    "p1z1z" -> 用两个东碰；"p1m1m"/"p9m9m"/"p0m0m" -> 同色数牌对碰；"pkfkf"/"pkfxkfx" -> 客风碰/客风不含场风碰
+    "z" -> ("z", False) 任意字牌；"zf"/"kf"/"kfx" 等
     "zNOT1z" -> ("@n:z,1z", False) 任意字牌但排除东
     "3mOR5m" -> ("@o:3m,5m", False) 3m 或 5m
     "m"/"p"/"s" -> 任意万字/饼子/索子（单字符，与 1m,2p,3s 等区分）
@@ -1051,9 +1100,15 @@ def _apply_suit_mapping_to_string(raw: str, mapping: Dict[str, str]) -> str:
     对原始舍牌元素做花色映射：仅替换 m/p/s 字符，t、r 等后缀保持不变。
     例：2mt + m→p -> 2pt；NOTm + m→p -> NOTp
     ap/apr/apf/apt 与 yp/ypr/ypf/ypt 等为整词占位符，其中的 p 不是花色，不参与映射。
+    碰写法以「p」开头（p1m1m、pkfkf）：首字符 p 为副露前缀，勿与花色「饼 p」混淆。
     """
     if _is_ap_or_yp_token(raw):
         return raw
+    if raw in SUIT_WILDCARDS:
+        return mapping[raw]
+    # 单字符花色通配 m/p/s 已在上方处理；p1m1m / pkfkf / p1z1z 等：只映射首字符之后的 m/p/s
+    if len(raw) > 1 and raw[0] in "pP":
+        return raw[0] + "".join(mapping[c] if c in "mps" else c for c in raw[1:])
     return "".join(mapping[c] if c in "mps" else c for c in raw)
 
 
@@ -1409,9 +1464,9 @@ def _expand_pure_honor_pattern(parsed: List[Tuple[str, bool]]) -> List[List[Tupl
     - zt-zt: 49 种 (7×7)
     - z1-z2: 42 种 (7×6)
     - z1-z2-z3: 210 种 (7×6×5)
-    - 含 zf/kf/ap 的不展开，保留占位符（1 种）
+    - 含 zf/kf/kfx/ap 的不展开，保留占位符（1 种）
     """
-    if any(t in ("zf", "kf", "kf1", "kf2", "kf3", "ap") for t, _ in parsed):
+    if any(t in ("zf", "kf", "kfx", "kf1", "kf2", "kf3", "ap") for t, _ in parsed):
         return [parsed]
 
     distinct_indices = [i for i, (t, _) in enumerate(parsed) if t in ("z1", "z2", "z3")]
@@ -1470,6 +1525,13 @@ def generate_equivalent_variants(
             return True
         if tile.startswith("@r:"):
             return _is_number_tile(tile[3:])
+        # 吃/碰内嵌数牌（如 @p:1m1m、@c:4mc3m5m 解析后）须参与花色等价（m/p/s 排列）
+        if tile.startswith(f"{CALL_PREFIX}c:") or tile.startswith(f"{CALL_PREFIX}p:"):
+            payload = tile.split(":", 1)[1]
+            for tkn in _split_tiles(payload):
+                if tkn in RED_FIVES or _is_number_tile(tkn):
+                    return True
+            return False
         if tile.startswith(RELATED_PREFIX):
             inner = tile[len(RELATED_PREFIX):]
             if inner.startswith("@r:"):
@@ -1623,7 +1685,7 @@ def get_acceptable_last_tiles(variants: List[Dict]) -> frozenset:
     """
     获取所有变体模式末尾所需的牌（用于快速排除）。
     若当前舍牌牌面不在此集合中，可跳过匹配。
-    字牌占位符 z/zt/zf/kf/z1/z2/z3：将 7 种字牌都加入，避免误排除。
+    字牌占位符 z/zt/zf/kf/kfx/z1/z2/z3：将 7 种字牌都加入，避免误排除。
     """
     last_tiles = set()
     for v in variants:
@@ -1788,13 +1850,13 @@ def _match_pattern_at_end(
     支持字牌占位符：
     - z: 任意字牌
     - zf: 自风（需 context["jikaze"]）
-    - kf: 客风（需 context["kyokuze_list"]）
+    - kf: 客风（需 context["kyokuze_list"]）；kfx: 客风不含场风（需 kyokuze_list + bakaze）
     - z1,z2,z3: 互不相同的字牌；kf1,kf2,kf3: 互不相同的客风（需 context）
 
     Args:
         full_discards: [(牌字符串, 是否摸切), ...]，牌为中文或 1m 等
         pattern: [(牌或占位符, 是否要求摸切), ...]
-        context: {"jikaze": str, "kyokuze_list": List[str]}，用于 zf/kf
+        context: {"jikaze": str, "kyokuze_list": List[str], "bakaze": str}，用于 zf/kf/kfx
         out_position_to_tile: 若提供，成功匹配时填充 {pattern_idx: 匹配到的牌}（仅舍牌消耗位置）
     """
     if not full_discards or not pattern:
@@ -1979,6 +2041,10 @@ def _match_pattern_at_end(
                     return False
                 if base == "kf" and (not kyokuze_list or tile_str not in kyokuze_list):
                     return False
+                if base == "kfx":
+                    kfx_names = _kfx_wind_names_from_ctx(ctx)
+                    if not kfx_names or tile_str not in kfx_names:
+                        return False
                 consumed_any_discard = True
                 if out_position_to_tile is not None:
                     out_position_to_tile[p_idx] = tile_str
@@ -2031,6 +2097,17 @@ def _match_pattern_at_end(
                         bakaze = ctx.get("bakaze")
                         if _ap_condition_met(visible_tiles, tile_str, bakaze):
                             matched_opt = opt
+                            break
+                    elif tile_part == "kfx":
+                        tile_z = _honor_tile_to_z(tile_str)
+                        kfx_names = _kfx_wind_names_from_ctx(ctx)
+                        if (
+                            kfx_names
+                            and tile_z in [_honor_tile_to_z(k) for k in kfx_names]
+                            and tile_z not in matched_honors
+                        ):
+                            matched_opt = opt
+                            matched_honors.add(tile_z)
                             break
                     elif tile_part in ("kf", "kf1", "kf2", "kf3"):
                         tile_z = _honor_tile_to_z(tile_str)
@@ -2101,6 +2178,35 @@ def _match_pattern_at_end(
                             has_kf_pon = True
                             break
                 if not has_kf_pon:
+                    return False
+            elif pat_tile == f"{CALL_PREFIX}p:kfx":
+                # 客风不含场风碰：pai 须在 kfx 集合内
+                kfx_names = _kfx_wind_names_from_ctx(ctx)
+                if not kfx_names:
+                    return False
+                next_elem = pattern[p_idx + 1] if p_idx + 1 < len(pattern) else None
+                next_tile = next_elem[0] if next_elem else None
+                require_immediate_kfx = (
+                    next_tile is not None
+                    and next_tile != "*"
+                    and not (next_tile.startswith(CALL_PREFIX) if isinstance(next_tile, str) else False)
+                )
+                kfx_z_list = [_honor_tile_to_z(k) for k in kfx_names]
+                has_kfx_pon = False
+                current_turn = ctx.get("current_discard_turn")
+                for c in calls:
+                    if current_turn is not None:
+                        from_turn = getattr(c, "from_discard_turn", 1)
+                        if from_turn > current_turn:
+                            continue
+                        if require_immediate_kfx and from_turn != current_turn:
+                            continue
+                    if getattr(c, "call_type", None) == "pon":
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z in kfx_z_list:
+                            has_kfx_pon = True
+                            break
+                if not has_kfx_pon:
                     return False
             elif pat_tile == f"{CALL_PREFIX}p:zf":
                 if not jikaze:
@@ -2202,6 +2308,16 @@ def _match_pattern_at_end(
             d_idx -= 1
             p_idx -= 1
             continue
+        if pat_tile == "kfx":
+            kfx_names = _kfx_wind_names_from_ctx(ctx)
+            if not kfx_names or tile_str not in kfx_names:
+                return False
+            consumed_any_discard = True
+            if out_position_to_tile is not None:
+                out_position_to_tile[p_idx] = tile_str
+            d_idx -= 1
+            p_idx -= 1
+            continue
         if pat_tile == "yp":
             if _honor_tile_to_z(tile_str) not in yakuhai_set:
                 return False
@@ -2212,7 +2328,7 @@ def _match_pattern_at_end(
             p_idx -= 1
             continue
         if pat_tile == "ap":
-            # 安牌：场上可见1-3枚字牌+可见0张的非场风、非三元字牌（不含本张舍牌）
+            # 安牌：见 _ap_condition_met（① 该字牌 1–3 枚可见；② 非场风非三元且该牌种 0 枚可见，均不含本张）
             if not _is_honor_tile(tile_str):
                 return False
             visible_tiles = ctx.get("visible_tiles")
@@ -2296,6 +2412,25 @@ def _match_pattern_at_end(
                             break
                 if not has_kf_pon:
                     return False
+            elif pat_tile == f"{CALL_PREFIX}p:kfx":
+                kfx_names = _kfx_wind_names_from_ctx(ctx)
+                if not kfx_names:
+                    return False
+                current_turn = ctx.get("current_discard_turn")
+                kfx_z_list = [_honor_tile_to_z(k) for k in kfx_names]
+                has_kfx_pon = False
+                for c in calls:
+                    if current_turn is not None:
+                        from_turn = getattr(c, "from_discard_turn", 1)
+                        if from_turn > current_turn:
+                            continue
+                    if getattr(c, "call_type", None) == "pon":
+                        pai_z = _honor_tile_to_z(getattr(c, "pai", ""))
+                        if pai_z in kfx_z_list:
+                            has_kfx_pon = True
+                            break
+                if not has_kfx_pon:
+                    return False
             elif pat_tile == f"{CALL_PREFIX}p:zf":
                 if not jikaze: return False
                 current_turn = ctx.get("current_discard_turn")
@@ -2342,12 +2477,12 @@ def match_discard_to_variant(
 
     使用完整序列（含摸切），保证 [1m,3m] 要求 1m 与 3m 相邻；
     [3m,*,1m] 允许中间有任意摸切。
-    字牌占位符 zf/kf 需 context: {"jikaze": str, "kyokuze_list": List[str]}。
+    字牌占位符 zf/kf/kfx 需 context: jikaze、kyokuze_list；kfx 另需 bakaze（resolve_bakaze）。
 
     Args:
         full_discards: [(牌字符串, 是否摸切), ...]，按出牌顺序
         variants: generate_equivalent_variants 返回的变体列表
-        context: 可选，含 jikaze、kyokuze_list，用于 zf/kf 匹配
+        context: 可选，含 jikaze、kyokuze_list、bakaze，用于 zf/kf/kfx 匹配
 
     Returns:
         匹配到的变体（含 position_to_tile、matched_start_index 等），若都不匹配则返回 None。

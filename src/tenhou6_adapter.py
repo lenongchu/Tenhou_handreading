@@ -39,6 +39,23 @@ def _pai_to_tile(pai: str) -> int:
     return base * 4
 
 
+def _normalize_bakaze_zh(raw: Optional[str]) -> str:
+    """
+    tenhou6 data.bakaze → 东/南/西/北。
+    场风以谱面为准（含连庄/流局后的局），勿用「半庄内累计手数」自创公式。
+    """
+    b = (raw or "E").strip().upper()
+    if b in ("E", "東", "东"):
+        return "东"
+    if b in ("S", "南"):
+        return "南"
+    if b in ("W", "西"):
+        return "西"
+    if b in ("N", "北"):
+        return "北"
+    return "东"
+
+
 def _tehai_to_hand_tiles(tehais: List[str]) -> List[int]:
     """将 tehais (牌符列表) 转为 tile 编码列表。使用 base*4，允许重复以保留枚数。"""
     result = []
@@ -63,24 +80,30 @@ def _parse_round_from_tenhou6(
     oya = int(game_data.get("oya", 0))
     honba = int(game_data.get("honba", 0))
     kyoku = int(game_data.get("kyoku", 1))  # 场内局号 1-4
-    bakaze = (game_data.get("bakaze") or "E").upper()
-    # tenhou-paifu-to-json: kyoku=1-4 为场内局号，bakaze 为场风 E=东/S=南/W=西
-    # round_num: 0=东1, 1=东2, 2=东3, 3=东4, 4=南1, 5=南2, ...
-    if bakaze in ("E", "東"):
+    bakaze_zh = _normalize_bakaze_zh(game_data.get("bakaze"))
+    # tenhou-paifu-to-json: kyoku=1-4 为场内局号，data.bakaze 为场风（与连庄/流局进度一致）
+    # round_num: 0=东1…, 4=南1…（用于展示与 get_bakaze 回退；役牌场风以 GameState.bakaze 为准）
+    if bakaze_zh == "东":
         field_offset = 0
-    elif bakaze in ("S", "南"):
+    elif bakaze_zh == "南":
         field_offset = 4
-    elif bakaze in ("W", "西"):
+    elif bakaze_zh == "西":
         field_offset = 8
     else:
-        field_offset = 0
+        field_offset = 12
     round_num = field_offset + (kyoku - 1)
     
     # 初始手牌
     tehais_raw = game_data.get("tehais", [[], [], [], []])
     
     game_states = [
-        GameState(player_id=i, round_num=round_num, honba=honba, oya=oya)
+        GameState(
+            player_id=i,
+            round_num=round_num,
+            bakaze=bakaze_zh,
+            honba=honba,
+            oya=oya,
+        )
         for i in range(4)
     ]
     
@@ -241,7 +264,7 @@ def _parse_round_from_tenhou6(
 
 def _round_identity(data: Dict[str, Any]) -> Tuple[str, int, int, int]:
     """提取局的唯一标识 (bakaze, kyoku, honba, oya)，用于一炮双响去重"""
-    bakaze = (data.get("bakaze") or "E").upper()
+    bakaze = _normalize_bakaze_zh(data.get("bakaze"))
     kyoku = int(data.get("kyoku", 1))
     honba = int(data.get("honba", 0))
     oya = int(data.get("oya", 0))

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union, Union
 
 from .mjlog_parser import MjlogParser
 
@@ -35,7 +35,12 @@ RED_TO_STANDARD = {34: 4, 35: 13, 36: 22}
 # 赤五 base(34/35/36) → mahjong 库 136 编码中的 tile 索引（赤五有固定位置）
 RED_TO_136 = {34: 16, 35: 52, 36: 88}
 WIND_STR_TO_BASE = {"东": 27, "南": 28, "西": 29, "北": 30}
-BAKAZE_TO_BASE = {"E": 27, "S": 28, "W": 29, "N": 30, "东": 27, "南": 28, "西": 29, "北": 30}
+# 谱面 bakaze：ASCII / 简中 / 日文汉字（与 tenhou6_adapter._normalize_bakaze_zh 一致）
+BAKAZE_TO_BASE = {
+    "E": 27, "S": 28, "W": 29, "N": 30,
+    "东": 27, "南": 28, "西": 29, "北": 30,
+    "東": 27,
+}
 
 
 def _tile_to_base(tile_str: Optional[str]) -> Optional[int]:
@@ -160,7 +165,11 @@ class RoundInstantDealInAnalyzer:
         self.normalize_oya_ron_to_ko = bool(normalize_oya_ron_to_ko)
 
         bakaze = (self.game_data.get("bakaze") or "E")
-        self.round_wind = BAKAZE_TO_BASE.get(str(bakaze).upper(), 27)
+        bkey = str(bakaze).strip()
+        # ASCII 场风用大写键；中日文风字保持原样（.upper() 对「东」无效果）
+        if len(bkey) == 1 and bkey.isascii():
+            bkey = bkey.upper()
+        self.round_wind = BAKAZE_TO_BASE.get(bkey, 27)
         self.player_winds = [
             WIND_STR_TO_BASE.get(MjlogParser.get_player_wind(pid, self.oya), 27)
             for pid in range(4)

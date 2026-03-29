@@ -82,7 +82,7 @@
 |------|------|
 | `iter_valid_discards` | 生成器：扁平化遍历局→玩家→舍牌，统一前置过滤（南三南四、宝牌、消耗牌、副露、立直、巡目等） |
 | `MatchValidator` | 匹配后统一约束校验（禁打、前段有打、宝牌、立直、副露、可见牌、目标牌排除） |
-| `_core_match_engine` | 核心匹配引擎：预检 → 解析 → `iter_valid_discards` → 变体匹配 → `MatchValidator`，产出匹配样本迭代器 |
+| `_core_match_engine` | 核心匹配引擎：预检 → 解析 → `iter_valid_discards` → 变体匹配 → `MatchValidator`，产出匹配样本迭代器。**多行模式**：除「即时铳率 + 多行」外对 `items` 逐行尝试，各行可分别命中；和/铳结局按 `(seat, round_num, honba, orig_i)` 去重。即时铳率且多行仍为「首条命中即停」。 |
 | `_process_one_log_analyze` | 主界面 per-log worker：调用 `_core_match_engine(is_grid=False)`，聚合统计（target_count、即时铳率、役牌手持分布、sample_pool 等） |
 | `_process_one_log_grid` | 矩阵 per-log worker：调用 `_core_match_engine(is_grid=True)`，按 cell 聚合 target_count 分布 |
 
@@ -176,18 +176,18 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 | | `OR` | 逻辑或 | `3mOR5m`, `[25]m`（[25]m 即 2m~5m 其一） |
 | | `NOT` | 逻辑非 | `NOTm`, `zNOT1z`, `NOT[45]m`（排除 4m,5m） |
 | **占位符** | `z`/`zt` | 任意字牌/摸切字牌 | `z-zt` |
-| | `zf`/`kf`/`yp` | 自风/客风/役牌（自风+场风+三元） | `zf`, `kf`, `yp` |
-| | `ap` | 安牌（满足其一即可，不含本张舍牌：场上可见1-3枚该字牌；或非场风、非三元字牌可见0张） | `ap` |
+| | `zf`/`kf`/`kfx`/`yp` | 自风/客风/**客风不含场风**/役牌（自风+场风+三元） | `zf`, `kf`, **`kfx`**（剔除 `resolve_bakaze` 场风牌；连风时与 `kf` 同集）, `yp` |
+| | `ap` | 安牌（满足其一即可，不含本张舍牌：① 场上该字牌可见 1–3 枚；② 或非场风、非三元字牌且该牌种可见 0 枚。场风以 `resolve_bakaze` 为准） | `ap` |
 | | `apr` | 立直宣言的安牌（该舍牌为立直宣言且满足安牌条件） | `apr` |
 | | `yp[n]` n=1..4 | 索引役牌：同索引=同牌型（拆对），异索引=异牌型 | `yp[1]-yp[1]` 拆对役牌；`yp[1]-yp[2]t` 两张不同役牌 |
 | | `z1`-`z3`/`kf1`-`kf3` | 互不相同字牌/客风 | `z1-z2-z3` |
-| **副露** | `c<tiles>`/`p<tiles>` | 吃/碰 | `4mc3m5m`, `p1z1z` |
-| | `pkfkf`/`pzfzf`/`pypyp` | 客风/自风/役牌碰 | `pkfkf`, `pzfzf`, `pypyp` |
+| **副露** | `c<tiles>`/`p<tiles>` | 吃/碰 | `4mc3m5m`, `p1z1z`, **`p1m1m`/`p9m9m`/`p0m0m`（数牌/赤对碰，两枚须相同）** |
+| | `pkfkf`/`pkfxkfx`/`pzfzf`/`pypyp` | 客风/客风不含场风/自风/役牌碰 | `pkfkf`, **`pkfxkfx`**（对称 `pkfkf`）, `pzfzf`, `pypyp` |
 | | `fl`/`flp`/`fls`/`flm`/`lmfl` | 副露通配符（见 2.1） | `fl-$`, `flp-3m` |
 | **拆搭** | `cd1`/`cd2` | 任意拆搭（含对子如1m-1m）/拆搭花色≠目标牌花色 | `cd1`, `cd2-3m` |
 | | `cdm`/`cdp`/`cds` | 拆指定花色搭子 | `cdm` |
 
-> `r` 与 `c/p` 不能同现（立直不可副露）；`*` 仅匹配连续摸切；`cd2` 要求拆搭花色与目标牌花色不同。数字范围 `[xy]suit` 无后缀时仅匹配手切，需手摸切皆可请写 `[xy]suitf`（如 `[29]mf`）。
+> `r` 与 `c/p` 不能同现（立直不可副露）；`*` 仅匹配连续摸切；`cd2` 要求拆搭花色与目标牌花色不同。数字范围 `[xy]suit` 无后缀时仅匹配手切，需手摸切皆可请写 `[xy]suitf`（如 `[29]mf`）。**`OR` 仅连接「简单牌/占位符」**；`p1m1mORp9m9m` 这类副露 OR **不支持**，请用主界面**多行舍牌模式**（每行一条，分析上行间为 OR）。
 
 ### 目标牌输入（Target tile，统计用）
 
@@ -214,7 +214,8 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 |------|------|------|------|
 | **指定副露** | `4mc3m5m` | 用 3m5m 吃 4m | 精确匹配该吃 |
 | | `p1z1z` | 碰东 | 精确匹配该碰 |
-| | `pkfkf`/`pzfzf`/`pypyp` | 客风/自风/役牌碰 | 匹配任一满足的碰 |
+| | `p1m1m` / `p9m9m` / `p0m0m` 等 | 数牌或赤**对子碰**（`consumed` 两枚相同） | 与 `p1z1z` 同属 `p<tiles>` 语法；参与 m/p/s 等价 |
+| | `pkfkf`/`pkfxkfx`/`pzfzf`/`pypyp` | 客风/客风不含场风/自风/役牌碰 | 匹配任一满足的碰 |
 | **通配符** | `fl` | 任意副露 | 吃/碰/杠任一即可，无内容要求 |
 | | `flp` | 饼子副露 | 副露的鸣牌+自牌均为 p（如 4pc3p5p、p3p3p） |
 | | `fls` | 索子副露 | 副露均为 s |
@@ -255,6 +256,8 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 | 前段禁打 | `_apply_suit_mapping_to_string` | NOTs → NOTm；`[39]p` → `[39]s` 等，与主模式同套映射 |
 | 前段有打 | `_apply_suit_mapping_to_string` | `[37]mOR[37]s` → `[37]pOR[37]m` 等，与主模式同套映射 |
 
+**副露 `p` 前缀与数牌对碰**：手写碰为 **`p` + 两枚相同牌**（字牌 `p1z1z`；数牌 `p1m1m`、`p9m9m`；赤对 `p0m0m`）。解析为 `@p:…`，与谱面 `pon` 的 `consumed` 精确匹配；含数牌时走 `m/p/s` 花色等价（如 `p1m1m`→`p1p1p`/`p1s1s`）。**等价映射**时首字符 **`p` 视为碰前缀**，不是花色「饼子」，仅其后的 `m`/`p`/`s` 参与置换（`_apply_suit_mapping_to_string`）。消耗牌预搜 `get_consumed_search_patterns` 对碰按「两枚 `consumed` 相同」识别，含数牌碰。
+
 **前段约束**：前段禁打、前段有打均参与等价映射，与主舍牌模式使用同一套花色映射；判定时用**当前命中变体的映射后串**对「主模式匹配点之前的实际舍牌」做检查。语法与舍牌模式一致，含数字范围 `[xy]`（如 `[39]p` = 3p～9p 共 7 张）。
 
 **巡目范围与前段约束**：巡目范围约束**整个舍牌模式**，主模式必须全部落在巡目范围内。前段禁打、前段有打**不受巡目范围限制**，检查的是「主模式匹配点之前」的全部舍牌，可发生在巡目范围之前（如巡目 3–4、主模式 m-s，前段有打 4m 可在第 1–2 巡出现）。
@@ -264,6 +267,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 ### 3.4 占位符 ap/yp 与等价映射
 
 - **ap / apr / apf / apt**（安牌、立直宣言安牌等）与 **yp / ypr / ypf / ypt**（役牌等）中的字母 **p** 是占位符名的一部分，**不是**花色「饼子」。等价映射时这些整词**不参与**花色替换（否则会误写成 am/ym 等）。
+- **与副露 `p1z1z` / `p1m1m` 的区别**：后者整串以 **`p` 表示碰（pon）前缀**，随后两枚牌才含 `m`/`p`/`s` 花色；等价映射时仅将前缀后的花色字符参与 `m/p/s` 置换（见 **§3.3**「副露 `p` 前缀与数牌对碰」）。
 - 带后缀形式（如 `apf` 手摸切皆可、`apt` 摸切）同样按整词保留。实现见 `equivalent_variants._is_ap_or_yp_token` 与 `_apply_suit_mapping_to_string`。
 
 ### 3.5 纯字牌模式 + 数牌目标
@@ -417,6 +421,7 @@ Worker 函数由 `ProcessPoolExecutor` 调用，参数 `(raw_content, params)` �
 - `live_analyzer`：`use_yaku_hai_hand` 聚合；`collect_verification_samples` 可按「零对/一对/两对/三对及以上」筛选（末项对应 `pair_kinds≥3`，常数 `YAKU_HAI_PAIR_FILTER_GE3`）
 - `gui_app`：选项、结果/合并/Excel、生成样本
 - **多组巡目**：与和铳率相同合并巡目，不跑役牌专用矩阵
+- **多行舍牌模式**：同一巡可对各行模式分别计命中，`sample_pool` 带 `matched_pattern_idx`。**「生成样本」**：`last_query_params` 含 `multi_pattern` 与 `query_items`；当 **`len(query_items) > 1`** 时按所舍牌模式下拉项过滤 `matched_pattern_idx`，并传入 `collect_verification_samples(..., pattern_index_filter=…)`，避免样本混池。**即时铳率**且多行时引擎仍为「首条命中即停」。
 - **样本一致性抽查**：该模式下不对 `sample_pool` 做 `verify_sample_consistency` 抽查
 
 ### 维护

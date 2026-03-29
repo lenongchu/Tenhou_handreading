@@ -1031,7 +1031,7 @@ class MainWindow(QMainWindow):
             "格式与舍牌模式相同。目标玩家必须满足所有填写的副露（AND）。\n\n"
             "• pzfzf：碰出自风\n"
             "• pypyp：碰出任一役牌（自风/场风/三元牌）\n"
-            "• pkfkf：碰出客风\n"
+            "• pkfkf：碰出客风；pkfxkfx：客风碰但不含场风（对称 pkfkf）\n"
             "• 4mc3m5m：用3m5m吃过4m\n"
             "• p1z1z：碰出东\n\n"
             "最多 4 个约束，留空表示无此约束。"
@@ -3875,7 +3875,8 @@ class MainWindow(QMainWindow):
         self._last_sample_pattern_str = "-".join(selected_pattern)
         self._last_sample_target_tile = selected_target
 
-        multi = self.last_query_params.get("multi_pattern", False) and len(query_items) > 1
+        # 多行模式：以 query_items 条数为准（与 sample_pattern_combo 一致），勿仅依赖 multi_pattern 标记
+        multi = len(query_items) > 1
         # 构建用于本次采样的参数（单模式用选中的 pattern/target）
         params_for_sample = {
             **self.last_query_params,
@@ -4116,6 +4117,8 @@ class MainWindow(QMainWindow):
             total_logs_hint = cached.get("total_logs") if cached else None
             self.last_query_params = {
                 "query_items": query_items,
+                # 供「生成样本」判断多行模式：`analyze` 的 result 必带 multi_pattern，否则下拉有多项也不会过滤 sample_pool
+                "multi_pattern": bool(result.get("multi_pattern", False)),
                 "query_pattern": first_pattern,
                 "query_pattern_str": "-".join(first_pattern),
                 "target_tile": first_target,

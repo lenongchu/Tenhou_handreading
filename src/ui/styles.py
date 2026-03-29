@@ -288,7 +288,7 @@ PATTERN_HELP_HTML = """
 <p>在舍牌序列中表示"此处有一次吃或碰"，不占一张舍牌；<b>语义为具体吃的/碰的牌</b>，如 <code>4mc3m5m</code> 表示必须是用 3m5m 吃的 4m。</p>
 <ul>
 <li><b>吃</b>：任意 <code>(牌)c(牌)(牌)</code> 或 <code>c(牌)(牌)</code>，如 <code>1sc2s3s</code>、<code>4mc3m5m</code>、<code>c5m6m</code></li>
-<li><b>碰</b>：<code>p1z1z</code> 用两个东碰（只碰东）；<code>pkfkf</code> 用客风碰</li>
+<li><b>碰</b>：<code>p1z1z</code> 用两个东碰（只碰东）；<code>pkfkf</code> 客风碰；<code>pkfxkfx</code> 客风碰且不含场风（写法对称 <code>pkfkf</code>）</li>
 <li><b>等价变体</b>：含吃或数牌碰时<u>不</u>生成花色等价变体；仅碰字牌时仍可生成变体</li>
 </ul>
 
@@ -311,7 +311,8 @@ PATTERN_HELP_HTML = """
 <tr><td><code>z</code></td><td>任意字牌（手切）</td></tr>
 <tr><td><code>zt</code></td><td>任意字牌且摸切</td></tr>
 <tr><td><code>zf</code></td><td>自风（当前局座风）</td></tr>
-<tr><td><code>kf</code></td><td>任意一张客风</td></tr>
+<tr><td><code>kf</code></td><td>任意一张客风（含场风位，当其非自风时）</td></tr>
+<tr><td><code>kfx</code></td><td>客风但不含场风牌；连风时与 <code>kf</code> 同集</td></tr>
 <tr><td><code>z1</code> <code>z2</code> <code>z3</code></td><td>互不相同的字牌</td></tr>
 <tr><td><code>kf1</code> <code>kf2</code> <code>kf3</code></td><td>互不相同的客风</td></tr>
 <tr><td><code>ap</code></td><td>安牌（满足其一即可，不含本张：该字牌可见1-3枚；或非场风、非三元字牌可见0张）</td></tr>
